@@ -476,7 +476,7 @@ mod rodio_impl {
     use super::*;
     use rodio::Source;
     use rodio::{buffer::SamplesBuffer, OutputStream, OutputStreamBuilder, Sink};
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     // ========================================================================
     // Sample-counting source wrapper for accurate position tracking
@@ -692,28 +692,25 @@ mod rodio_impl {
             let counting_source = SampleCountingSource::new(buffer, self.handle.clone());
 
             // Append to sink and update volume dynamically
-            if let Ok(sink) = self.sink.lock() {
-                // Apply current volume/mute state to sink (dynamic, affects all queued audio)
-                sink.set_volume(self.handle.effective_volume());
-                sink.append(counting_source);
-            }
+            let sink = self.sink.lock();
+            // Apply current volume/mute state to sink (dynamic, affects all queued audio)
+            sink.set_volume(self.handle.effective_volume());
+            sink.append(counting_source);
             // Position is now computed on-demand in AudioHandle::position()
         }
 
         /// Starts audio playback.
         pub fn play(&mut self) {
-            if let Ok(sink) = self.sink.lock() {
-                sink.play();
-                self.state = AudioState::Playing;
-            }
+            let sink = self.sink.lock();
+            sink.play();
+            self.state = AudioState::Playing;
         }
 
         /// Pauses audio playback.
         pub fn pause(&mut self) {
-            if let Ok(sink) = self.sink.lock() {
-                sink.pause();
-                self.state = AudioState::Paused;
-            }
+            let sink = self.sink.lock();
+            sink.pause();
+            self.state = AudioState::Paused;
         }
 
         /// Returns the current state.
@@ -726,9 +723,9 @@ mod rodio_impl {
         /// Note: After clear(), the sink may be paused. Caller should call play()
         /// if playback should continue (e.g., during seek).
         pub fn clear(&mut self) {
-            if let Ok(sink) = self.sink.lock() {
-                sink.clear();
-            }
+            let sink = self.sink.lock();
+            sink.clear();
+            drop(sink);
             // Reset all position tracking so next queued samples establish new timeline
             self.initial_pts = None;
             self.handle.clear_playback_epoch();
