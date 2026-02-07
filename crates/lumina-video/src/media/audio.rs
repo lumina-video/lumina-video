@@ -605,6 +605,19 @@ mod rodio_impl {
             external_handle: Option<AudioHandle>,
         ) -> Result<Self, String> {
             // Create audio output stream (rodio 0.21 API)
+            // On Linux, set explicit ALSA buffer size to avoid extreme default latency (cpal#446).
+            // macOS CoreAudio (512 frames) and Android Oboe have reasonable defaults.
+            #[cfg(target_os = "linux")]
+            let stream = OutputStreamBuilder::from_default_device()
+                .map(|b| b.with_buffer_size(cpal::BufferSize::Fixed(1024)))
+                .and_then(|b| b.open_stream_or_fallback())
+                .or_else(|e| {
+                    tracing::warn!("Audio: explicit buffer setup failed ({e}), trying default");
+                    OutputStreamBuilder::open_default_stream()
+                })
+                .map_err(|e| format!("Failed to create audio output: {e}"))?;
+
+            #[cfg(not(target_os = "linux"))]
             let stream = OutputStreamBuilder::open_default_stream()
                 .map_err(|e| format!("Failed to create audio output: {e}"))?;
 
