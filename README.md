@@ -120,7 +120,7 @@ cargo build
 
 #### NixOS / Nix
 
-No manual dependency installation needed:
+No manual dependency installation needed. The flake pins nixos-24.11 (GStreamer 1.24 for DMABuf zero-copy):
 
 ```bash
 nix run github:lumina-video/lumina-video
@@ -128,11 +128,23 @@ nix run github:lumina-video/lumina-video
 
 > **Note:** First run downloads and builds dependencies (may take several minutes). Subsequent runs are instant.
 
-Or enter a development shell with all dependencies:
+Or enter a development shell with all dependencies (includes `vainfo` and `vulkaninfo` for diagnostics):
 
 ```bash
 nix develop github:lumina-video/lumina-video
 cargo run --package lumina-video-demo
+```
+
+For VA-API hardware acceleration on NixOS, add to `configuration.nix`:
+
+```nix
+# NixOS 24.11+
+hardware.graphics = {
+  enable = true;
+  extraPackages = with pkgs; [
+    intel-media-driver  # Intel Broadwell+ (iHD)
+  ];
+};
 ```
 
 #### Pre-built Demo Packages
@@ -209,7 +221,7 @@ choco install llvm
 cargo run --package lumina-video-demo --features windows-native-video
 ```
 
-> **Note:** Windows native video is opt-in until the zero-copy implementation is validated. See [PR #23](https://github.com/lumina-video/lumina-video/pull/23).
+> **Note:** Windows native video is opt-in until the zero-copy implementation is validated on real hardware.
 
 </details>
 
@@ -221,6 +233,7 @@ cargo run --package lumina-video-demo --features windows-native-video
 - **Subtitles** — SRT and WebVTT with customizable styling
 - **HLS streaming** with adaptive bitrate
 - **A/V sync** — callback-based audio clock (drift TBC)
+- **MoQ live streaming** — Media over QUIC transport with hardware decode (experimental)
 
 ## Platform Support
 
@@ -238,12 +251,14 @@ cargo run --package lumina-video-demo --features windows-native-video
 
 ### Pending Improvements
 
-| PR | Platform | Enhancement |
-|----|----------|-------------|
-| [#23](https://github.com/lumina-video/lumina-video/pull/23) | Windows | Zero-copy diagnostics |
-| [#24](https://github.com/lumina-video/lumina-video/pull/24) | Windows | A/V sync bridge |
+| Area | Enhancement | Status |
+|------|-------------|--------|
+| Windows | Zero-copy diagnostics + A/V sync bridge | Needs porting to lumina-video |
+| MoQ | Frame pixelation on late join (IDR resync) | Investigating HTTP group fetch |
+| MoQ | Audio playback verification | Pipeline built, needs live stream testing |
+| MoQ | zap.stream connectivity | Upstream PR submitted |
 
-> **Testers wanted!** Windows zero-copy needs validation. Try the PR branches and report results.
+> **Testers wanted!** Windows zero-copy needs validation on real hardware.
 
 ## Configuration
 
@@ -261,6 +276,7 @@ cargo run --package lumina-video-demo --features windows-native-video
 
 | Feature | Description |
 |---------|-------------|
+| `moq` | Media over QUIC live streaming (experimental) |
 | `windows-native-video` | Enable Windows native video (opt-in until validated) |
 | `vendored-runtime` | Bundle GStreamer libraries with binary (Linux only, no system deps) |
 
@@ -333,6 +349,39 @@ player.load_subtitles_srt(srt_content)?;
 Full Unicode support including CJK, Cyrillic, Thai, Arabic. See font configuration in [docs/PLATFORMS.md](docs/PLATFORMS.md).
 
 </details>
+
+## MoQ Live Streaming (Experimental)
+
+lumina-video supports live video streaming via [Media over QUIC (MoQ)](https://datatracker.ietf.org/wg/moq/about/) — a next-generation low-latency protocol built on QUIC/WebTransport.
+
+```toml
+[dependencies]
+lumina-video = { git = "https://github.com/lumina-video/lumina-video", features = ["moq"] }
+```
+
+**Current status:**
+
+| Component | Status |
+|-----------|--------|
+| QUIC transport (quinn) | Working |
+| Catalog fetch + track subscription | Working |
+| H.264 hardware decode (VTDecoder) | Working (macOS) |
+| AAC audio decode (symphonia + rodio) | Built, not yet verified on live stream |
+| Linux / Android / Windows / Web | Not yet tested |
+| Late-join IDR resync | In progress |
+| Nostr NIP-53 stream discovery | In progress |
+
+**Tested relays:**
+
+- `moq://cdn.moq.dev` (kixelated — BBB demo)
+- `moq://interop-relay.cloudflare.mediaoverquic.com:443` (Cloudflare)
+
+```rust
+// Connect to a MoQ live stream
+let player = VideoPlayer::new("moq://cdn.moq.dev/bbb");
+```
+
+The MoQ implementation uses native hardware decoders (same zero-copy pipeline as file playback) and supports both the moq-lite and IETF Draft 14 protocols.
 
 <details>
 <summary><b>Custom controls example</b></summary>
