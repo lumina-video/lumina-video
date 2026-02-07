@@ -189,22 +189,23 @@ trunk serve --open
 <details>
 <summary><b>Android</b></summary>
 
-**Prerequisites:** [Rust toolchain](https://rustup.rs/), Android SDK (API 35), Android NDK 26.x, connected device or emulator
+**Prerequisites:** [Rust toolchain](https://rustup.rs/), Android SDK (API 35), Android NDK 26.x, `ANDROID_NDK_HOME` env var set, connected device
 
 ```bash
 # Add Android target and install cargo-ndk
 rustup target add aarch64-linux-android
 cargo install cargo-ndk
 
-# Build native library
-cargo ndk -t arm64-v8a build --package lumina-video-android --release
+# Build native library (-P 26 required — default API 21 is missing libaaudio)
+cargo ndk -t arm64-v8a -P 26 build --package lumina-video-android --release
 
 # Copy to jniLibs
 mkdir -p android/app/src/main/jniLibs/arm64-v8a
 cp target/aarch64-linux-android/release/liblumina_video_android.so \
    android/app/src/main/jniLibs/arm64-v8a/
 
-# Build and install APK
+# Set SDK path and build APK
+echo "sdk.dir=$ANDROID_HOME" > android/local.properties
 cd android && ./gradlew assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
