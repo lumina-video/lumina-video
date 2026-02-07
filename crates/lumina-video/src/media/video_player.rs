@@ -622,13 +622,13 @@ impl VideoPlayer {
 
                 // Start FFmpeg audio thread only if decoder doesn't handle audio internally
                 // AND this is not a MoQ URL (MoQ handles audio via its own pipeline).
-                #[cfg(feature = "moq")]
-                let is_moq = super::moq_decoder::MoqDecoder::is_moq_url(&self.url);
-                #[cfg(not(feature = "moq"))]
-                let is_moq = false;
-
                 #[cfg(target_os = "macos")]
                 {
+                    #[cfg(feature = "moq")]
+                    let is_moq = super::moq_decoder::MoqDecoder::is_moq_url(&self.url);
+                    #[cfg(not(feature = "moq"))]
+                    let is_moq = false;
+
                     if !uses_native_audio && !is_moq {
                         if let Some(audio_thread) = AudioThread::new(&self.url, metadata.start_time)
                         {

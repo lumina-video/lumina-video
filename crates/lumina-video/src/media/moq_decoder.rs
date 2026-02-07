@@ -1270,7 +1270,7 @@ impl MoqDecoder {
         if !(1..=4).contains(&nal_length_size) {
             return 0;
         }
-        if nal_data.len() >= nal_length_size + 1 {
+        if nal_data.len() > nal_length_size {
             nal_data[nal_length_size] & 0x1F
         } else {
             0
@@ -4292,7 +4292,6 @@ impl MoqGStreamerDecoder {
     /// Pushes a NAL unit to the GStreamer pipeline via appsrc.
     fn push_nal_unit(&mut self, moq_frame: &MoqVideoFrame) -> Result<(), VideoError> {
         use gstreamer as gst;
-        use gstreamer::prelude::*;
 
         // Skip non-keyframes until we receive a keyframe (decoder needs IDR to start)
         if !self.received_keyframe {
@@ -4338,7 +4337,6 @@ impl MoqGStreamerDecoder {
     /// Pulls a decoded frame from appsink and converts it to VideoFrame.
     fn pull_decoded_frame(&mut self) -> Result<Option<VideoFrame>, VideoError> {
         use gstreamer as gst;
-        use gstreamer::prelude::*;
         use gstreamer_video as gst_video;
 
         // Try to pull a sample (non-blocking)
@@ -4393,7 +4391,6 @@ impl MoqGStreamerDecoder {
         sample: &gstreamer::Sample,
     ) -> Result<Option<VideoFrame>, VideoError> {
         use super::video::{DmaBufPlane, LinuxGpuSurface};
-        use gstreamer::prelude::*;
         use gstreamer_allocators::DmaBufMemory;
         use std::os::fd::RawFd;
 
@@ -4564,8 +4561,6 @@ impl MoqGStreamerDecoder {
 
     /// Parses DRM modifier from GStreamer caps (GStreamer 1.24+).
     fn parse_drm_modifier_from_sample(sample: &gstreamer::Sample) -> Option<u64> {
-        use gstreamer::prelude::*;
-
         let caps = sample.caps()?;
         let structure = caps.structure(0)?;
 
@@ -4597,7 +4592,6 @@ impl MoqGStreamerDecoder {
         width: u32,
         height: u32,
     ) -> Option<CpuFrame> {
-        use gstreamer::prelude::*;
         use gstreamer_video::VideoFormat;
 
         let map = buffer.map_readable().ok()?;
