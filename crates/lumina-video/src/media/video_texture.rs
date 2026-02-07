@@ -1221,7 +1221,7 @@ mod native_render_callback {
                     )
                 {
                     use crate::media::android_video::{
-                        is_yuv_hardware_buffer_format, is_yv12_format,
+                        is_yuv_candidate_hardware_buffer_format, is_yv12_format,
                         AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
                     };
 
@@ -1309,7 +1309,7 @@ mod native_render_callback {
                                 }
                             }
                         }
-                    } else if is_yuv_hardware_buffer_format(frame.format) {
+                    } else if is_yuv_candidate_hardware_buffer_format(frame.format) {
                         // YUV path - try true zero-copy first, fall back to CPU-assisted path
                         //
                         // True zero-copy: Uses raw Vulkan to import YUV planes and do GPU-side

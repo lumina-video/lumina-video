@@ -1221,6 +1221,15 @@ pub fn is_yuv_hardware_buffer_format(format: u32) -> bool {
     )
 }
 
+/// Returns true if this AHardwareBuffer format should be attempted via the YUV import path.
+///
+/// This is intentionally broader than `is_yuv_hardware_buffer_format`:
+/// vendor decoder formats (e.g. UBWC/SBWC/AFBC-backed external formats) are not part of
+/// the public AHB format enum but are valid YUV candidates for Vulkan external-format import.
+pub fn is_yuv_candidate_hardware_buffer_format(format: u32) -> bool {
+    format != AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM
+}
+
 /// Returns true if the AHardwareBuffer format is YV12 (3-plane: Y, V, U).
 ///
 /// YV12 is a planar format where V comes before U, which is opposite to I420/YUV420p.
@@ -1228,6 +1237,103 @@ pub fn is_yuv_hardware_buffer_format(format: u32) -> bool {
 /// shader's expected order (Y, U, V).
 pub fn is_yv12_format(format: u32) -> bool {
     format == AHARDWAREBUFFER_FORMAT_YV12
+}
+
+#[cfg(test)]
+mod format_routing_tests {
+    use super::*;
+
+    // Known vendor-proprietary HW decoder formats (not in public AHB enum).
+    // These are the formats that were previously misrouted to the dead-end else branch.
+    const QUALCOMM_UBWC: u32 = 0x7FA30C06; // Snapdragon (S21, Pixel 5, etc.)
+    const QUALCOMM_UBWC_NV12: u32 = 0x7FA30C04; // Older Snapdragon UBWC variant
+    const SAMSUNG_SBWC: u32 = 0x7FA30C07; // Exynos (Galaxy S series, non-US)
+    const MEDIATEK_AFBC: u32 = 0x7F000001; // Dimensity chipsets
+    const GOOGLE_TENSOR: u32 = 0x7F000100; // Pixel 6+
+
+    #[test]
+    fn rgba_routes_to_rgba_path_not_yuv() {
+        assert!(!is_yuv_hardware_buffer_format(
+            AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM
+        ));
+        assert!(!is_yuv_candidate_hardware_buffer_format(
+            AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM
+        ));
+    }
+
+    #[test]
+    fn known_yuv_formats_route_to_yuv_path() {
+        // NV12
+        assert!(is_yuv_hardware_buffer_format(
+            AHARDWAREBUFFER_FORMAT_Y8CB8CR8_420
+        ));
+        assert!(is_yuv_candidate_hardware_buffer_format(
+            AHARDWAREBUFFER_FORMAT_Y8CB8CR8_420
+        ));
+
+        // YV12
+        assert!(is_yuv_hardware_buffer_format(AHARDWAREBUFFER_FORMAT_YV12));
+        assert!(is_yuv_candidate_hardware_buffer_format(
+            AHARDWAREBUFFER_FORMAT_YV12
+        ));
+    }
+
+    #[test]
+    fn vendor_formats_route_to_yuv_path() {
+        let vendor_formats = [
+            (QUALCOMM_UBWC, "Qualcomm UBWC"),
+            (QUALCOMM_UBWC_NV12, "Qualcomm UBWC NV12"),
+            (SAMSUNG_SBWC, "Samsung SBWC"),
+            (MEDIATEK_AFBC, "MediaTek AFBC"),
+            (GOOGLE_TENSOR, "Google Tensor"),
+        ];
+
+        for (format, name) in vendor_formats {
+            // Must NOT be classified as strict YUV (used for PixelFormat metadata)
+            assert!(
+                !is_yuv_hardware_buffer_format(format),
+                "{name} (0x{format:08x}) should not be strict YUV"
+            );
+            // Must be classified as YUV candidate (routing to zero-copy pipeline)
+            assert!(
+                is_yuv_candidate_hardware_buffer_format(format),
+                "{name} (0x{format:08x}) should be a YUV candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_yuv_is_subset_of_candidate() {
+        // Every format recognized by the strict classifier must also be recognized by the candidate
+        let all_formats = [
+            AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+            AHARDWAREBUFFER_FORMAT_Y8CB8CR8_420,
+            AHARDWAREBUFFER_FORMAT_YV12,
+            QUALCOMM_UBWC,
+            QUALCOMM_UBWC_NV12,
+            SAMSUNG_SBWC,
+            MEDIATEK_AFBC,
+            GOOGLE_TENSOR,
+            0, // edge case: format zero
+        ];
+
+        for format in all_formats {
+            if is_yuv_hardware_buffer_format(format) {
+                assert!(
+                    is_yuv_candidate_hardware_buffer_format(format),
+                    "strict⊆candidate violated for format 0x{format:08x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn yv12_helper_consistent() {
+        assert!(is_yv12_format(AHARDWAREBUFFER_FORMAT_YV12));
+        assert!(!is_yv12_format(AHARDWAREBUFFER_FORMAT_Y8CB8CR8_420));
+        assert!(!is_yv12_format(AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM));
+        assert!(!is_yv12_format(QUALCOMM_UBWC));
+    }
 }
 
 /// Counter for generating unique player IDs

@@ -2009,7 +2009,7 @@ pub mod android {
                             ahb_external_format
                         );
                         return Err(ZeroCopyError::NotAvailable(
-                            "External-format AHardwareBuffers require VkExternalFormatANDROID which is not yet implemented".to_string(),
+                            "External-format AHardwareBuffers are not supported in RGBA import; use import_ahardwarebuffer_yuv_zero_copy".to_string(),
                         ));
                     }
 
