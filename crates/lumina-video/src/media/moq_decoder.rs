@@ -1071,7 +1071,7 @@ impl MoqDecoder {
                                 shared.frame_stats.received.fetch_add(1, Ordering::Relaxed) + 1;
 
                             stats_log_counter += 1;
-                            if stats_log_counter % 30 == 0 {
+                            if stats_log_counter.is_multiple_of(30) {
                                 shared.frame_stats.log_summary("worker");
                             }
 
@@ -1242,6 +1242,7 @@ impl MoqDecoder {
     /// AVCC sample may contain multiple NAL units (SPS/PPS/AUD before IDR),
     /// so we iterate all NALs and return true if any is type 5. The NAL length
     /// prefix size comes from avcC (lengthSizeMinusOne + 1).
+    #[allow(dead_code)]
     fn is_idr_frame(nal_data: &[u8], nal_length_size: usize) -> bool {
         if !(1..=4).contains(&nal_length_size) {
             return false;
@@ -1266,6 +1267,7 @@ impl MoqDecoder {
     }
 
     /// Gets the NAL type from AVCC data for logging.
+    #[allow(dead_code)]
     fn get_nal_type(nal_data: &[u8], nal_length_size: usize) -> u8 {
         if !(1..=4).contains(&nal_length_size) {
             return 0;
@@ -3758,6 +3760,7 @@ pub struct MoqGStreamerDecoder {
     /// Whether we've received the first keyframe (needed to start decoding)
     received_keyframe: bool,
     /// Codec detected from catalog (H264 or H265)
+    #[allow(dead_code)]
     codec: MoqVideoCodec,
     /// Locally cached metadata (safe copy from shared state)
     cached_metadata: VideoMetadata,

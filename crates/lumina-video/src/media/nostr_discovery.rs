@@ -252,7 +252,7 @@ async fn run_discovery(
         match tokio::time::timeout(Duration::from_millis(500), notifications.recv()).await {
             Ok(Ok(RelayPoolNotification::Event { event, .. })) => {
                 event_count += 1;
-                if event_count <= 5 || event_count % 50 == 0 {
+                if event_count <= 5 || event_count.is_multiple_of(50) {
                     tracing::debug!(
                         "Nostr: received event {} (kind {})",
                         event_count,

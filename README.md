@@ -434,7 +434,7 @@ cargo build --features windows-native-video
 lumina-video                            GPU backend: wgpu (Vulkan, Metal, DX12, WebGPU)
 ├── video_player.rs    # Main VideoPlayer widget (egui integration)
 ├── video_texture.rs   # wgpu::Texture management, YUV→RGB shaders
-├── zero_copy.rs       # Platform zero-copy: IOSurface, DMA-BUF, D3D11, AHB
+├── zero_copy.rs       # Platform zero-copy: IOSurface, DMA-BUF, D3D11→D3D12, AHB
 ├── frame_queue.rs     # Thread-safe frame buffer
 ├── macos_video.rs     # VideoToolbox (macOS)
 ├── linux_video.rs     # GStreamer + VA-API (Linux)
