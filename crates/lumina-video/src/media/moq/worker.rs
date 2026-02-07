@@ -138,11 +138,13 @@ pub(crate) async fn run_moq_worker(
                             is_keyframe: frame.keyframe,
                         };
 
-                        if recv_count <= 5 {
-                            let nal_type = moq_frame.data.get(4).map(|b| b & 0x1F).unwrap_or(0);
+                        if recv_count <= 10 {
+                            let mut preview = [0u8; 20];
+                            let n = moq_frame.data.len().min(20);
+                            preview[..n].copy_from_slice(&moq_frame.data[..n]);
                             tracing::info!(
-                                "MoQ {} frame #{}: is_keyframe={}, NAL type={}, {} bytes",
-                                label, recv_count, moq_frame.is_keyframe, nal_type, moq_frame.data.len()
+                                "MoQ {} recv frame #{}: is_keyframe={}, {} bytes, first_20={:02x?}",
+                                label, recv_count, moq_frame.is_keyframe, moq_frame.data.len(), &preview[..n],
                             );
                         }
 
@@ -244,7 +246,12 @@ fn build_connect_url(url: &MoqUrl) -> (String, Option<PathOwned>) {
             None => base,
         };
         let path = sanitize_path(url.namespace());
-        (connect, Some(PathOwned::from(path)))
+        let broadcast = if path.is_empty() {
+            None
+        } else {
+            Some(PathOwned::from(path))
+        };
+        (connect, broadcast)
     } else {
         // cdn.moq.dev style: include namespace in connection URL
         let base = format!("{}://{}/{}", scheme, url.server_addr(), url.namespace());
@@ -255,7 +262,13 @@ fn build_connect_url(url: &MoqUrl) -> (String, Option<PathOwned>) {
         // Use track (if specified) as the broadcast path
         (
             connect,
-            url.track().map(|t| PathOwned::from(sanitize_path(t))),
+            url.track().map(sanitize_path).and_then(|t| {
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(PathOwned::from(t))
+                }
+            }),
         )
     }
 }
@@ -265,7 +278,7 @@ fn build_connect_url(url: &MoqUrl) -> (String, Option<PathOwned>) {
 /// moq-lite's `announced()` panics (unwrap on None) if the prefix has a
 /// trailing slash that doesn't match the server-side path. This sanitizes
 /// user-provided namespace/track strings defensively.
-/// Ref: <https://github.com/moq-dev/moq/issues/910>
+/// See moq-dev/moq#910.
 fn sanitize_path(s: &str) -> String {
     s.trim_end_matches('/').to_string()
 }
@@ -717,5 +730,78 @@ async fn teardown_audio(
         if teardown_ms > 250 {
             tracing::warn!("MoQ {}: audio teardown took {}ms", label, teardown_ms);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::media::moq::MoqUrl;
+
+    #[test]
+    fn test_sanitize_path_strips_trailing_slashes() {
+        assert_eq!(sanitize_path("namespace/"), "namespace");
+        assert_eq!(sanitize_path("namespace///"), "namespace");
+        assert_eq!(sanitize_path("namespace"), "namespace");
+        assert_eq!(sanitize_path(""), "");
+        assert_eq!(sanitize_path("/"), "");
+    }
+
+    #[test]
+    fn test_build_connect_url_cdn_moq_dev_style() {
+        // cdn.moq.dev style: namespace in URL, track as broadcast path
+        let url = MoqUrl::parse("moqs://cdn.moq.dev/bbb").unwrap();
+        let (connect, path) = build_connect_url(&url);
+        assert_eq!(connect, "https://cdn.moq.dev:443/bbb");
+        assert!(path.is_none()); // no track → no broadcast path
+    }
+
+    #[test]
+    fn test_build_connect_url_cdn_moq_dev_with_track() {
+        let url = MoqUrl::parse("moqs://cdn.moq.dev/bbb/video0").unwrap();
+        let (connect, path) = build_connect_url(&url);
+        assert_eq!(connect, "https://cdn.moq.dev:443/bbb");
+        assert_eq!(path.as_ref().map(|p| p.to_string()), Some("video0".into()));
+    }
+
+    #[test]
+    fn test_build_connect_url_uuid_broadcast() {
+        // zap.stream style: UUID namespace → broadcast path
+        let url =
+            MoqUrl::parse("moqs://relay.example.com/537a365c-f1ec-44ac-af10-22d14a7319fb").unwrap();
+        let (connect, path) = build_connect_url(&url);
+        assert_eq!(connect, "https://relay.example.com:443");
+        assert_eq!(
+            path.as_ref().map(|p| p.to_string()),
+            Some("537a365c-f1ec-44ac-af10-22d14a7319fb".into())
+        );
+    }
+
+    #[test]
+    fn test_build_connect_url_trailing_slash_sanitized() {
+        // Ensure trailing slashes in track are stripped (prevents announced() panic)
+        let url = MoqUrl::parse("moqs://cdn.moq.dev/bbb/video0/").unwrap();
+        let (_connect, path) = build_connect_url(&url);
+        // track() returns "video0/" from the parser, sanitize_path strips the slash
+        if let Some(p) = path {
+            assert!(!p.to_string().ends_with('/'), "path should not end with /");
+        }
+    }
+
+    #[test]
+    fn test_build_connect_url_localhost_no_tls() {
+        let url = MoqUrl::parse("moq://localhost:4443/test").unwrap();
+        let (connect, _path) = build_connect_url(&url);
+        assert!(
+            connect.starts_with("http://"),
+            "localhost moq:// should use http"
+        );
+    }
+
+    #[test]
+    fn test_build_connect_url_with_jwt_query() {
+        let url = MoqUrl::parse("moqs://cdn.moq.dev/bbb?jwt=abc123").unwrap();
+        let (connect, _path) = build_connect_url(&url);
+        assert!(connect.contains("?jwt=abc123"));
     }
 }

@@ -532,55 +532,117 @@ impl MoqDecoder {
         self.shared.audio_info.lock().clone()
     }
 
-    /// Checks if AVCC data contains an IDR frame (H.264 NAL type 5).
-    /// The hang crate's is_keyframe flag can be wrong when joining mid-stream.
-    /// AVCC sample may contain multiple NAL units (SPS/PPS/AUD before IDR),
-    /// so we iterate all NALs and return true if any is type 5. The NAL length
-    /// prefix size comes from avcC (lengthSizeMinusOne + 1).
+    /// Checks if data contains an IDR frame (H.264 NAL type 5).
+    ///
+    /// Auto-detects Annex B (start codes) vs AVCC (length-prefixed) format.
+    /// The hang crate's is_keyframe flag can be wrong when joining mid-stream,
+    /// so we parse actual NAL types. Returns true if any NAL is type 5.
     #[allow(dead_code)]
     fn is_idr_frame(nal_data: &[u8], nal_length_size: usize) -> bool {
-        if !(1..=4).contains(&nal_length_size) {
-            return false;
-        }
-        let mut offset = 0usize;
-        while offset + nal_length_size <= nal_data.len() {
-            let mut nal_len = 0usize;
-            for i in 0..nal_length_size {
-                nal_len = (nal_len << 8) | nal_data[offset + i] as usize;
-            }
-            offset += nal_length_size;
-            if nal_len == 0 || offset + nal_len > nal_data.len() {
-                break;
-            }
-            let nal_type = nal_data[offset] & 0x1F;
-            if nal_type == 5 {
-                return true;
-            }
-            offset += nal_len;
-        }
-        false
+        let (types, count) = Self::find_nal_types(nal_data, nal_length_size);
+        types[..count].contains(&5)
     }
 
-    /// Gets the NAL type from AVCC data for logging.
+    /// Gets the first NAL type from data for logging.
     #[allow(dead_code)]
     fn get_nal_type(nal_data: &[u8], nal_length_size: usize) -> u8 {
-        if !(1..=4).contains(&nal_length_size) {
-            return 0;
-        }
-        if nal_data.len() > nal_length_size {
-            nal_data[nal_length_size] & 0x1F
+        let (types, count) = Self::find_nal_types(nal_data, nal_length_size);
+        if count > 0 {
+            types[0]
         } else {
             0
         }
     }
 
+    /// Max NAL units we track per sample (AUD + SPS + PPS + SEI + IDR + spare).
+    const MAX_NAL_TYPES: usize = 8;
+
+    /// Returns all NAL types found in data, auto-detecting Annex B vs AVCC format.
+    /// Uses a fixed-size stack buffer to avoid heap allocation on the per-frame path.
+    fn find_nal_types(
+        nal_data: &[u8],
+        nal_length_size: usize,
+    ) -> ([u8; Self::MAX_NAL_TYPES], usize) {
+        if Self::data_is_annex_b(nal_data) {
+            Self::find_nal_types_annex_b(nal_data)
+        } else {
+            Self::find_nal_types_avcc(nal_data, nal_length_size)
+        }
+    }
+
+    /// Check if data starts with Annex B start codes.
+    fn data_is_annex_b(data: &[u8]) -> bool {
+        matches!(data, [0, 0, 0, 1, ..] | [0, 0, 1, ..])
+    }
+
+    /// Extract NAL types from Annex B bitstream (start-code delimited).
+    fn find_nal_types_annex_b(data: &[u8]) -> ([u8; Self::MAX_NAL_TYPES], usize) {
+        let mut types = [0u8; Self::MAX_NAL_TYPES];
+        let mut count = 0;
+        let mut i = 0;
+        while i < data.len() && count < Self::MAX_NAL_TYPES {
+            let sc_len = if data.get(i..i + 4) == Some(&[0, 0, 0, 1]) {
+                4
+            } else if data.get(i..i + 3) == Some(&[0, 0, 1]) {
+                3
+            } else {
+                i += 1;
+                continue;
+            };
+            let nal_start = i + sc_len;
+            if let Some(&byte) = data.get(nal_start) {
+                types[count] = byte & 0x1F;
+                count += 1;
+            }
+            i = nal_start + 1;
+        }
+        (types, count)
+    }
+
+    /// Extract NAL types from AVCC data (length-prefixed).
+    fn find_nal_types_avcc(
+        nal_data: &[u8],
+        nal_length_size: usize,
+    ) -> ([u8; Self::MAX_NAL_TYPES], usize) {
+        let mut types = [0u8; Self::MAX_NAL_TYPES];
+        let mut count = 0;
+        if !(1..=4).contains(&nal_length_size) {
+            return (types, count);
+        }
+        let mut offset = 0usize;
+        while offset + nal_length_size <= nal_data.len() && count < Self::MAX_NAL_TYPES {
+            let len_bytes = match nal_data.get(offset..offset + nal_length_size) {
+                Some(b) => b,
+                None => break,
+            };
+            let mut nal_len = 0usize;
+            for &byte in len_bytes {
+                nal_len = (nal_len << 8) | byte as usize;
+            }
+            offset += nal_length_size;
+            if nal_len == 0 || offset + nal_len > nal_data.len() {
+                break;
+            }
+            types[count] = match nal_data.get(offset) {
+                Some(&b) => b & 0x1F,
+                None => break,
+            };
+            count += 1;
+            offset += nal_len;
+        }
+        (types, count)
+    }
+
     /// Returns true if frame should be skipped while waiting for an IDR resync.
+    /// Accepts both IDR frames (NAL type 5) and hang-flagged keyframes (NAL type 1 I-frames)
+    /// as valid resync points, since moq-lite guarantees group-boundary keyframes.
     #[cfg(target_os = "macos")]
     fn should_wait_for_idr(&self, moq_frame: &MoqVideoFrame) -> bool {
         if !self.waiting_for_idr_after_error {
             return false;
         }
-        !Self::is_idr_frame(&moq_frame.data, self.h264_nal_length_size)
+        // Accept IDR (NAL 5) or hang's is_keyframe flag as resync point
+        !Self::is_idr_frame(&moq_frame.data, self.h264_nal_length_size) && !moq_frame.is_keyframe
     }
 
     /// Decodes an encoded frame.
@@ -656,30 +718,55 @@ impl MoqDecoder {
             )));
         }
 
-        // CRITICAL: Check actual NAL type, not just is_keyframe flag.
-        // When joining a MoQ stream mid-session, the first frame may be marked
-        // as keyframe by hang but actually be a P-frame (NAL type 1).
-        // VideoToolbox requires an actual IDR frame (NAL type 5) to start decoding.
-        let is_idr = Self::is_idr_frame(&moq_frame.data, self.h264_nal_length_size);
+        // Check NAL types for diagnostics and keyframe validation.
+        // H.264 keyframes can be either NAL type 5 (IDR) or NAL type 1 (non-IDR I-frame).
+        // moq-lite guarantees group-boundary joins, so the first frame in a group is always
+        // a keyframe. We trust hang's is_keyframe flag for first-frame acceptance.
+        let (nal_types_arr, nal_count) =
+            Self::find_nal_types(&moq_frame.data, self.h264_nal_length_size);
+        let nal_types = &nal_types_arr[..nal_count];
+        let is_annex_b = Self::data_is_annex_b(&moq_frame.data);
+        let is_idr = nal_types.contains(&5);
         if let Some(ref decoder) = self.vt_decoder {
-            // If we haven't decoded any frames yet, we MUST have an IDR frame
             let frame_count = decoder.frame_count();
-            if frame_count == 0 && !is_idr {
-                let nal_type = Self::get_nal_type(&moq_frame.data, self.h264_nal_length_size);
-                tracing::debug!(
-                    "MoQ: waiting for IDR frame (got NAL type {}, is_keyframe={}, {} bytes)",
-                    nal_type,
+
+            // Log first 10 frames at INFO level for pipeline diagnostics
+            if frame_count < 10 {
+                let mut preview = [0u8; 20];
+                let preview_len = moq_frame.data.len().min(20);
+                preview[..preview_len].copy_from_slice(&moq_frame.data[..preview_len]);
+                tracing::info!(
+                    "MoQ decode frame #{}: {} bytes, is_keyframe={}, format={}, NAL types={:?}, is_idr={}, first 20 bytes={:02x?}",
+                    frame_count,
+                    moq_frame.data.len(),
                     moq_frame.is_keyframe,
-                    moq_frame.data.len()
+                    if is_annex_b { "AnnexB" } else { "AVCC" },
+                    nal_types,
+                    is_idr,
+                    &preview[..preview_len],
+                );
+            }
+
+            // First frame: accept if IDR (NAL 5) OR if hang marks it as keyframe (NAL 1 I-frame).
+            // moq-lite guarantees group-boundary joins with keyframes, so is_keyframe=true
+            // from hang is trustworthy — the frame is an intra-coded I-frame even if not IDR.
+            if frame_count == 0 && !is_idr && !moq_frame.is_keyframe {
+                tracing::warn!(
+                    "MoQ: dropping frame #{} — not a keyframe (NAL types={:?}, is_keyframe={}, {} bytes, format={})",
+                    frame_count,
+                    nal_types,
+                    moq_frame.is_keyframe,
+                    moq_frame.data.len(),
+                    if is_annex_b { "AnnexB" } else { "AVCC" },
                 );
                 return Err(VideoError::DecodeFailed(format!(
-                    "Waiting for IDR frame (got NAL type {})",
-                    nal_type
+                    "Waiting for keyframe (got NAL types {:?})",
+                    nal_types
                 )));
             }
 
-            // If we were waiting for IDR and got one, clear error state and prepare decoder
-            if self.waiting_for_idr_after_error && is_idr {
+            // If we were waiting for IDR and got a keyframe, clear error state and prepare decoder
+            if self.waiting_for_idr_after_error && (is_idr || moq_frame.is_keyframe) {
                 if let Some(ref mut decoder) = self.vt_decoder {
                     decoder.prepare_for_idr_resync();
                 }
@@ -1263,6 +1350,15 @@ mod macos_vt {
             sampleSizeArray: *const usize,
             sampleBufferOut: *mut *mut c_void,
         ) -> i32;
+
+        fn CMSampleBufferGetSampleAttachmentsArray(
+            sbuf: *mut c_void,
+            createIfNecessary: bool,
+        ) -> *const c_void;
+
+        /// kCMSampleAttachmentKey_DependsOnOthers: kCFBooleanFalse = sync sample (keyframe)
+        static kCMSampleAttachmentKey_DependsOnOthers: *const c_void;
+        static kCMSampleAttachmentKey_NotSync: *const c_void;
     }
 
     // VideoToolbox framework
@@ -1295,9 +1391,13 @@ mod macos_vt {
     extern "C" {
         fn CFRelease(cf: *const c_void);
         fn CFRetain(cf: *const c_void) -> *const c_void;
+        fn CFArrayGetValueAtIndex(theArray: *const c_void, idx: isize) -> *const c_void;
+        fn CFDictionarySetValue(theDict: *const c_void, key: *const c_void, value: *const c_void);
         /// Null allocator - performs no allocation/deallocation.
         /// Use this for caller-owned memory passed to CM functions.
         static kCFAllocatorNull: *const c_void;
+        static kCFBooleanTrue: *const c_void;
+        static kCFBooleanFalse: *const c_void;
     }
 
     /// Wrapper for CVPixelBuffer (raw pointer) that releases on drop.
@@ -1803,8 +1903,51 @@ mod macos_vt {
                 )));
             }
 
+            // SAFETY: Mutate the sample attachment dictionary to set keyframe flags.
+            //
+            // - `sample_buffer_ptr` is a valid CMSampleBufferRef created by
+            //   `CMSampleBufferCreate` above with `num_samples = 1`, so sample
+            //   index 0 is the only valid index.
+            // - `CMSampleBufferGetSampleAttachmentsArray(sample_buffer_ptr, true)`
+            //   returns a retained CFArrayRef with one entry per sample (i.e. one
+            //   mutable CFDictionaryRef at index 0), or null on failure.
+            // - `CFArrayGetValueAtIndex(attachments, 0)` yields a non-null
+            //   CFDictionaryRef that we may mutate via `CFDictionarySetValue`
+            //   because the array was obtained with `createIfNecessary = true`.
+            // - Both pointers are checked for null before use.
+            // - `is_keyframe` guards which keys are set: keyframes get
+            //   DependsOnOthers=false + NotSync=false; non-keyframes get
+            //   DependsOnOthers=true.
+            unsafe {
+                let attachments = CMSampleBufferGetSampleAttachmentsArray(sample_buffer_ptr, true);
+                if !attachments.is_null() {
+                    let dict = CFArrayGetValueAtIndex(attachments, 0);
+                    if !dict.is_null() {
+                        if is_keyframe {
+                            CFDictionarySetValue(
+                                dict,
+                                kCMSampleAttachmentKey_DependsOnOthers,
+                                kCFBooleanFalse,
+                            );
+                            CFDictionarySetValue(
+                                dict,
+                                kCMSampleAttachmentKey_NotSync,
+                                kCFBooleanFalse,
+                            );
+                        } else {
+                            CFDictionarySetValue(
+                                dict,
+                                kCMSampleAttachmentKey_DependsOnOthers,
+                                kCFBooleanTrue,
+                            );
+                        }
+                    }
+                }
+            }
+
             tracing::debug!(
-                "VTDecoder: CMSampleBuffer created, calling VTDecompressionSessionDecodeFrame"
+                "VTDecoder: CMSampleBuffer created (keyframe={}), calling VTDecompressionSessionDecodeFrame",
+                is_keyframe
             );
 
             // Decode the frame synchronously for MoQ live streams
@@ -2123,7 +2266,10 @@ mod macos_vt {
         }
         if info_flags & 0x2 != 0 {
             // kVTDecodeInfo_FrameDropped
-            tracing::debug!("VT decode: frame dropped (info_flags=0x{:x})", info_flags);
+            tracing::warn!(
+                "VT decode: frame dropped by VideoToolbox (info_flags=0x{:x})",
+                info_flags
+            );
             return;
         }
         if info_flags & 0x4 != 0 {

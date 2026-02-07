@@ -77,6 +77,7 @@ fn get_moq_test_streams() -> Vec<(String, String)> {
 
 /// Known MoQ relay endpoints for manual entry
 const MOQ_RELAYS: &[(&str, &str)] = &[
+    ("localhost (anon)", "moq://localhost:4443/anon"),
     ("cdn.moq.dev (anon)", "moqs://cdn.moq.dev:443/anon"),
     ("cdn.moq.dev", "moqs://cdn.moq.dev:443"),
     (
@@ -754,7 +755,7 @@ impl eframe::App for DemoApp {
                                         let fps_color = if measured >= metadata.frame_rate * 0.95 {
                                             egui::Color32::GREEN
                                         } else if measured >= metadata.frame_rate * 0.8 {
-                                            egui::Color32::YELLOW
+                                            egui::Color32::from_rgb(255, 165, 0) // orange
                                         } else {
                                             egui::Color32::RED
                                         };

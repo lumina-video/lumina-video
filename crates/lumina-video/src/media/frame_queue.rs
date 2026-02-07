@@ -497,6 +497,7 @@ fn decode_loop<D: VideoDecoderBackend>(
     // Try multiple times since streaming decoders (HTTP, ExoPlayer) need time to buffer
     let mut preview_attempts = 0;
     let max_preview_attempts = 30; // Try for up to ~3 seconds for slow HTTP streams
+    let mut preview_dims: Option<(u32, u32)> = None;
 
     loop {
         // Check for early termination (user closed video)
@@ -511,6 +512,7 @@ fn decode_loop<D: VideoDecoderBackend>(
                 let (w, h) = frame.dimensions();
                 if w > 1 && h > 1 {
                     tracing::info!("Decoded preview frame at {:?} ({}x{})", frame.pts, w, h);
+                    preview_dims = Some((w, h));
                     let _ = frame_queue.try_push(frame);
                     break;
                 } else {
@@ -546,48 +548,66 @@ fn decode_loop<D: VideoDecoderBackend>(
 
     // Wait for metadata to become available (ExoPlayer needs time to determine duration/dimensions)
     // This is important because pausing too early may prevent ExoPlayer from reporting metadata
-    let metadata_wait_start = std::time::Instant::now();
-    let metadata_timeout = Duration::from_secs(3);
-
-    loop {
-        // Check for early termination (user closed video)
-        if stop_flag.load(Ordering::Acquire) {
-            tracing::debug!("Metadata loop interrupted by stop signal");
-            return;
+    //
+    // For live streams (no duration), skip this wait entirely if we already have dimensions
+    // from the preview frame. Live stream decoders (MoQ) never report duration, and their
+    // cached_metadata only syncs in decode_next() — which isn't called during this loop.
+    // Without this bypass, MoQ streams always stall for the full 3-second timeout.
+    let is_live = decoder.duration().is_none();
+    if is_live && preview_dims.is_some() {
+        tracing::info!(
+            "Live stream: using preview dimensions {:?}, skipping metadata wait",
+            preview_dims
+        );
+        *shared_dimensions.lock() = preview_dims;
+        let fps = decoder.metadata().frame_rate;
+        if fps > 0.0 {
+            *shared_frame_rate.lock() = Some(fps);
         }
+    } else {
+        let metadata_wait_start = std::time::Instant::now();
+        let metadata_timeout = Duration::from_secs(3);
 
-        let duration_opt = decoder.duration();
-        let has_duration = duration_opt.is_some();
-        let dims = decoder.dimensions();
-        let has_dimensions = dims.0 > 1 && dims.1 > 1; // >1 to exclude placeholder
-
-        if has_duration && has_dimensions {
-            *shared_duration.lock() = duration_opt;
-            *shared_dimensions.lock() = Some(dims);
-            let fps = decoder.metadata().frame_rate;
-            if fps > 0.0 {
-                *shared_frame_rate.lock() = Some(fps);
+        loop {
+            // Check for early termination (user closed video)
+            if stop_flag.load(Ordering::Acquire) {
+                tracing::debug!("Metadata loop interrupted by stop signal");
+                return;
             }
-            break;
-        }
 
-        if metadata_wait_start.elapsed() > metadata_timeout {
-            tracing::warn!("Timeout waiting for video metadata");
-            // Store whatever we have
-            if let Some(dur) = duration_opt {
-                *shared_duration.lock() = Some(dur);
-            }
-            if dims.0 > 0 && dims.1 > 0 {
+            let duration_opt = decoder.duration();
+            let has_duration = duration_opt.is_some();
+            let dims = decoder.dimensions();
+            let has_dimensions = dims.0 > 1 && dims.1 > 1; // >1 to exclude placeholder
+
+            if has_duration && has_dimensions {
+                *shared_duration.lock() = duration_opt;
                 *shared_dimensions.lock() = Some(dims);
+                let fps = decoder.metadata().frame_rate;
+                if fps > 0.0 {
+                    *shared_frame_rate.lock() = Some(fps);
+                }
+                break;
             }
-            let fps = decoder.metadata().frame_rate;
-            if fps > 0.0 {
-                *shared_frame_rate.lock() = Some(fps);
-            }
-            break;
-        }
 
-        thread::sleep(Duration::from_millis(100));
+            if metadata_wait_start.elapsed() > metadata_timeout {
+                tracing::warn!("Timeout waiting for video metadata");
+                // Store whatever we have
+                if let Some(dur) = duration_opt {
+                    *shared_duration.lock() = Some(dur);
+                }
+                if dims.0 > 0 && dims.1 > 0 {
+                    *shared_dimensions.lock() = Some(dims);
+                }
+                let fps = decoder.metadata().frame_rate;
+                if fps > 0.0 {
+                    *shared_frame_rate.lock() = Some(fps);
+                }
+                break;
+            }
+
+            thread::sleep(Duration::from_millis(100));
+        }
     }
 
     // Pause the decoder after getting preview frame (for decoders like ExoPlayer that auto-play)
@@ -1317,7 +1337,7 @@ impl FrameScheduler {
             let ahead_tolerance = if audio_started {
                 Duration::from_millis(2000) // Normal tolerance for seek recovery
             } else {
-                Duration::from_millis(100) // Tight tolerance while waiting for audio
+                Duration::from_millis(500) // Match audio startup budget (sync_position holds for 500ms)
             };
             let should_accept =
                 next_pts <= current_pos + ahead_tolerance || self.current_frame.is_none();
