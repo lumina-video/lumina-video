@@ -1633,7 +1633,7 @@ impl MoqDecoder {
 
             // Find end of this NAL unit
             let mut nal_end = data.len();
-            for j in nal_start + 1..data.len() - 2 {
+            for j in nal_start + 1..data.len().saturating_sub(2) {
                 if data[j] == 0 && data[j + 1] == 0 {
                     if j + 2 < data.len() && data[j + 2] == 1 {
                         nal_end = j;
@@ -2384,6 +2384,7 @@ mod macos_vt {
         /// The NAL unit can be in:
         /// - AVCC format (length-prefixed NALs) - used by MoQ/hang
         /// - Annex B format (start code prefixed) - used by raw H.264 streams
+        ///
         /// Returns the decoded VideoFrame with IOSurface-backed GPU surface.
         pub fn decode_frame(
             &mut self,
@@ -2621,7 +2622,7 @@ mod macos_vt {
             if nal_len > 0 && nal_len <= data.len() - 4 {
                 let nal_type = data[4] & 0x1F;
                 // Valid H.264 NAL types are 1-23
-                if nal_type >= 1 && nal_type <= 23 {
+                if (1..=23).contains(&nal_type) {
                     return true;
                 }
             }
@@ -2660,7 +2661,7 @@ mod macos_vt {
                 let nal_start = i + start_code_len;
                 let mut nal_end = nal_data.len();
 
-                for j in nal_start..nal_data.len() - 2 {
+                for j in nal_start..nal_data.len().saturating_sub(2) {
                     if nal_data[j] == 0 && nal_data[j + 1] == 0 {
                         if j + 2 < nal_data.len() && nal_data[j + 2] == 1 {
                             nal_end = j;
