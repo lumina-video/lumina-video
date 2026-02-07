@@ -243,7 +243,8 @@ fn build_connect_url(url: &MoqUrl) -> (String, Option<PathOwned>) {
             Some(query) => format!("{}?{}", base, query),
             None => base,
         };
-        (connect, Some(PathOwned::from(url.namespace().to_string())))
+        let path = sanitize_path(url.namespace());
+        (connect, Some(PathOwned::from(path)))
     } else {
         // cdn.moq.dev style: include namespace in connection URL
         let base = format!("{}://{}/{}", scheme, url.server_addr(), url.namespace());
@@ -252,8 +253,21 @@ fn build_connect_url(url: &MoqUrl) -> (String, Option<PathOwned>) {
             None => base,
         };
         // Use track (if specified) as the broadcast path
-        (connect, url.track().map(|t| PathOwned::from(t.to_string())))
+        (
+            connect,
+            url.track().map(|t| PathOwned::from(sanitize_path(t))),
+        )
     }
+}
+
+/// Strip trailing slashes from a path string.
+///
+/// moq-lite's `announced()` panics (unwrap on None) if the prefix has a
+/// trailing slash that doesn't match the server-side path. This sanitizes
+/// user-provided namespace/track strings defensively.
+/// Ref: <https://github.com/moq-dev/moq/issues/910>
+fn sanitize_path(s: &str) -> String {
+    s.trim_end_matches('/').to_string()
 }
 
 /// Two-phase connect: try QUIC first, then WebSocket fallback.
@@ -554,17 +568,16 @@ async fn fetch_and_validate_catalog(
         );
     }
 
-    // Determine max latency: use catalog jitter if available, otherwise config default
+    // Determine max latency: prefer catalog jitter (publisher-recommended buffer),
+    // fall back to config default (500ms) when the catalog has no jitter field.
     let max_latency = if let Some(jitter) = video_config.jitter {
         let jitter_ms = jitter.as_millis() as u64;
-        let effective_ms = jitter_ms.max(config.max_latency_ms);
         tracing::info!(
-            "MoQ {}: Using catalog jitter {}ms (effective latency: {}ms)",
+            "MoQ {}: Using catalog jitter {}ms as latency buffer",
             label,
             jitter_ms,
-            effective_ms,
         );
-        Duration::from_millis(effective_ms)
+        Duration::from_millis(jitter_ms)
     } else {
         tracing::info!(
             "MoQ {}: No jitter in catalog, using default {}ms",
