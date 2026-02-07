@@ -139,6 +139,8 @@ pub struct WebMoqUrl {
     /// Track name (reserved for track-specific subscriptions)
     #[allow(dead_code)]
     track: Option<String>,
+    /// Query string (e.g., "jwt=xxx" for authentication)
+    query: Option<String>,
     /// Original URL (reserved for debugging/logging)
     #[allow(dead_code)]
     original: String,
@@ -158,6 +160,12 @@ impl WebMoqUrl {
             return Err(VideoError::OpenFailed(
                 "URL must start with moq:// or moqs://".to_string(),
             ));
+        };
+
+        // Split off query string before parsing path
+        let (rest, query) = match rest.find('?') {
+            Some(idx) => (&rest[..idx], Some(rest[idx + 1..].to_string())),
+            None => (rest, None),
         };
 
         // Split host:port from path
@@ -209,6 +217,7 @@ impl WebMoqUrl {
             use_tls,
             namespace,
             track,
+            query,
             original,
         })
     }
@@ -216,7 +225,10 @@ impl WebMoqUrl {
     /// Returns the WebTransport URL for connection.
     pub fn webtransport_url(&self) -> String {
         let scheme = if self.use_tls { "https" } else { "http" };
-        format!("{}://{}:{}", scheme, self.host, self.port)
+        match &self.query {
+            Some(q) => format!("{}://{}:{}?{}", scheme, self.host, self.port, q),
+            None => format!("{}://{}:{}", scheme, self.host, self.port),
+        }
     }
 
     /// Returns the namespace.

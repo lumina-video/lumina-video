@@ -154,10 +154,15 @@ impl ReorderBuffer {
 /// Statistics for the reorder buffer.
 #[derive(Debug, Clone, Copy)]
 pub struct ReorderBufferStats {
+    /// Total frames inserted into the buffer.
     pub frames_received: u64,
+    /// Frames dropped (arrived too late or evicted when buffer was full).
     pub frames_dropped: u64,
+    /// Frames emitted in correct sequence order.
     pub frames_emitted: u64,
+    /// Frames currently waiting in the buffer for missing predecessors.
     pub pending_count: usize,
+    /// Next sequence number expected for in-order emission.
     pub next_sequence: u64,
 }
 
@@ -386,7 +391,7 @@ mod tests {
         };
         let ready = buffer.insert(frame0);
         assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0], Bytes::from("frame0"));
+        assert_eq!(ready.first(), Some(&Bytes::from("frame0")));
 
         let frame1 = MoqFrame {
             group_sequence: 0,
@@ -396,7 +401,7 @@ mod tests {
         };
         let ready = buffer.insert(frame1);
         assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0], Bytes::from("frame1"));
+        assert_eq!(ready.first(), Some(&Bytes::from("frame1")));
     }
 
     #[test]
@@ -422,8 +427,8 @@ mod tests {
         };
         let ready = buffer.insert(frame0);
         assert_eq!(ready.len(), 2); // Both frames now ready
-        assert_eq!(ready[0], Bytes::from("frame0"));
-        assert_eq!(ready[1], Bytes::from("frame1"));
+        assert_eq!(ready.first(), Some(&Bytes::from("frame0")));
+        assert_eq!(ready.get(1), Some(&Bytes::from("frame1")));
     }
 
     #[test]
