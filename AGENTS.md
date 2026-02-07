@@ -213,6 +213,25 @@ fn potentially_slow_operation() {
 }
 ```
 
+## Media Performance Contracts
+
+### Zero-Copy Invariants
+- Decoder output must remain on GPU/native surfaces whenever platform APIs allow.
+- No CPU pixel copies in steady-state playback.
+- Any required copy must be documented with platform reason and measured impact.
+- PRs adding new copies in decode/render paths require perf data justifying the regression.
+
+### Hot-Path Rules
+- No heap allocations in per-frame decode/render/present paths.
+- No blocking calls, no synchronous I/O, no unbounded queues in frame-critical threads.
+- No mutex contention in frame-critical paths; use lock-free or bounded SPSC designs.
+
+### Clocking, Backpressure, and Recovery
+- Define one master clock (audio or wall clock) and enforce drift correction policy.
+- Use bounded queues with explicit drop policy (`drop_oldest` by default for live).
+- On overload, prefer frame drop over latency growth.
+- On discontinuity (seek/network gap), perform bounded resync with explicit timeout.
+
 ## Code Reuse
 
 ### Don't Duplicate
