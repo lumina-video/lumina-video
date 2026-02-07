@@ -54,9 +54,11 @@ use std::time::Duration;
 
 use super::moq::{AudioTrackInfo, MoqTransportConfig, MoqUrl, VideoTrackInfo};
 use super::video::{
-    CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend, VideoError,
-    VideoFrame, VideoMetadata,
+    DecodedFrame, HwAccelType, PixelFormat, VideoDecoderBackend, VideoError, VideoFrame,
+    VideoMetadata,
 };
+#[cfg(not(target_os = "macos"))]
+use super::video::{CpuFrame, Plane};
 #[cfg(target_os = "macos")]
 use super::video_decoder::HwAccelConfig;
 
