@@ -153,8 +153,9 @@ struct DemoApp {
     moq_broadcast_name: String,
     /// Show MoQ help window
     show_moq_help: bool,
-    /// Nostr stream discovery service
+    /// Nostr stream discovery service (kept alive; events come via nostr_event_rx)
     #[cfg(feature = "moq")]
+    #[allow(dead_code)]
     nostr_discovery: Option<NostrDiscovery>,
     /// Receiver for nostr discovery events
     #[cfg(feature = "moq")]
@@ -248,7 +249,7 @@ impl DemoApp {
         cc.egui_ctx.set_fonts(fonts);
 
         // Start with the first sample video (with safe fallback)
-        let first_sample = SAMPLE_VIDEOS.get(0);
+        let first_sample = SAMPLE_VIDEOS.first();
         let player = cc.wgpu_render_state.as_ref().and_then(|render_state| {
             first_sample.map(|(_, url, _)| {
                 VideoPlayer::with_wgpu(*url, render_state)
@@ -454,7 +455,7 @@ impl eframe::App for DemoApp {
                 #[cfg(feature = "moq")]
                 {
                     if let Some(moq) = player.moq_stats() {
-                        self.fps_tracker.update(moq.frame_stats.rendered as u64);
+                        self.fps_tracker.update(moq.frame_stats.rendered);
                     } else {
                         self.fps_tracker.update_ui_frame();
                     }
@@ -619,7 +620,7 @@ impl eframe::App for DemoApp {
                             let relay = MOQ_RELAYS
                                 .get(self.selected_moq_relay)
                                 .map(|(_, url)| *url)
-                                .or_else(|| MOQ_RELAYS.get(0).map(|(_, url)| *url))
+                                .or_else(|| MOQ_RELAYS.first().map(|(_, url)| *url))
                                 .expect("MOQ_RELAYS is empty");
                             let url = format!("{}/{}", relay, self.moq_broadcast_name.trim());
                             if let Some(render_state) = frame.wgpu_render_state() {

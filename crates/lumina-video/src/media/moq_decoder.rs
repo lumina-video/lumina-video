@@ -53,10 +53,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::moq::{AudioTrackInfo, MoqTransportConfig, MoqUrl, VideoTrackInfo};
+#[cfg(not(target_os = "macos"))]
+use super::video::{CpuFrame, Plane};
 use super::video::{
     DecodedFrame, HwAccelType, PixelFormat, VideoDecoderBackend, VideoError, VideoFrame,
     VideoMetadata,
 };
+#[cfg(target_os = "macos")]
 use super::video_decoder::HwAccelConfig;
 
 use async_channel::{Receiver, Sender};
@@ -131,7 +134,8 @@ pub enum MoqDecoderState {
 pub struct MoqDecoderConfig {
     /// Transport configuration
     pub transport: MoqTransportConfig,
-    /// Hardware acceleration configuration
+    /// Hardware acceleration configuration (macOS only)
+    #[cfg(target_os = "macos")]
     pub hw_accel: HwAccelConfig,
     /// Maximum latency for track subscription (frames older than this are skipped)
     pub max_latency_ms: u64,
@@ -150,6 +154,7 @@ impl Default for MoqDecoderConfig {
     fn default() -> Self {
         Self {
             transport: MoqTransportConfig::default(),
+            #[cfg(target_os = "macos")]
             hw_accel: HwAccelConfig::default(),
             max_latency_ms: 500, // 500ms max latency for live streaming
             enable_audio: true,
@@ -1068,7 +1073,7 @@ impl MoqDecoder {
                                 shared.frame_stats.received.fetch_add(1, Ordering::Relaxed) + 1;
 
                             stats_log_counter += 1;
-                            if stats_log_counter % 30 == 0 {
+                            if stats_log_counter.is_multiple_of(30) {
                                 shared.frame_stats.log_summary("worker");
                             }
 
@@ -1239,6 +1244,7 @@ impl MoqDecoder {
     /// AVCC sample may contain multiple NAL units (SPS/PPS/AUD before IDR),
     /// so we iterate all NALs and return true if any is type 5. The NAL length
     /// prefix size comes from avcC (lengthSizeMinusOne + 1).
+    #[allow(dead_code)]
     fn is_idr_frame(nal_data: &[u8], nal_length_size: usize) -> bool {
         if !(1..=4).contains(&nal_length_size) {
             return false;
@@ -1263,11 +1269,12 @@ impl MoqDecoder {
     }
 
     /// Gets the NAL type from AVCC data for logging.
+    #[allow(dead_code)]
     fn get_nal_type(nal_data: &[u8], nal_length_size: usize) -> u8 {
         if !(1..=4).contains(&nal_length_size) {
             return 0;
         }
-        if nal_data.len() >= nal_length_size + 1 {
+        if nal_data.len() > nal_length_size {
             nal_data[nal_length_size] & 0x1F
         } else {
             0
@@ -3054,6 +3061,8 @@ pub mod android {
                     height: 0,
                     frame_rate: 0.0,
                     duration: None,
+                    pixel_aspect_ratio: 1.0,
+                    start_time: None,
                 },
             })
         }
@@ -3753,6 +3762,7 @@ pub struct MoqGStreamerDecoder {
     /// Whether we've received the first keyframe (needed to start decoding)
     received_keyframe: bool,
     /// Codec detected from catalog (H264 or H265)
+    #[allow(dead_code)]
     codec: MoqVideoCodec,
     /// Locally cached metadata (safe copy from shared state)
     cached_metadata: VideoMetadata,
@@ -3887,6 +3897,7 @@ impl MoqGStreamerDecoder {
             }
         });
 
+        let initial_volume = config.initial_volume;
         Ok(Self {
             pipeline,
             appsrc,
@@ -3899,7 +3910,7 @@ impl MoqGStreamerDecoder {
             _owned_runtime: owned_runtime,
             _runtime: runtime,
             audio_muted: false,
-            audio_volume: config.initial_volume,
+            audio_volume: initial_volume,
             position: Duration::ZERO,
             received_keyframe: false,
             codec,
@@ -3909,6 +3920,8 @@ impl MoqGStreamerDecoder {
                 height: 0,
                 frame_rate: 0.0,
                 duration: None,
+                pixel_aspect_ratio: 1.0,
+                start_time: None,
             },
         })
     }
@@ -4284,7 +4297,6 @@ impl MoqGStreamerDecoder {
     /// Pushes a NAL unit to the GStreamer pipeline via appsrc.
     fn push_nal_unit(&mut self, moq_frame: &MoqVideoFrame) -> Result<(), VideoError> {
         use gstreamer as gst;
-        use gstreamer::prelude::*;
 
         // Skip non-keyframes until we receive a keyframe (decoder needs IDR to start)
         if !self.received_keyframe {
@@ -4307,10 +4319,8 @@ impl MoqGStreamerDecoder {
             })?;
             buffer_ref.set_pts(gst::ClockTime::from_useconds(moq_frame.timestamp_us));
 
-            // Mark keyframes with SYNC_POINT flag
-            if moq_frame.is_keyframe {
-                buffer_ref.set_flags(gst::BufferFlags::SYNC_POINT);
-            } else {
+            // Mark non-keyframes with DELTA_UNIT (keyframes have no flag — absence of DELTA_UNIT implies sync point)
+            if !moq_frame.is_keyframe {
                 buffer_ref.set_flags(gst::BufferFlags::DELTA_UNIT);
             }
         }
@@ -4332,7 +4342,6 @@ impl MoqGStreamerDecoder {
     /// Pulls a decoded frame from appsink and converts it to VideoFrame.
     fn pull_decoded_frame(&mut self) -> Result<Option<VideoFrame>, VideoError> {
         use gstreamer as gst;
-        use gstreamer::prelude::*;
         use gstreamer_video as gst_video;
 
         // Try to pull a sample (non-blocking)
@@ -4387,7 +4396,6 @@ impl MoqGStreamerDecoder {
         sample: &gstreamer::Sample,
     ) -> Result<Option<VideoFrame>, VideoError> {
         use super::video::{DmaBufPlane, LinuxGpuSurface};
-        use gstreamer::prelude::*;
         use gstreamer_allocators::DmaBufMemory;
         use std::os::fd::RawFd;
 
@@ -4558,8 +4566,6 @@ impl MoqGStreamerDecoder {
 
     /// Parses DRM modifier from GStreamer caps (GStreamer 1.24+).
     fn parse_drm_modifier_from_sample(sample: &gstreamer::Sample) -> Option<u64> {
-        use gstreamer::prelude::*;
-
         let caps = sample.caps()?;
         let structure = caps.structure(0)?;
 
@@ -4591,7 +4597,6 @@ impl MoqGStreamerDecoder {
         width: u32,
         height: u32,
     ) -> Option<CpuFrame> {
-        use gstreamer::prelude::*;
         use gstreamer_video::VideoFormat;
 
         let map = buffer.map_readable().ok()?;
@@ -4828,10 +4833,6 @@ impl VideoDecoderBackend for MoqGStreamerDecoder {
 // Re-export Android types at module level
 #[cfg(target_os = "android")]
 pub use android::MoqAndroidDecoder;
-
-// Re-export Linux types at module level
-#[cfg(target_os = "linux")]
-pub use MoqGStreamerDecoder;
 
 #[cfg(test)]
 mod tests {
