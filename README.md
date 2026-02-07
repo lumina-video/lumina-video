@@ -8,7 +8,7 @@
 
 > ⚠️ **Experimental** 👷 - macOS, Linux, and Web are tested and working with zero-copy GPU rendering. Android achieves 1 GPU hop. Windows is untested.
 
-Hardware-accelerated embedded video player for [egui](https://github.com/emilk/egui) with zero-copy GPU rendering.
+Hardware-accelerated embedded video player for [egui](https://github.com/emilk/egui) with zero-copy GPU rendering. Decoded frames are delivered as [`wgpu::Texture`](https://docs.rs/wgpu) — no CPU roundtrips on supported platforms.
 
 **Goal:** Be the most performant embedded video player for apps built on egui.
 
@@ -426,14 +426,15 @@ cargo build --features windows-native-video
 ## Architecture
 
 ```text
-lumina-video
-├── video_player.rs    # Main VideoPlayer widget
-├── video_texture.rs   # GPU texture management, YUV→RGB shaders
+lumina-video                            GPU backend: wgpu (Vulkan, Metal, DX12, WebGPU)
+├── video_player.rs    # Main VideoPlayer widget (egui integration)
+├── video_texture.rs   # wgpu::Texture management, YUV→RGB shaders
+├── zero_copy.rs       # Platform zero-copy: IOSurface, DMA-BUF, D3D11, AHB
 ├── frame_queue.rs     # Thread-safe frame buffer
 ├── macos_video.rs     # VideoToolbox (macOS)
-├── linux_video.rs     # GStreamer (Linux)
-├── windows_video.rs   # Media Foundation (Windows)
-├── android_video.rs   # ExoPlayer/MediaCodec (Android)
+├── linux_video.rs     # GStreamer + VA-API (Linux)
+├── windows_video.rs   # Media Foundation + DXVA (Windows)
+├── android_video.rs   # MediaCodec (Android)
 └── audio.rs           # Audio playback, A/V sync
 ```
 
