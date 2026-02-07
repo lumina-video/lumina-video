@@ -53,12 +53,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::moq::{AudioTrackInfo, MoqTransportConfig, MoqUrl, VideoTrackInfo};
+#[cfg(not(target_os = "macos"))]
+use super::video::{CpuFrame, Plane};
 use super::video::{
     DecodedFrame, HwAccelType, PixelFormat, VideoDecoderBackend, VideoError, VideoFrame,
     VideoMetadata,
 };
-#[cfg(not(target_os = "macos"))]
-use super::video::{CpuFrame, Plane};
 #[cfg(target_os = "macos")]
 use super::video_decoder::HwAccelConfig;
 
