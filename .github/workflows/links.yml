@@ -25,6 +25,8 @@ jobs:
             --exclude "^https://test-videos\\.co\\.uk"
             --exclude "^https://example\\.com"
             --exclude "vendor-gstreamer-.*gstreamer-vendor-linux"
+            --exclude "^moqs?://"
+            --exclude "^rtmp://"
             '*.md'
             'crates/**/*.md'
             'crates/**/*.rs'

@@ -54,9 +54,10 @@ use std::time::Duration;
 
 use super::moq::{AudioTrackInfo, MoqTransportConfig, MoqUrl, VideoTrackInfo};
 use super::video::{
-    DecodedFrame, HwAccelType, PixelFormat, VideoDecoderBackend, VideoError, VideoFrame,
-    VideoMetadata,
+    CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend, VideoError,
+    VideoFrame, VideoMetadata,
 };
+#[cfg(target_os = "macos")]
 use super::video_decoder::HwAccelConfig;
 
 use async_channel::{Receiver, Sender};
@@ -3054,6 +3055,8 @@ pub mod android {
                     height: 0,
                     frame_rate: 0.0,
                     duration: None,
+                    pixel_aspect_ratio: 1.0,
+                    start_time: None,
                 },
             })
         }
@@ -3909,6 +3912,8 @@ impl MoqGStreamerDecoder {
                 height: 0,
                 frame_rate: 0.0,
                 duration: None,
+                pixel_aspect_ratio: 1.0,
+                start_time: None,
             },
         })
     }
@@ -4307,10 +4312,8 @@ impl MoqGStreamerDecoder {
             })?;
             buffer_ref.set_pts(gst::ClockTime::from_useconds(moq_frame.timestamp_us));
 
-            // Mark keyframes with SYNC_POINT flag
-            if moq_frame.is_keyframe {
-                buffer_ref.set_flags(gst::BufferFlags::SYNC_POINT);
-            } else {
+            // Mark non-keyframes with DELTA_UNIT (keyframes have no flag — absence of DELTA_UNIT implies sync point)
+            if !moq_frame.is_keyframe {
                 buffer_ref.set_flags(gst::BufferFlags::DELTA_UNIT);
             }
         }
@@ -4828,10 +4831,6 @@ impl VideoDecoderBackend for MoqGStreamerDecoder {
 // Re-export Android types at module level
 #[cfg(target_os = "android")]
 pub use android::MoqAndroidDecoder;
-
-// Re-export Linux types at module level
-#[cfg(target_os = "linux")]
-pub use MoqGStreamerDecoder;
 
 #[cfg(test)]
 mod tests {
