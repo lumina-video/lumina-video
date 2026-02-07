@@ -474,9 +474,9 @@ impl std::fmt::Debug for AudioSamples {
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 mod rodio_impl {
     use super::*;
+    use parking_lot::Mutex;
     use rodio::Source;
     use rodio::{buffer::SamplesBuffer, OutputStream, OutputStreamBuilder, Sink};
-    use parking_lot::Mutex;
 
     // ========================================================================
     // Sample-counting source wrapper for accurate position tracking
@@ -609,7 +609,7 @@ mod rodio_impl {
             // macOS CoreAudio (512 frames) and Android Oboe have reasonable defaults.
             #[cfg(target_os = "linux")]
             let stream = OutputStreamBuilder::from_default_device()
-                .map(|b| b.with_buffer_size(cpal::BufferSize::Fixed(1024)))
+                .map(|b| b.with_buffer_size(rodio::cpal::BufferSize::Fixed(1024)))
                 .and_then(|b| b.open_stream_or_fallback())
                 .or_else(|e| {
                     tracing::warn!("Audio: explicit buffer setup failed ({e}), trying default");
