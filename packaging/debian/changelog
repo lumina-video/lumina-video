@@ -1,0 +1,9 @@
+lumina-video-demo (0.1.0-1) unstable; urgency=medium
+
+  * Initial release
+  * Hardware-accelerated video playback with zero-copy GPU rendering
+  * GStreamer + VA-API backend for Linux
+  * HLS/m3u8 streaming support
+  * Subtitle support (SRT, WebVTT)
+
+ -- alltheseas <alltheseas@users.noreply.github.com>  Mon, 02 Feb 2026 12:00:00 +0000

@@ -1,0 +1,40 @@
+[package]
+name = "lumina-video-android"
+version = { workspace = true }
+edition = "2021"
+description = "Android native library for lumina-video demo"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+# cdylib for Android native library
+crate-type = ["cdylib"]
+
+[dependencies]
+# lumina-video (Android zero-copy is always-on)
+lumina-video = { path = "../lumina-video" }
+
+# Core egui for the demo app
+egui = { workspace = true }
+# Android requires android-game-activity feature for eframe and egui-winit
+eframe = { workspace = true, features = ["android-game-activity"] }
+egui-wgpu = { workspace = true }
+egui-winit = { workspace = true, features = ["android-game-activity"] }
+
+# Android game activity (use upstream crates.io version)
+android-activity = { version = "0.6", features = ["game-activity"] }
+jni = { workspace = true }
+ndk-context = "0.1"
+
+# Logging
+tracing = { workspace = true }
+android_logger = "0.14"
+
+# wgpu for Vulkan backend config
+# Version MUST match egui-wgpu's wgpu version (24.x) for HAL type compatibility
+wgpu = "24"
+
+# HAL viability spike: raw Vulkan access
+# Version MUST match egui-wgpu's wgpu-hal version for type compatibility
+wgpu-hal = { version = "24", features = ["vulkan"] }
+ash = "0.38"

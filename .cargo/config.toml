@@ -1,0 +1,7 @@
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+# Enable WebCodecs unstable APIs for wasm32 target
+# Required for VideoDecoder, EncodedVideoChunk, etc.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg=web_sys_unstable_apis"]

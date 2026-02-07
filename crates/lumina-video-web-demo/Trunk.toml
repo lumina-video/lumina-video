@@ -1,0 +1,12 @@
+[build]
+target = "index.html"
+dist = "dist"
+
+[watch]
+ignore = ["dist"]
+
+# Copy video-bridge.js to dist
+[[hooks]]
+stage = "post_build"
+command = "sh"
+command_args = ["-c", "cp -f ../lumina-video/src/media/video-bridge.js dist/ 2>/dev/null || true"]

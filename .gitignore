@@ -1,0 +1,41 @@
+.DS_Store
+.buildcmd
+TODO.bak
+android-config.json
+logcat.txt
+build.log
+rusty-tags.vi
+.privenv
+*.so
+*.swp
+*.jar
+target
+.gradle
+.git
+/dist
+/packages
+.direnv/
+/tags
+.zed
+.lsp
+.idea
+local.properties
+.beads.beads/
+.beads/
+# Local development lumina-video checkout (not crates/lumina-video/)
+/lumina-video/
+
+# Vendored runtime libraries (downloaded at build time, not committed)
+vendor/linux-x86_64/lib/
+vendor/linux-x86_64/include/
+vendor/linux-x86_64/VERSION
+vendor/linux-x86_64/COPYING
+# Local clones (not part of this repo)
+/egui-vid/
+/moq/
+/moq-rs/
+/moq-js/
+/nips/
+/strfry/
+/zap-stream-core/
+/zap.stream/

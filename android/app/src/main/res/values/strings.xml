@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    String resources for lumina-video demo application
+-->
+<resources>
+    <string name="app_name">lumina-video Demo</string>
+    <string name="loading">Loading video…</string>
+    <string name="error_playback">Video playback error</string>
+    <string name="error_native_library">Failed to load native library</string>
+</resources>

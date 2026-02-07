@@ -1,0 +1,2 @@
+# Placeholder for vendored GStreamer libraries
+# Libraries are downloaded at build time or via scripts/fetch-vendor-libs.sh

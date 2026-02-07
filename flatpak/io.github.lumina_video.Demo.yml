@@ -1,0 +1,102 @@
+app-id: io.github.lumina_video.Demo
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: lumina-video-demo
+
+# GPU access for zero-copy rendering (VA-API, Vulkan)
+finish-args:
+  # X11 + Wayland display
+  - --share=ipc
+  - --socket=x11
+  - --socket=wayland
+  # GPU access (required for zero-copy)
+  - --device=dri
+  # Network for video streaming
+  - --share=network
+  # Audio playback
+  - --socket=pulseaudio
+  # Note: VA-API driver auto-detection is handled by libva.
+  # If needed, users can override at runtime:
+  #   flatpak run --env=LIBVA_DRIVER_NAME=radeonsi io.github.lumina_video.Demo  (AMD)
+  #   flatpak run --env=LIBVA_DRIVER_NAME=iHD io.github.lumina_video.Demo       (Intel)
+  #   flatpak run --env=LIBVA_DRIVER_NAME=i965 io.github.lumina_video.Demo      (older Intel)
+
+modules:
+  # ============================================================================
+  # GStreamer plugins for codec support
+  # The freedesktop runtime includes base GStreamer but we need additional plugins
+  # ============================================================================
+
+  # GStreamer Good Plugins (LGPL, well-supported codecs)
+  - name: gst-plugins-good
+    buildsystem: meson
+    sources:
+      - type: archive
+        url: https://gstreamer.freedesktop.org/src/gst-plugins-good/gst-plugins-good-1.24.10.tar.xz
+        sha256: 00b39c0bf5eaaffdc7705de18a5af904c0ba9cab5e2a3f0e3b60c3bdfe258ed4
+    config-opts:
+      - -Ddoc=disabled
+      - -Dexamples=disabled
+      - -Dtests=disabled
+
+  # GStreamer Bad Plugins (various licenses, less stable but needed for formats)
+  - name: gst-plugins-bad
+    buildsystem: meson
+    sources:
+      - type: archive
+        url: https://gstreamer.freedesktop.org/src/gst-plugins-bad/gst-plugins-bad-1.24.10.tar.xz
+        sha256: 682e9c9e50b2dfa95d71c9d8295c0bc04e7c655d6d9d339ce5e568da72fc6882
+    config-opts:
+      - -Ddoc=disabled
+      - -Dexamples=disabled
+      - -Dtests=disabled
+
+  # GStreamer Libav (FFmpeg-based decoders for broad format support)
+  - name: gst-libav
+    buildsystem: meson
+    sources:
+      - type: archive
+        url: https://gstreamer.freedesktop.org/src/gst-libav/gst-libav-1.24.10.tar.xz
+        sha256: 3aa8f1c4ced2a37cb2fe91f6bf4fb1115807cf17f5204a9c8dcba076b8adf5fc
+    config-opts:
+      - -Ddoc=disabled
+      - -Dtests=disabled
+
+  # GStreamer VA-API plugin for zero-copy hardware decoding
+  - name: gstreamer-vaapi
+    buildsystem: meson
+    sources:
+      - type: archive
+        url: https://gstreamer.freedesktop.org/src/gstreamer-vaapi/gstreamer-vaapi-1.24.10.tar.xz
+        sha256: 2e607b753a03e94f09f6e50fb480de6dac9be3d7ead6cb2a52698bbfe92ee883
+    config-opts:
+      - -Ddoc=disabled
+      - -Dexamples=disabled
+      - -Dtests=disabled
+
+  # ============================================================================
+  # lumina-video-demo application
+  # ============================================================================
+  - name: lumina-video-demo
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/lumina-video-demo/cargo
+        RUSTFLAGS: '-L /app/lib'
+    build-commands:
+      # Note: cargo-sources.json provides pre-fetched dependencies for offline build
+      - cargo --offline build --release --locked --package lumina-video-demo --verbose
+      - install -Dm755 target/release/lumina-video-demo /app/bin/lumina-video-demo
+    sources:
+      # Pin to specific commit for reproducible builds
+      # TODO: Update to release tag when available (e.g., tag: v0.1.0)
+      - type: git
+        url: https://github.com/lumina-video/lumina-video.git
+        commit: 1f45c976  # feat/linux-packaging branch - update on release
+      # Cargo sources for offline build - generate with:
+      #   flatpak-cargo-generator Cargo.lock -o flatpak/cargo-sources.json
+      - cargo-sources.json

@@ -1,0 +1,252 @@
+[package]
+name = "lumina-video"
+version = { workspace = true }
+edition = "2021"
+description = "Cross-platform video playback for egui with hardware acceleration"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lumina-video/lumina-video"
+keywords = ["egui", "video", "multimedia", "wgpu", "hardware-acceleration"]
+categories = ["gui", "multimedia", "rendering"]
+
+[package.metadata.docs.rs]
+# Document all features on docs.rs
+all-features = true
+# Enable cfg_attr(docsrs, doc(cfg(...))) for feature-gated documentation
+rustdoc-args = ["--cfg", "docsrs"]
+# Document all target platforms for zero-copy feature visibility
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-linux-android",
+]
+
+[dependencies]
+# Core egui
+egui = { workspace = true }
+eframe = { workspace = true }
+egui-wgpu = { workspace = true }
+
+# Note: Threading deps (parking_lot, crossbeam) moved to non-wasm32 target section
+
+# GPU rendering
+bytemuck = { version = "1.14", features = ["derive"] }
+
+# Note: wgpu with HAL access for zero-copy is platform-specific (see target sections below)
+
+# Utilities
+tracing = { workspace = true }
+thiserror = { workspace = true }
+url = "2.5"
+profiling = { version = "1.0", optional = true }
+
+# Android native decoder + zero-copy (always enabled on Android)
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { workspace = true }
+android-activity = { version = "0.6", features = ["game-activity"] }
+ndk-context = "0.1"
+ndk-sys = { version = "0.6" }
+# ndk crate for safe AImageReader bindings (acquire_latest_image_async with fence FD)
+ndk = { version = "0.9", features = ["api-level-26", "media"] }
+webpki-roots = { workspace = true }
+# ash for Vulkan AHardwareBuffer import (zero-copy)
+ash = { version = "0.38" }
+# wgpu-hal with vulkan feature for direct HAL access (zero-copy texture import)
+# Version MUST match egui-wgpu's wgpu-hal version for type compatibility
+wgpu-hal = { version = "24", features = ["vulkan"] }
+# wgpu for zero-copy texture import (wgpu::Device, wgpu::Texture types)
+wgpu = { version = "24" }
+# libc for FD close() in zero-copy fence sync
+libc = { version = "0.2" }
+
+# Linux GStreamer-based video decoder + zero-copy (always enabled on Linux)
+[target.'cfg(target_os = "linux")'.dependencies]
+gstreamer = { version = "0.24" }
+# v1_24 feature enables propose_allocation callback for VideoMeta support
+gstreamer-app = { version = "0.24", features = ["v1_24"] }
+gstreamer-video = { version = "0.24" }
+gstreamer-allocators = { version = "0.24" }
+# ash for Vulkan DMABuf import (zero-copy)
+ash = { version = "0.38" }
+# libc for FD dup() in zero-copy path
+libc = { version = "0.2" }
+# DRM fourcc codes for video format mapping
+drm-fourcc = { version = "2.2" }
+# wgpu with HAL access for zero-copy Vulkan DMABuf import
+wgpu = { version = "24", features = ["vulkan-portability"] }
+rodio = { workspace = true }
+symphonia-core = { workspace = true }
+symphonia-codec-aac = { workspace = true }
+
+# macOS native AVFoundation/VideoToolbox decoder + zero-copy (always enabled on macOS)
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-av-foundation = { workspace = true }
+objc2-core-media = { workspace = true }
+objc2-core-video = { workspace = true }
+objc2-video-toolbox = { workspace = true }
+block2 = { workspace = true }
+objc2-core-foundation = { version = "0.3", features = ["CFNumber", "CFDictionary", "CFString"] }
+# metal-rs for zero-copy IOSurface → Metal texture import
+metal = { workspace = true }
+# wgpu with HAL access for zero-copy Metal IOSurface import
+wgpu = { version = "24" }
+# Profiling support
+profiling = { version = "1.0" }
+# FFmpeg for MKV/WebM container support (AVFoundation doesn't support these)
+# Requires one-time setup: ./scripts/setup-macos-ffmpeg.sh
+ffmpeg-next = { workspace = true }
+rodio = { workspace = true }
+symphonia-core = { workspace = true }
+symphonia-codec-aac = { workspace = true }
+
+# Windows native Media Foundation decoder
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Foundation",
+    "Win32_Security",
+], optional = true }
+rodio = { workspace = true, optional = true }
+
+# Native-only dependencies (not available on wasm32)
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Threading (wasm32 uses single-threaded model, std::thread unavailable)
+parking_lot = { workspace = true }
+crossbeam-channel = "0.5"
+crossbeam = "0.8.4"
+# egui-winit has clipboard support which depends on arboard (not wasm32 compatible)
+egui-winit = { workspace = true }
+# Async promises with tokio backend
+poll-promise = { workspace = true }
+# HTTP streaming - browser uses native fetch APIs instead
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+hyper-rustls = { workspace = true }
+rustls = { workspace = true }
+tokio = { workspace = true }
+
+# MoQ (Media over QUIC) transport dependencies
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.quinn]
+version = "0.11"
+optional = true
+
+# MoQ crates from kixelated/moq (the active repo, moq-rs is archived)
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.moq-lite]
+git = "https://github.com/kixelated/moq"
+optional = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.moq-native]
+git = "https://github.com/kixelated/moq"
+optional = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.hang]
+git = "https://github.com/kixelated/moq"
+optional = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.async-channel]
+version = "2.0"
+optional = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.bytes]
+version = "1.5"
+optional = true
+
+# Nostr client for MoQ stream discovery (NIP-53 Live Activities)
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.nostr-sdk]
+version = "0.37"
+optional = true
+
+# Web/WASM video playback using browser APIs (always enabled on wasm32)
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { version = "0.2" }
+wasm-bindgen-futures = { version = "0.4" }
+js-sys = { version = "0.3" }
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlVideoElement",
+    "HtmlMediaElement",
+    "HtmlCanvasElement",
+    "MediaError",
+    "TimeRanges",
+    "CssStyleDeclaration",
+    "Node",
+    "console",
+    # WebCodecs API for MoQ decoder (unstable, requires --cfg=web_sys_unstable_apis)
+    "VideoDecoder",
+    "VideoDecoderConfig",
+    "VideoDecoderInit",
+    "VideoDecoderSupport",
+    "VideoFrame",
+    "EncodedVideoChunk",
+    "EncodedVideoChunkInit",
+    "EncodedVideoChunkType",
+    "CodecState",
+    # GPU interop for zero-copy rendering
+    # Note: WebGPU APIs (Gpu*) are unstable and require --cfg=web_sys_unstable_apis
+    # and web-sys 0.3.70+ built with webidl from Chrome Canary or similar
+    # Disabled until web-sys officially supports them
+    # "GpuDevice",
+    # "GpuQueue",
+    # "GpuTexture",
+    # "GpuTextureDescriptor",
+    # "GpuTextureUsage",
+    # "GpuTextureFormat",
+    # "GpuExtent3dDict",
+    # "GpuImageCopyTexture",
+    # "GpuImageCopyExternalImage",
+] }
+# wgpu for WebGPU zero-copy texture operations
+wgpu = { version = "24" }
+
+[features]
+# ============================================================================
+# DEFAULT BEHAVIOR: Zero-copy + Native Hardware Decoder
+# ============================================================================
+# lumina-video uses native hardware decoders and zero-copy GPU rendering by default.
+# No feature flags needed - it "just works" on supported platforms:
+#
+#   - macOS: AVFoundation + VideoToolbox + FFmpeg (MKV/WebM)
+#            Requires one-time setup: ./scripts/setup-macos-ffmpeg.sh
+#   - Linux: GStreamer + VA-API → DMABuf → Vulkan → wgpu
+#   - Android: MediaCodec → AHardwareBuffer → Vulkan → wgpu
+#   - Web: HTMLVideoElement → WebGPU
+#   - Windows: Requires `windows-native-video` feature (opt-in until validated)
+#
+# For Windows, enable with: lumina-video = { ..., features = ["windows-native-video"] }
+default = []
+
+# Windows: Native Media Foundation + DXVA2/D3D11VA hardware acceleration
+# This is opt-in until the Windows zero-copy implementation is validated
+windows-native-video = ["windows", "rodio", "profiling"]
+
+# Profiling support (enabled automatically with windows-native-video)
+profiling = ["dep:profiling"]
+
+# Vendored runtime: Bundle GStreamer libraries with the binary (Linux only)
+# This eliminates the need for users to install GStreamer system packages.
+# The vendored libraries are loaded from `vendor/linux-x86_64/lib/` relative to the executable.
+# LGPL compliance: See vendor/README.md for source availability and relinking instructions.
+vendored-runtime = []
+
+# MoQ: Media over QUIC live streaming transport
+# Feeds encoded media into FFmpeg for decoding, reusing existing frame queue and A/V sync
+# Note: Requires FFmpeg to be available (always included on macOS, requires setup on other platforms)
+# Includes Nostr discovery (NIP-53) for finding live MoQ streams
+moq = ["async-channel", "bytes", "hang", "moq-lite", "moq-native", "nostr-sdk", "quinn"]
+
+[lints.rust]
+# Allow objc crate's legacy cargo-clippy cfg check (fixed in newer versions but we use 0.2.x via metal-rs)
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(feature, values(\"cargo-clippy\"))"] }

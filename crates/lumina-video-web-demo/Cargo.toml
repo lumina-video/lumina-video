@@ -1,0 +1,35 @@
+[package]
+name = "lumina-video-web-demo"
+version = { workspace = true }
+edition = "2021"
+description = "Web demo application for lumina-video video player"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "lumina-video-web-demo"
+path = "src/main.rs"
+
+[dependencies]
+# Web video is always-on for wasm32 target
+lumina-video = { path = "../lumina-video" }
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "wgpu"] }
+egui = "0.31.1"
+egui-wgpu = "0.31.1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+parking_lot = "0.12"
+web-sys = { version = "0.3", features = [
+    "console",
+    "Document",
+    "Window",
+    "HtmlCanvasElement",
+    "Element",
+    "CanvasRenderingContext2d",
+    "ImageData",
+    "HtmlVideoElement",
+    "Performance",
+] }
+
+# Note: trunk handles WASM builds. Run with:
+#   trunk serve --open

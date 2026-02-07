@@ -1,0 +1,22 @@
+#!/usr/bin/make -f
+
+export CARGO_HOME = $(CURDIR)/debian/cargo
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --locked --package lumina-video-demo
+
+override_dh_auto_install:
+	install -D -m 755 target/release/lumina-video-demo \
+		$(CURDIR)/debian/lumina-video-demo/usr/bin/lumina-video-demo
+
+override_dh_auto_test:
+	# Skip tests during package build
+	true
+
+override_dh_auto_clean:
+	cargo clean || true
+	rm -rf $(CARGO_HOME)

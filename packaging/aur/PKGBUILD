@@ -1,0 +1,51 @@
+# Maintainer: alltheseas <alltheseas@users.noreply.github.com>
+pkgname=lumina-video-demo
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Hardware-accelerated video player demo for egui with zero-copy GPU rendering"
+arch=('x86_64')
+url="https://github.com/lumina-video/lumina-video"
+license=('MIT OR Apache-2.0')
+
+# Runtime dependencies for zero-copy playback
+depends=(
+    'gstreamer'
+    'gst-plugins-base'
+    'gst-plugins-good'
+    'gst-plugins-bad'
+    'gst-plugins-ugly'
+    'gst-libav'
+    'gstreamer-vaapi'
+    'vulkan-icd-loader'
+    'libva'
+    'wayland'
+    'libxkbcommon'
+    'libx11'
+    'libxcursor'
+    'libxrandr'
+    'libxi'
+)
+
+# Build dependencies
+makedepends=(
+    'rust'
+    'cargo'
+    'pkg-config'
+    'cmake'
+    'vulkan-headers'
+)
+
+source=("$pkgname-$pkgver.tar.gz::https://github.com/lumina-video/lumina-video/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')  # Update with actual checksum on release
+
+build() {
+    cd "lumina-video-$pkgver"
+    cargo build --release --package lumina-video-demo
+}
+
+package() {
+    cd "lumina-video-$pkgver"
+    install -Dm755 "target/release/lumina-video-demo" "$pkgdir/usr/bin/lumina-video-demo"
+    install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 "README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

@@ -1,0 +1,26 @@
+# Android build artifacts
+*.iml
+.gradle/
+/local.properties
+/.idea/
+.DS_Store
+/build/
+/captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.ap_
+*.aab
+
+# Module build directories
+/app/build/
+/lumina-video-bridge/build/
+
+# Native library outputs (built by cargo-ndk)
+# Keep the jniLibs directory structure but ignore .so files
+app/src/main/jniLibs/**/*.so
+
+# Signing configs
+*.keystore
+*.jks
+signing.properties

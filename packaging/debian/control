@@ -1,0 +1,43 @@
+Source: lumina-video-demo
+Section: video
+Priority: optional
+Maintainer: alltheseas <alltheseas@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13),
+               cargo,
+               rustc,
+               pkg-config,
+               libgstreamer1.0-dev,
+               libgstreamer-plugins-base1.0-dev,
+               libvulkan-dev,
+               libwayland-dev,
+               libxkbcommon-dev,
+               libx11-dev,
+               libxcursor-dev,
+               libxrandr-dev,
+               libxi-dev,
+               cmake
+Standards-Version: 4.6.0
+Homepage: https://github.com/lumina-video/lumina-video
+Rules-Requires-Root: no
+
+Package: lumina-video-demo
+Architecture: amd64
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         gstreamer1.0-plugins-base,
+         gstreamer1.0-plugins-good,
+         gstreamer1.0-plugins-bad,
+         gstreamer1.0-plugins-ugly,
+         gstreamer1.0-libav,
+         gstreamer1.0-vaapi,
+         libvulkan1,
+         mesa-va-drivers | intel-media-va-driver
+Description: Hardware-accelerated video player demo for egui
+ lumina-video-demo is a demonstration application showcasing the lumina-video
+ video player library with zero-copy GPU rendering.
+ .
+ Features:
+  - Hardware-accelerated video decoding (VA-API)
+  - Zero-copy GPU rendering (DMABuf -> Vulkan)
+  - HLS/m3u8 streaming support
+  - Subtitle support (SRT, WebVTT)

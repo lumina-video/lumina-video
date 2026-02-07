@@ -1,0 +1,409 @@
+name: Package GStreamer Vendor Bundle
+
+on:
+  # Manual trigger for building new bundles
+  workflow_dispatch:
+    inputs:
+      gstreamer_version:
+        description: 'GStreamer version for display only (actual version from Ubuntu repos)'
+        required: false
+        default: '1.24'
+        # Note: This input is informational. The actual GStreamer version is determined
+        # by the Ubuntu 24.04 package repositories. Update BUNDLE_VERSION env var below
+        # when creating a new bundle with different versions.
+  # Rebuild when this workflow changes
+  push:
+    paths:
+      - '.github/workflows/package-gstreamer.yml'
+    branches:
+      - main
+
+env:
+  BUNDLE_VERSION: "1.24.0-ubuntu24.04-1"
+
+jobs:
+  package-linux-x86_64:
+    name: Package GStreamer for Linux x86_64
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GStreamer and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-libav \
+            gstreamer1.0-vaapi \
+            gstreamer1.0-tools \
+            libglib2.0-dev \
+            liborc-0.4-dev
+
+      - name: Create bundle directory structure
+        run: |
+          mkdir -p bundle/lib/gstreamer-1.0
+          mkdir -p bundle/lib/pkgconfig
+          mkdir -p bundle/include
+
+      - name: Copy core GStreamer libraries
+        run: |
+          # Core GStreamer libraries
+          LIBS=(
+            "libgstreamer-1.0.so.0"
+            "libgstbase-1.0.so.0"
+            "libgstvideo-1.0.so.0"
+            "libgstapp-1.0.so.0"
+            "libgstaudio-1.0.so.0"
+            "libgstpbutils-1.0.so.0"
+            "libgstallocators-1.0.so.0"
+            "libgstgl-1.0.so.0"
+            "libgsttag-1.0.so.0"
+            "libgstriff-1.0.so.0"
+            "libgstfft-1.0.so.0"
+            "libgstsdp-1.0.so.0"
+            "libgstrtsp-1.0.so.0"
+            "libgstrtp-1.0.so.0"
+          )
+
+          for lib in "${LIBS[@]}"; do
+            src=$(find /usr/lib/x86_64-linux-gnu -name "$lib" -type f 2>/dev/null | head -1)
+            if [ -n "$src" ]; then
+              cp -L "$src" bundle/lib/
+              echo "Copied: $lib"
+            else
+              echo "Warning: $lib not found"
+            fi
+          done
+
+      - name: Copy GStreamer plugins
+        run: |
+          PLUGIN_DIR="/usr/lib/x86_64-linux-gnu/gstreamer-1.0"
+
+          # Essential plugins for lumina-video
+          PLUGINS=(
+            # Core
+            "libgstcoreelements.so"
+            "libgsttypefindfunctions.so"
+            "libgstautodetect.so"
+
+            # Playback
+            "libgstplayback.so"
+            "libgstapp.so"
+
+            # Video processing
+            "libgstvideoconvertscale.so"
+            "libgstvideofilter.so"
+            "libgstvideorate.so"
+
+            # Audio processing
+            "libgstaudioconvert.so"
+            "libgstaudioresample.so"
+            "libgstvolume.so"
+            "libgstaudiomixer.so"
+            "libgstaudioparsers.so"
+
+            # Codecs via FFmpeg
+            "libgstlibav.so"
+
+            # Hardware acceleration
+            "libgstvaapi.so"
+            "libgstva.so"
+
+            # Container formats
+            "libgstmatroska.so"
+            "libgstisomp4.so"
+            "libgstogg.so"
+
+            # Network/streaming
+            "libgstsoup.so"
+            "libgstrtsp.so"
+            "libgstrtp.so"
+            "libgstudp.so"
+            "libgsttcp.so"
+
+            # OpenGL (for some pipelines)
+            "libgstopengl.so"
+          )
+
+          for plugin in "${PLUGINS[@]}"; do
+            src="$PLUGIN_DIR/$plugin"
+            if [ -f "$src" ]; then
+              cp -L "$src" bundle/lib/gstreamer-1.0/
+              echo "Copied plugin: $plugin"
+            else
+              echo "Warning: plugin $plugin not found"
+            fi
+          done
+
+      - name: Copy dependency libraries
+        run: |
+          # Libraries that GStreamer depends on (that might not be on target system)
+          DEPS=(
+            "liborc-0.4.so.0"
+            "libglib-2.0.so.0"
+            "libgobject-2.0.so.0"
+            "libgmodule-2.0.so.0"
+            "libgio-2.0.so.0"
+          )
+
+          for dep in "${DEPS[@]}"; do
+            src=$(find /usr/lib/x86_64-linux-gnu -name "$dep" -type f 2>/dev/null | head -1)
+            if [ -n "$src" ]; then
+              cp -L "$src" bundle/lib/
+              echo "Copied dependency: $dep"
+            fi
+          done
+
+      - name: Copy headers
+        run: |
+          # Copy GStreamer headers for build-time compilation
+          cp -r /usr/include/gstreamer-1.0 bundle/include/
+
+          # Copy glib headers (needed by gstreamer headers)
+          cp -r /usr/include/glib-2.0 bundle/include/
+          cp -r /usr/lib/x86_64-linux-gnu/glib-2.0/include/* bundle/include/glib-2.0/
+
+          # Copy orc headers
+          if [ -d /usr/include/orc-0.4 ]; then
+            cp -r /usr/include/orc-0.4 bundle/include/
+          fi
+
+      - name: Generate pkg-config files
+        run: |
+          # Create pkg-config files that point to our bundle
+          # These will be patched at build time to use actual paths
+
+          cat > bundle/lib/pkgconfig/gstreamer-1.0.pc << 'PKGCONFIG'
+          prefix=@PREFIX@
+          exec_prefix=${prefix}
+          libdir=${prefix}/lib
+          includedir=${prefix}/include
+
+          Name: GStreamer
+          Description: Streaming media framework (vendored)
+          Version: 1.24.0
+          Libs: -L${libdir} -lgstreamer-1.0
+          Cflags: -I${includedir}/gstreamer-1.0 -I${includedir}/glib-2.0
+          PKGCONFIG
+
+          cat > bundle/lib/pkgconfig/gstreamer-app-1.0.pc << 'PKGCONFIG'
+          prefix=@PREFIX@
+          exec_prefix=${prefix}
+          libdir=${prefix}/lib
+          includedir=${prefix}/include
+
+          Name: GStreamer App
+          Description: GStreamer app library (vendored)
+          Version: 1.24.0
+          Requires: gstreamer-1.0
+          Libs: -L${libdir} -lgstapp-1.0
+          Cflags: -I${includedir}/gstreamer-1.0
+          PKGCONFIG
+
+          cat > bundle/lib/pkgconfig/gstreamer-video-1.0.pc << 'PKGCONFIG'
+          prefix=@PREFIX@
+          exec_prefix=${prefix}
+          libdir=${prefix}/lib
+          includedir=${prefix}/include
+
+          Name: GStreamer Video
+          Description: GStreamer video library (vendored)
+          Version: 1.24.0
+          Requires: gstreamer-1.0
+          Libs: -L${libdir} -lgstvideo-1.0
+          Cflags: -I${includedir}/gstreamer-1.0
+          PKGCONFIG
+
+          cat > bundle/lib/pkgconfig/gstreamer-audio-1.0.pc << 'PKGCONFIG'
+          prefix=@PREFIX@
+          exec_prefix=${prefix}
+          libdir=${prefix}/lib
+          includedir=${prefix}/include
+
+          Name: GStreamer Audio
+          Description: GStreamer audio library (vendored)
+          Version: 1.24.0
+          Requires: gstreamer-1.0
+          Libs: -L${libdir} -lgstaudio-1.0
+          Cflags: -I${includedir}/gstreamer-1.0
+          PKGCONFIG
+
+          cat > bundle/lib/pkgconfig/gstreamer-base-1.0.pc << 'PKGCONFIG'
+          prefix=@PREFIX@
+          exec_prefix=${prefix}
+          libdir=${prefix}/lib
+          includedir=${prefix}/include
+
+          Name: GStreamer Base
+          Description: GStreamer base library (vendored)
+          Version: 1.24.0
+          Requires: gstreamer-1.0
+          Libs: -L${libdir} -lgstbase-1.0
+          Cflags: -I${includedir}/gstreamer-1.0
+          PKGCONFIG
+
+          cat > bundle/lib/pkgconfig/gstreamer-allocators-1.0.pc << 'PKGCONFIG'
+          prefix=@PREFIX@
+          exec_prefix=${prefix}
+          libdir=${prefix}/lib
+          includedir=${prefix}/include
+
+          Name: GStreamer Allocators
+          Description: GStreamer allocators library (vendored)
+          Version: 1.24.0
+          Requires: gstreamer-1.0
+          Libs: -L${libdir} -lgstallocators-1.0
+          Cflags: -I${includedir}/gstreamer-1.0
+          PKGCONFIG
+
+          cat > bundle/lib/pkgconfig/glib-2.0.pc << 'PKGCONFIG'
+          prefix=@PREFIX@
+          exec_prefix=${prefix}
+          libdir=${prefix}/lib
+          includedir=${prefix}/include
+
+          Name: GLib
+          Description: GLib library (vendored)
+          Version: 2.80.0
+          Libs: -L${libdir} -lglib-2.0
+          Cflags: -I${includedir}/glib-2.0
+          PKGCONFIG
+
+          cat > bundle/lib/pkgconfig/gobject-2.0.pc << 'PKGCONFIG'
+          prefix=@PREFIX@
+          exec_prefix=${prefix}
+          libdir=${prefix}/lib
+          includedir=${prefix}/include
+
+          Name: GObject
+          Description: GObject library (vendored)
+          Version: 2.80.0
+          Requires: glib-2.0
+          Libs: -L${libdir} -lgobject-2.0
+          Cflags: -I${includedir}/glib-2.0
+          PKGCONFIG
+
+      - name: Create version info
+        run: |
+          cat > bundle/VERSION << EOF
+          BUNDLE_VERSION=${{ env.BUNDLE_VERSION }}
+          GSTREAMER_VERSION=$(pkg-config --modversion gstreamer-1.0)
+          GLIB_VERSION=$(pkg-config --modversion glib-2.0)
+          UBUNTU_VERSION=$(lsb_release -rs)
+          GLIBC_VERSION=$(ldd --version | head -1 | grep -oE '[0-9]+\.[0-9]+$')
+          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EOF
+
+          cat bundle/VERSION
+
+      - name: Create LGPL compliance notice
+        run: |
+          cat > bundle/COPYING << 'EOF'
+          GStreamer Vendor Bundle - LGPL Compliance Notice
+
+          This bundle contains GStreamer libraries licensed under LGPL-2.1+.
+
+          SOURCE AVAILABILITY
+          ===================
+          GStreamer source code is available at:
+          https://gstreamer.freedesktop.org/src/
+
+          The specific versions included in this bundle can be found in the
+          VERSION file. Ubuntu source packages are available at:
+          https://packages.ubuntu.com/source/noble/gstreamer1.0
+
+          RELINKING INSTRUCTIONS
+          ======================
+          To use system GStreamer instead of this vendored bundle:
+
+          1. Install system GStreamer:
+             sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
+          2. Build without the vendored-runtime feature:
+             cargo build  # (without --features vendored-runtime)
+
+          LICENSE
+          =======
+          GStreamer is free software; you can redistribute it and/or modify
+          it under the terms of the GNU Library General Public License as
+          published by the Free Software Foundation; either version 2 of the
+          License, or (at your option) any later version.
+
+          See https://gstreamer.freedesktop.org/documentation/license.html
+          EOF
+
+      - name: List bundle contents
+        run: |
+          echo "=== Bundle contents ==="
+          find bundle -type f | sort
+          echo ""
+          echo "=== Bundle size ==="
+          du -sh bundle
+          du -sh bundle/lib
+          du -sh bundle/lib/gstreamer-1.0
+          du -sh bundle/include
+
+      - name: Create tarball
+        run: |
+          tar -czvf gstreamer-vendor-linux-x86_64.tar.gz -C bundle .
+          ls -lh gstreamer-vendor-linux-x86_64.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gstreamer-vendor-linux-x86_64
+          path: gstreamer-vendor-linux-x86_64.tar.gz
+
+      - name: Upload to release (if tagged)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: gstreamer-vendor-linux-x86_64.tar.gz
+
+  # Create a release with the bundle
+  create-vendor-release:
+    name: Create Vendor Release
+    needs: package-linux-x86_64
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: gstreamer-vendor-linux-x86_64
+
+      - name: Create or update vendor release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: vendor-gstreamer-${{ env.BUNDLE_VERSION }}
+          name: "GStreamer Vendor Bundle ${{ env.BUNDLE_VERSION }}"
+          body: |
+            Pre-built GStreamer libraries for use with `lumina-video`'s `vendored-runtime` feature.
+
+            **Platform:** Linux x86_64 (Ubuntu 24.04+, glibc 2.39+)
+            **GStreamer:** 1.24.x
+
+            ## Usage
+
+            This bundle is automatically downloaded when building with the `vendored-runtime` feature:
+
+            ```toml
+            [dependencies]
+            lumina-video = { git = "...", features = ["vendored-runtime"] }
+            ```
+
+            ## LGPL Compliance
+
+            GStreamer is LGPL-2.1+. Source available at https://gstreamer.freedesktop.org/src/
+            See COPYING in the tarball for relinking instructions.
+          files: gstreamer-vendor-linux-x86_64.tar.gz
+          draft: false
+          prerelease: false

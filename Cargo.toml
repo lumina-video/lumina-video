@@ -1,0 +1,81 @@
+[workspace]
+resolver = "2"
+package.version = "0.1.0"
+members = [
+    "crates/lumina-video",
+    "crates/lumina-video-demo",
+    "crates/lumina-video-android",
+    "crates/lumina-video-web-demo",
+]
+
+[workspace.dependencies]
+# Core egui dependencies
+# NOTE: android-game-activity feature is added at crate level for Android builds (lumina-video-android)
+# to avoid pulling in ndk-sys on non-Android platforms
+eframe = { version = "0.31.1", default-features = false, features = [ "wgpu", "wayland", "x11" ] }
+egui = { version = "0.31.1", features = ["serde"] }
+egui-wgpu = "0.31.1"
+# Disabled clipboard to avoid objc2 version conflict between arboard (0.3.x) and winit (0.2.x)
+egui-winit = { version = "0.31.1" }
+
+# Video/audio dependencies
+ffmpeg-next = "8.0"
+rodio = { version = "0.21", default-features = false, features = ["playback", "symphonia-all"] }
+symphonia-core = "0.5"
+symphonia-codec-aac = "0.5"
+
+# Async/threading
+poll-promise = { version = "0.3.0", features = ["tokio"] }
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+
+# HTTP streaming
+hyper = { version = "1.7.0", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+hyper-rustls = { version = "0.27.7", default-features = false, features = ["webpki-roots", "native-tokio", "ring", "http1", "http2"] }
+http-body-util = "0.1.3"
+rustls = { version = "0.23.28", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1.0"
+tokio = { version = "1.16", features = ["macros", "rt-multi-thread", "fs"] }
+
+# Utilities
+tracing = { version = "0.1.40", features = ["log"] }
+thiserror = "2.0.7"
+bytemuck = { version = "1.14", features = ["derive"] }
+
+# Android
+jni = "0.21.1"
+
+# macOS native video decoding (VideoToolbox HW acceleration)
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSDictionary", "NSString", "NSURL", "NSValue", "NSError"] }
+objc2-av-foundation = { version = "0.3", features = ["AVAsset", "AVAssetReader", "AVAssetReaderOutput", "AVAssetTrack", "AVMediaFormat", "objc2-core-media", "objc2-core-video", "objc2-core-foundation"] }
+objc2-core-media = { version = "0.3", features = ["CMTime", "CMTimeRange", "CMSampleBuffer", "CMFormatDescription", "objc2", "objc2-core-video"] }
+objc2-core-video = { version = "0.3", features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn", "CVBase", "objc2"] }
+objc2-video-toolbox = "0.3"
+block2 = "0.6"
+# metal-rs for zero-copy IOSurface → Metal texture import
+metal = "0.31"
+
+[profile.small]
+inherits = 'release'
+opt-level = 'z'
+lto = true
+codegen-units = 1
+panic = 'abort'
+strip = true
+
+# NOTE: objc2 0.5.x (winit) and 0.6.x (AVFoundation) coexist because they use different ObjC classes.
+# The Objective-C runtime handles dispatch correctly for both versions.
+
+# Patches for zero-copy video rendering
+[patch.crates-io]
+# Patched wgpu workspace crates to enable Linux DMABuf external memory extensions for zero-copy video
+# All interdependent wgpu crates must be patched together to avoid type mismatches
+naga = { git = "https://github.com/lumina-video/wgpu.git", branch = "linux-dmabuf-extensions" }
+wgpu-types = { git = "https://github.com/lumina-video/wgpu.git", branch = "linux-dmabuf-extensions" }
+wgpu-hal = { git = "https://github.com/lumina-video/wgpu.git", branch = "linux-dmabuf-extensions" }
+wgpu-core = { git = "https://github.com/lumina-video/wgpu.git", branch = "linux-dmabuf-extensions" }
+# Android: patched android-activity for JNI access
+android-activity = { git = "https://github.com/damus-io/android-activity", rev = "4ee16f1585e4a75031dc10785163d4b920f95805" }
+# Note: Android zero-copy uses raw ash/Vulkan, bypassing wgpu limitations for AHB import.

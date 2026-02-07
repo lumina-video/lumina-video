@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>lumina-video Web Demo</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #1a1a1a;
+        }
+
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+
+        /* Loading indicator */
+        #loading {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-family: system-ui, sans-serif;
+            font-size: 18px;
+        }
+
+        #loading.hidden {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="loading">Loading lumina-video...</div>
+    <canvas id="lumina-video-canvas"></canvas>
+
+    <!-- HLS.js for HLS streaming support -->
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js"></script>
+
+    <script>
+        // Hide loading indicator when WASM is ready
+        window.addEventListener('load', function() {
+            // Give the WASM a moment to initialize
+            setTimeout(function() {
+                document.getElementById('loading').classList.add('hidden');
+            }, 1000);
+        });
+    </script>
+
+    <link data-trunk rel="rust" data-wasm-opt="z" />
+</body>
+</html>

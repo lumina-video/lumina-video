@@ -1,0 +1,296 @@
+name: Release Linux Packages
+
+on:
+  release:
+    types: [published]
+  # Allow manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g., 0.1.0)'
+        required: true
+        default: '0.1.0'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-binary:
+    name: Build Linux Binary
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            # Strip 'v' prefix from tag
+            VERSION="${{ github.event.release.tag_name }}"
+            VERSION="${VERSION#v}"
+          else
+            VERSION="${{ inputs.version }}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libspeechd-dev libxkbcommon-dev libssl-dev libunwind-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libasound2-dev libavutil-dev libavformat-dev libavcodec-dev \
+            libavdevice-dev libavfilter-dev libswscale-dev libswresample-dev \
+            libclang-dev
+
+      - name: Build release binary
+        run: cargo build --release --locked --package lumina-video-demo
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumina-video-demo-linux-x86_64
+          path: target/release/lumina-video-demo
+
+  package-deb:
+    name: Build .deb Package
+    needs: build-binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: lumina-video-demo-linux-x86_64
+          path: ./binary
+
+      - name: Build .deb package
+        run: |
+          VERSION="${{ needs.build-binary.outputs.version }}"
+          PKG_NAME="lumina-video-demo"
+          PKG_DIR="${PKG_NAME}_${VERSION}_amd64"
+
+          # Create package structure
+          mkdir -p "${PKG_DIR}/DEBIAN"
+          mkdir -p "${PKG_DIR}/usr/bin"
+
+          # Install binary
+          cp binary/lumina-video-demo "${PKG_DIR}/usr/bin/"
+          chmod 755 "${PKG_DIR}/usr/bin/lumina-video-demo"
+
+          # Create control file using printf to avoid YAML parsing issues
+          printf '%s\n' \
+            "Package: lumina-video-demo" \
+            "Version: ${VERSION}" \
+            "Section: video" \
+            "Priority: optional" \
+            "Architecture: amd64" \
+            "Depends: gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, gstreamer1.0-vaapi, libvulkan1" \
+            "Maintainer: alltheseas <alltheseas@users.noreply.github.com>" \
+            "Description: Hardware-accelerated video player demo for egui" \
+            " lumina-video-demo demonstrates the lumina-video video player library" \
+            " with zero-copy GPU rendering via VA-API and Vulkan." \
+            > "${PKG_DIR}/DEBIAN/control"
+
+          # Build package (produces ${PKG_DIR}.deb)
+          dpkg-deb --build "${PKG_DIR}"
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-package
+          path: "*.deb"
+
+  package-rpm:
+    name: Build .rpm Package
+    needs: build-binary
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:40
+    steps:
+      # Note: If dnf fails due to TLS, may need: dnf -y update ca-certificates first
+      - name: Install git for checkout
+        run: dnf install -y git ca-certificates && update-ca-trust
+
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: dnf install -y rpm-build rpmdevtools
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: lumina-video-demo-linux-x86_64
+          path: ./binary
+
+      - name: Build .rpm package
+        run: |
+          VERSION="${{ needs.build-binary.outputs.version }}"
+
+          # Setup RPM build tree
+          rpmdev-setuptree
+
+          # Create simplified spec for binary packaging using printf
+          printf '%s\n' \
+            "Name:           lumina-video-demo" \
+            "Version:        %{_version}" \
+            "Release:        1%{?dist}" \
+            "Summary:        Hardware-accelerated video player demo for egui" \
+            "License:        MIT OR Apache-2.0" \
+            "URL:            https://github.com/lumina-video/lumina-video" \
+            "" \
+            "Requires:       gstreamer1-plugins-base" \
+            "Requires:       gstreamer1-plugins-good" \
+            "Requires:       gstreamer1-plugins-bad-free" \
+            "Requires:       vulkan-loader" \
+            "Requires:       gstreamer1-plugin-libav" \
+            "Requires:       gstreamer1-vaapi" \
+            "" \
+            "%description" \
+            "lumina-video-demo demonstrates the lumina-video video player library" \
+            "with zero-copy GPU rendering via VA-API and Vulkan." \
+            "" \
+            "%install" \
+            "install -D -m 755 %{_sourcedir}/lumina-video-demo %{buildroot}%{_bindir}/lumina-video-demo" \
+            "" \
+            "%files" \
+            "%{_bindir}/lumina-video-demo" \
+            > ~/rpmbuild/SPECS/lumina-video-demo.spec
+
+          # Copy binary to SOURCES
+          cp binary/lumina-video-demo ~/rpmbuild/SOURCES/
+          chmod 755 ~/rpmbuild/SOURCES/lumina-video-demo
+
+          # Build RPM
+          rpmbuild -bb --define "_version ${VERSION}" ~/rpmbuild/SPECS/lumina-video-demo.spec
+
+          # Copy to workspace
+          cp ~/rpmbuild/RPMS/x86_64/*.rpm ./
+
+      - name: Upload .rpm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-package
+          path: "*.rpm"
+
+  package-flatpak:
+    name: Build Flatpak Bundle
+    needs: build-binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Flatpak and flatpak-builder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+          sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          sudo flatpak install -y flathub org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: lumina-video-demo-linux-x86_64
+          path: ./binary
+
+      - name: Create simplified Flatpak manifest
+        run: |
+          VERSION="${{ needs.build-binary.outputs.version }}"
+
+          # Create manifest using printf to avoid YAML parsing issues
+          printf '%s\n' \
+            "app-id: io.github.lumina_video.Demo" \
+            "runtime: org.freedesktop.Platform" \
+            "runtime-version: '24.08'" \
+            "sdk: org.freedesktop.Sdk" \
+            "command: lumina-video-demo" \
+            "" \
+            "finish-args:" \
+            "  - --share=ipc" \
+            "  - --socket=x11" \
+            "  - --socket=wayland" \
+            "  - --device=dri" \
+            "  - --share=network" \
+            "  - --socket=pulseaudio" \
+            "  - --filesystem=home:ro" \
+            "  - --filesystem=xdg-videos" \
+            "  - --filesystem=xdg-download:ro" \
+            "  - --talk-name=org.freedesktop.portal.FileChooser" \
+            "" \
+            "modules:" \
+            "  - name: lumina-video-demo" \
+            "    buildsystem: simple" \
+            "    build-commands:" \
+            "      - install -Dm755 lumina-video-demo /app/bin/lumina-video-demo" \
+            "    sources:" \
+            "      - type: file" \
+            "        path: binary/lumina-video-demo" \
+            > flatpak-binary.yml
+
+      - name: Build Flatpak
+        run: |
+          VERSION="${{ needs.build-binary.outputs.version }}"
+          chmod +x binary/lumina-video-demo
+          flatpak-builder --force-clean --repo=repo build-dir flatpak-binary.yml
+          flatpak build-bundle repo "lumina-video-demo-${VERSION}.flatpak" io.github.lumina_video.Demo
+
+      - name: Upload Flatpak artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-package
+          path: "*.flatpak"
+
+  package-aur:
+    name: Prepare AUR PKGBUILD
+    needs: build-binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare PKGBUILD
+        run: |
+          VERSION="${{ needs.build-binary.outputs.version }}"
+
+          # Update version in PKGBUILD
+          sed -i "s/pkgver=.*/pkgver=${VERSION}/" packaging/aur/PKGBUILD
+
+          # Copy to output
+          cp packaging/aur/PKGBUILD ./PKGBUILD
+
+      - name: Upload PKGBUILD artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aur-pkgbuild
+          path: PKGBUILD
+
+  upload-release:
+    name: Upload to Release
+    needs: [build-binary, package-deb, package-rpm, package-flatpak, package-aur]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/lumina-video-demo-linux-x86_64/lumina-video-demo
+            artifacts/deb-package/*.deb
+            artifacts/rpm-package/*.rpm
+            artifacts/flatpak-package/*.flatpak
+            artifacts/aur-pkgbuild/PKGBUILD

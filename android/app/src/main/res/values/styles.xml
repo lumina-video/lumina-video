@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Theme and style resources for lumina-video demo application.
+
+    Uses Material Design 3 with customization for video playback experience.
+-->
+<resources>
+
+    <!--
+        Base application theme.
+        Dark theme is preferred for video playback to reduce eye strain.
+    -->
+    <style name="Theme.LuminaVideoDemo" parent="Theme.Material3.DayNight.NoActionBar">
+        <!-- Primary brand color -->
+        <item name="colorPrimary">@color/primary</item>
+        <item name="colorPrimaryDark">@color/primary_dark</item>
+        <item name="colorAccent">@color/accent</item>
+
+        <!-- Window background -->
+        <item name="android:windowBackground">@color/background</item>
+
+        <!-- Status bar -->
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+
+    <!--
+        Fullscreen theme for GameActivity.
+        Optimized for native rendering with minimal system UI interference.
+    -->
+    <style name="Theme.LuminaVideoDemo.Fullscreen" parent="Theme.LuminaVideoDemo">
+        <!-- Remove title bar -->
+        <item name="android:windowNoTitle">true</item>
+        <item name="windowNoTitle">true</item>
+
+        <!-- Enable fullscreen layout -->
+        <item name="android:windowFullscreen">true</item>
+
+        <!-- Translucent system bars for immersive experience -->
+        <item name="android:windowTranslucentStatus">true</item>
+        <item name="android:windowTranslucentNavigation">true</item>
+
+        <!-- windowLayoutInDisplayCutoutMode is in values-v28/styles.xml (requires API 28+) -->
+
+        <!-- Disable default animations for faster transitions -->
+        <item name="android:windowAnimationStyle">@null</item>
+
+        <!-- NOTE: Keep screen on is handled programmatically in MainActivity.kt
+             via window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+             because android:keepScreenOn is a View attribute, not a theme attribute. -->
+    </style>
+
+</resources>

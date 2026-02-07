@@ -1,0 +1,45 @@
+[package]
+name = "lumina-video-demo"
+version = { workspace = true }
+edition = "2021"
+description = "Demo application for lumina-video video player"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "lumina-video-demo"
+path = "src/main.rs"
+
+[features]
+default = ["moq"]
+# MoQ: Media over QUIC live streaming with Nostr discovery
+moq = ["lumina-video/moq", "tokio"]
+# Windows still requires explicit feature flag
+windows-native-video = ["lumina-video/windows-native-video"]
+
+[dependencies]
+# Workspace path dependency: This demo is part of the lumina-video workspace and uses
+# a path dependency to the main library crate. This is standard Rust workspace practice.
+# The demo is not published (publish = false), so path dependencies are appropriate.
+#
+# Native video decoders and zero-copy are always-on for Linux, macOS, Android.
+# Windows requires the windows-native-video feature.
+# MoQ (Media over QUIC) is always enabled for live streaming support.
+#
+# NOTE: objc2 0.5.x (winit) and 0.6.x (AVFoundation) coexist because they use different ObjC classes.
+# The Objective-C runtime handles dispatch correctly for both versions.
+lumina-video = { path = "../lumina-video", features = ["moq"] }
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "wgpu"] }
+egui = "0.31.1"
+ehttp = "0.5"
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { workspace = true, optional = true }
+
+# macOS: FFmpeg is always enabled (for MKV/WebM support)
+# No feature flag needed - just requires one-time setup: ./scripts/setup-macos-ffmpeg.sh
+
+# Windows needs explicit feature flag for native video
+[target.'cfg(target_os = "windows")'.dependencies]
+lumina-video = { path = "../lumina-video", features = ["windows-native-video"] }

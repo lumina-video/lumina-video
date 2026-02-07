@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    API 28+ specific theme overrides.
+
+    windowLayoutInDisplayCutoutMode requires API 28 (Android 9) but minSdk is 26.
+    This resource qualifier ensures the attribute only applies on compatible devices.
+-->
+<resources>
+
+    <!--
+        Fullscreen theme for GameActivity (API 28+ version).
+        Adds display cutout handling for notched screens.
+    -->
+    <style name="Theme.LuminaVideoDemo.Fullscreen" parent="Theme.LuminaVideoDemo">
+        <!-- Remove title bar -->
+        <item name="android:windowNoTitle">true</item>
+        <item name="windowNoTitle">true</item>
+
+        <!-- Enable fullscreen layout -->
+        <item name="android:windowFullscreen">true</item>
+
+        <!-- Translucent system bars for immersive experience -->
+        <item name="android:windowTranslucentStatus">true</item>
+        <item name="android:windowTranslucentNavigation">true</item>
+
+        <!-- Allow content to extend under display cutouts (notches) - API 28+ only -->
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+
+        <!-- Disable default animations for faster transitions -->
+        <item name="android:windowAnimationStyle">@null</item>
+
+        <!-- NOTE: Keep screen on is handled programmatically in MainActivity.kt
+             via window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+             because android:keepScreenOn is a View attribute, not a theme attribute. -->
+    </style>
+
+</resources>

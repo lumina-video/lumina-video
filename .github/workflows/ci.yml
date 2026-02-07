@@ -1,0 +1,163 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libspeechd-dev libxkbcommon-dev libssl-dev libunwind-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libasound2-dev libavutil-dev libavformat-dev libavcodec-dev \
+            libavdevice-dev libavfilter-dev libswscale-dev libswresample-dev \
+            libclang-dev
+      # Exclude lumina-video-android from non-Android builds (ndk-sys only compiles for Android)
+      - run: cargo clippy --package lumina-video --package lumina-video-demo --all-targets -- -D warnings
+
+  test-linux:
+    name: Test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libspeechd-dev libxkbcommon-dev libssl-dev libunwind-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            libasound2-dev libavutil-dev libavformat-dev libavcodec-dev \
+            libavdevice-dev libavfilter-dev libswscale-dev libswresample-dev \
+            libclang-dev
+      # Exclude lumina-video-android from non-Android builds
+      - name: Build
+        run: cargo build --package lumina-video --package lumina-video-demo --verbose
+      - name: Run tests
+        run: cargo test --package lumina-video --package lumina-video-demo --verbose
+
+  test-macos:
+    name: Test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install FFmpeg and pkg-config
+        run: brew install ffmpeg pkg-config
+      - name: Get FFmpeg version for cache key
+        id: ffmpeg-version
+        # jq is pre-installed on GitHub macOS runners
+        run: echo "version=$(brew info ffmpeg --json | jq -r '.[0].versions.stable')" >> $GITHUB_OUTPUT
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Include FFmpeg version in cache key to avoid stale library paths
+          key: macos-ffmpeg-${{ steps.ffmpeg-version.outputs.version }}
+      - name: Set FFmpeg library paths
+        run: |
+          FFMPEG_PREFIX=$(brew --prefix ffmpeg)
+          echo "PKG_CONFIG_PATH=${FFMPEG_PREFIX}/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
+          echo "LIBRARY_PATH=${FFMPEG_PREFIX}/lib:$LIBRARY_PATH" >> $GITHUB_ENV
+          echo "DYLD_LIBRARY_PATH=${FFMPEG_PREFIX}/lib:$DYLD_LIBRARY_PATH" >> $GITHUB_ENV
+      # Exclude lumina-video-android from non-Android builds
+      - name: Build
+        run: cargo build --package lumina-video --package lumina-video-demo --verbose
+      - name: Run tests
+        run: cargo test --package lumina-video --package lumina-video-demo --verbose
+
+  test-windows:
+    name: Test (Windows)
+    runs-on: windows-latest
+    # Windows support is in progress - disabled until other platforms are stable
+    if: false
+    continue-on-error: true
+    env:
+      VCPKGRS_DYNAMIC: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install LLVM
+        run: choco install llvm -y
+      - name: Set LIBCLANG_PATH
+        run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+      - name: Install FFmpeg via vcpkg
+        run: |
+          vcpkg install ffmpeg:x64-windows
+          echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+      # Exclude lumina-video-android from non-Android builds
+      - name: Build
+        run: cargo build --package lumina-video --package lumina-video-demo --verbose
+      - name: Run tests
+        run: cargo test --package lumina-video --package lumina-video-demo --verbose
+
+  check-android:
+    name: Check (Android)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Add Android target
+        run: rustup target add aarch64-linux-android
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+      - name: Check Android build
+        # Exclude web-demo (wasm-only) and demo (requires native deps)
+        run: cargo ndk -t arm64-v8a check --package lumina-video --package lumina-video-android
+
+  # Summary job for branch protection
+  ci-success:
+    name: CI Success
+    # Note: test-windows is disabled (if: false) until other platforms are stable
+    needs: [fmt, clippy, test-linux, test-macos, check-android]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check all jobs passed
+        run: |
+          if [[ "${{ needs.fmt.result }}" != "success" ]] || \
+             [[ "${{ needs.clippy.result }}" != "success" ]] || \
+             [[ "${{ needs.test-linux.result }}" != "success" ]] || \
+             [[ "${{ needs.test-macos.result }}" != "success" ]] || \
+             [[ "${{ needs.check-android.result }}" != "success" ]]; then
+            echo "Some jobs failed"
+            exit 1
+          fi
+          echo "All required jobs passed!"
+          echo "Note: Windows build is disabled until other platforms are stable"
