@@ -6,14 +6,23 @@ Complete guide for building and integrating lumina-video on Android.
 
 - Android SDK with API 35 (compileSdk)
 - Android NDK 26.x
+- `ANDROID_NDK_HOME` environment variable pointing to the NDK (cargo-ndk requires this)
 - Rust with Android targets: `rustup target add aarch64-linux-android`
 - `cargo-ndk`: `cargo install cargo-ndk`
+
+```bash
+# Verify your environment
+echo "SDK: $ANDROID_HOME"        # e.g. /opt/homebrew/share/android-commandlinetools
+echo "NDK: $ANDROID_NDK_HOME"    # e.g. $ANDROID_HOME/ndk/26.1.10909125
+ls "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/"  # should list darwin-x86_64 or linux-x86_64
+```
 
 ## Building the Native Library
 
 ```bash
 # Build native library for arm64
-cargo ndk -t arm64-v8a build --package lumina-video-android --release
+# -P 26 sets the minimum API level (required — default API 21 is missing libaaudio)
+cargo ndk -t arm64-v8a -P 26 build --package lumina-video-android --release
 
 # Copy to jniLibs
 mkdir -p android/app/src/main/jniLibs/arm64-v8a
@@ -24,8 +33,10 @@ cp target/aarch64-linux-android/release/liblumina_video_android.so \
 ## Building the APK
 
 ```bash
-# Create local.properties (set your SDK path)
-echo "sdk.dir=$HOME/Library/Android/sdk" > android/local.properties
+# Create local.properties pointing to your SDK
+# NOTE: The SDK path varies by install method. Use $ANDROID_HOME if set,
+# or check: ~/Library/Android/sdk, /opt/homebrew/share/android-commandlinetools
+echo "sdk.dir=$ANDROID_HOME" > android/local.properties
 
 # Build APK
 cd android && ./gradlew assembleDebug
@@ -57,7 +68,7 @@ adb shell pidof com.luminavideo.demo
 adb logcat -s "lumina-video:*" "LuminaVideoDemo:*" "ExoPlayerBridge:*"
 
 # Expected log output on successful start:
-# I LuminaVideoDemo: Loaded liblumina_video.so
+# I LuminaVideoDemo: Loaded liblumina_video_android.so
 # I lumina-video: android_main: Starting lumina-video demo
 # I lumina-video: AHardwareBuffer zero-copy available (API XX)
 ```
@@ -71,6 +82,8 @@ adb logcat -s "lumina-video:*" "LuminaVideoDemo:*" "ExoPlayerBridge:*"
 | `ClassNotFoundException: ExoPlayerBridge` | Wrong JNI package | Use latest code (fixed in commit 7359f445) |
 | `NoSuchMethodError: play(String)` | Missing Kotlin methods | Use latest Kotlin bridge code |
 | `AHardwareBuffer format errors` | Non-fatal wgpu probing | Ignore - failures handled gracefully |
+| `unable to find library -laaudio` | API level too low | Pass `-P 26` (or higher) to `cargo ndk` |
+| `sdk.dir` not set / wrong path | `local.properties` misconfigured | Run `echo "sdk.dir=$ANDROID_HOME" > android/local.properties` |
 
 ## ExoPlayer Bridge Architecture
 
