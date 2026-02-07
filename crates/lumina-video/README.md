@@ -14,12 +14,17 @@ lumina-video = { git = "https://github.com/lumina-video/lumina-video" }
 ```rust
 use lumina_video::VideoPlayer;
 
-// In your egui app:
+// In your eframe app's update():
+let wgpu_render_state = frame.wgpu_render_state().unwrap();
+
 if self.player.is_none() {
-    self.player = Some(VideoPlayer::new("https://example.com/video.mp4"));
+    self.player = Some(
+        VideoPlayer::with_wgpu("https://example.com/video.mp4", wgpu_render_state)
+            .with_autoplay(true),
+    );
 }
 if let Some(player) = &mut self.player {
-    player.show(ui, [640.0, 360.0].into());
+    player.show(ui, egui::vec2(640.0, 360.0));
 }
 ```
 
