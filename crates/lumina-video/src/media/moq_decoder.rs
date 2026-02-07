@@ -3220,6 +3220,60 @@ pub mod android {
             let max_latency = Duration::from_millis(config.max_latency_ms);
             let mut video_consumer = hang_consumer.subscribe(&video_track, max_latency);
 
+            // Audio track selection and subscription
+            use super::moq_audio::*;
+
+            let (mut audio_consumer_opt, audio_sender_opt, mut moq_audio_thread_opt) = if config
+                .enable_audio
+            {
+                if let Some((track_name, audio_cfg)) = select_preferred_audio_rendition(&catalog) {
+                    *shared.audio.audio_status.lock() = MoqAudioStatus::Starting;
+
+                    let audio_track = moq_lite::Track {
+                        name: track_name.to_string(),
+                        priority: 2,
+                    };
+                    let audio_consumer = hang_consumer.subscribe(&audio_track, max_latency);
+
+                    let (tx, rx) = crossbeam_channel::bounded(config.audio_buffer_capacity);
+                    let live_sender = LiveEdgeSender::new(tx.clone(), rx.clone());
+
+                    let audio_handle = super::audio::AudioHandle::new();
+                    *shared.audio.moq_audio_handle.lock() = Some(audio_handle.clone());
+
+                    match MoqAudioThread::spawn(
+                        rx,
+                        audio_cfg.sample_rate,
+                        audio_cfg.channel_count,
+                        audio_cfg.description.clone(),
+                        audio_handle,
+                        shared.audio.clone(),
+                    ) {
+                        Ok(thread) => {
+                            tracing::info!(
+                                "MoQ Android: Audio subscribed to track '{}' ({}Hz, {}ch)",
+                                track_name,
+                                audio_cfg.sample_rate,
+                                audio_cfg.channel_count,
+                            );
+                            (Some(audio_consumer), Some(live_sender), Some(thread))
+                        }
+                        Err(e) => {
+                            tracing::warn!("MoQ Android: Failed to start audio thread: {e}");
+                            *shared.audio.audio_status.lock() = MoqAudioStatus::Error;
+                            *shared.audio.moq_audio_handle.lock() = None;
+                            (None, None, None)
+                        }
+                    }
+                } else {
+                    tracing::info!("MoQ Android: No AAC audio track in catalog");
+                    *shared.audio.audio_status.lock() = MoqAudioStatus::Unavailable;
+                    (None, None, None)
+                }
+            } else {
+                (None, None, None)
+            };
+
             shared.set_state(MoqDecoderState::Streaming);
             shared.buffering_percent.store(100, Ordering::Relaxed);
 
@@ -3228,38 +3282,118 @@ pub mod android {
                 video_track_name
             );
 
-            // Main NAL unit receive loop
+            // Main frame receive loop with fair video/audio scheduling
             loop {
-                match video_consumer.read_frame().await {
-                    Ok(Some(frame)) => {
-                        let mut data = bytes::BytesMut::with_capacity(frame.payload.remaining());
-                        for chunk in &frame.payload {
-                            data.extend_from_slice(chunk);
-                        }
+                tokio::select! {
+                    video_result = video_consumer.read_frame() => {
+                        match video_result {
+                            Ok(Some(frame)) => {
+                                let mut data = bytes::BytesMut::with_capacity(frame.payload.remaining());
+                                for chunk in &frame.payload {
+                                    data.extend_from_slice(chunk);
+                                }
 
-                        let moq_frame = MoqVideoFrame {
-                            timestamp_us: frame.timestamp.as_micros() as u64,
-                            data: data.freeze(),
-                            is_keyframe: frame.keyframe,
-                        };
+                                let moq_frame = MoqVideoFrame {
+                                    timestamp_us: frame.timestamp.as_micros() as u64,
+                                    data: data.freeze(),
+                                    is_keyframe: frame.keyframe,
+                                };
 
-                        // Send NAL unit to decoder (blocking — applies QUIC backpressure)
-                        if nal_tx.send(moq_frame).await.is_err() {
-                            tracing::warn!("MoQ Android: Frame channel closed, stopping worker");
-                            break;
+                                if nal_tx.send(moq_frame).await.is_err() {
+                                    tracing::warn!("MoQ Android: Frame channel closed, stopping worker");
+                                    break;
+                                }
+                            }
+                            Ok(None) => {
+                                tracing::info!("MoQ Android: Video track ended");
+                                shared.set_state(MoqDecoderState::Ended);
+                                shared.eof_reached.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::error!("MoQ Android: Frame read error: {e}");
+                                shared.set_error(format!("Frame read error: {e}"));
+                                break;
+                            }
                         }
                     }
-                    Ok(None) => {
-                        tracing::info!("MoQ Android: Video track ended");
-                        shared.set_state(MoqDecoderState::Ended);
-                        shared.eof_reached.store(true, Ordering::Relaxed);
-                        break;
+                    audio_result = async {
+                        if let Some(consumer) = audio_consumer_opt.as_mut() {
+                            consumer.read_frame().await
+                        } else {
+                            std::future::pending().await
+                        }
+                    } => {
+                        if let Some(ref audio_sender) = audio_sender_opt {
+                            match audio_result {
+                                Ok(Some(frame)) => {
+                                    let mut data = bytes::BytesMut::with_capacity(frame.payload.remaining());
+                                    for chunk in &frame.payload {
+                                        data.extend_from_slice(chunk);
+                                    }
+                                    let moq_frame = MoqAudioFrame {
+                                        timestamp_us: frame.timestamp.as_micros() as u64,
+                                        data: data.freeze(),
+                                    };
+                                    if let Err(ChannelClosed) = audio_sender.send(moq_frame) {
+                                        tracing::warn!("MoQ Android: Audio channel closed");
+                                        audio_consumer_opt = None;
+                                    }
+                                }
+                                Ok(None) => {
+                                    tracing::info!("MoQ Android: Audio track ended");
+                                    audio_consumer_opt = None;
+                                }
+                                Err(e) => {
+                                    tracing::warn!("MoQ Android: Audio read error: {e}");
+                                    audio_consumer_opt = None;
+                                }
+                            }
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!("MoQ Android: Frame read error: {e}");
-                        shared.set_error(format!("Frame read error: {e}"));
-                        break;
+                }
+            }
+
+            // Worker teardown: deterministic audio thread shutdown
+            drop(audio_sender_opt);
+            {
+                let mut status = shared.audio.audio_status.lock();
+                if *status == MoqAudioStatus::Starting {
+                    *status = MoqAudioStatus::Unavailable;
+                }
+            }
+            if let Some(thread) = moq_audio_thread_opt.take() {
+                let shared_for_teardown = shared.clone();
+                let teardown_start = std::time::Instant::now();
+                let teardown_fut = tokio::task::spawn_blocking(move || drop(thread));
+                match tokio::time::timeout(Duration::from_secs(2), teardown_fut).await {
+                    Ok(Ok(())) => {
+                        tracing::debug!("MoQ Android: audio teardown completed")
                     }
+                    Ok(Err(e)) => {
+                        tracing::warn!("MoQ Android: audio teardown task failed: {e}");
+                        *shared_for_teardown.audio.audio_status.lock() = MoqAudioStatus::Error;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "MoQ Android: audio teardown timed out after 2s, proceeding"
+                        );
+                    }
+                }
+                shared_for_teardown
+                    .audio
+                    .internal_audio_ready
+                    .store(false, Ordering::Relaxed);
+                *shared_for_teardown.audio.moq_audio_handle.lock() = None;
+                {
+                    let mut status = shared_for_teardown.audio.audio_status.lock();
+                    if *status == MoqAudioStatus::Running || *status == MoqAudioStatus::Starting {
+                        *status = MoqAudioStatus::Unavailable;
+                    }
+                }
+                let teardown_ms = teardown_start.elapsed().as_millis();
+                if teardown_ms > 250 {
+                    tracing::warn!("MoQ Android: audio teardown took {teardown_ms}ms");
                 }
             }
 
@@ -3615,8 +3749,14 @@ pub mod android {
         }
 
         fn handles_audio_internally(&self) -> bool {
-            // Android MoQ audio deferred to JNI AudioTrack
-            false
+            self.shared
+                .audio
+                .internal_audio_ready
+                .load(Ordering::Relaxed)
+        }
+
+        fn audio_handle(&self) -> Option<super::audio::AudioHandle> {
+            self.shared.audio.moq_audio_handle.lock().clone()
         }
 
         fn set_muted(&mut self, muted: bool) -> Result<(), VideoError> {

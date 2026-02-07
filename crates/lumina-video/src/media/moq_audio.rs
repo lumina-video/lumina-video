@@ -1,7 +1,7 @@
 //! MoQ audio pipeline: crossbeam handoff → symphonia AAC decode → rodio playback.
 //!
-//! This module is gated on `cfg(all(feature = "moq", any(target_os = "macos", target_os = "linux")))`.
-//! Android uses JNI AudioTrack (deferred). Windows has no MoQ decoder yet.
+//! This module is gated on `cfg(all(feature = "moq", any(target_os = "macos", target_os = "linux", target_os = "android")))`.
+//! Android uses cpal/Oboe (same pipeline as desktop). Windows has no MoQ decoder yet.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

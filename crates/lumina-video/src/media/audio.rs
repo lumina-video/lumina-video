@@ -471,7 +471,7 @@ impl std::fmt::Debug for AudioSamples {
 // Rodio-based audio player (when ffmpeg feature is enabled)
 // ============================================================================
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 mod rodio_impl {
     use super::*;
     use rodio::Source;
@@ -742,7 +742,7 @@ mod rodio_impl {
 // Placeholder implementation (when ffmpeg feature is disabled)
 // ============================================================================
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
 mod placeholder_impl {
     use super::*;
 
@@ -805,10 +805,10 @@ mod placeholder_impl {
 }
 
 // Re-export the appropriate implementation
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 pub use rodio_impl::AudioPlayer;
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
 pub use placeholder_impl::AudioPlayer;
 
 #[cfg(test)]
