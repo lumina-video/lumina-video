@@ -471,12 +471,12 @@ impl std::fmt::Debug for AudioSamples {
 // Rodio-based audio player (when ffmpeg feature is enabled)
 // ============================================================================
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 mod rodio_impl {
     use super::*;
+    use parking_lot::Mutex;
     use rodio::Source;
     use rodio::{buffer::SamplesBuffer, OutputStream, OutputStreamBuilder, Sink};
-    use std::sync::Mutex;
 
     // ========================================================================
     // Sample-counting source wrapper for accurate position tracking
@@ -605,6 +605,19 @@ mod rodio_impl {
             external_handle: Option<AudioHandle>,
         ) -> Result<Self, String> {
             // Create audio output stream (rodio 0.21 API)
+            // On Linux, set explicit ALSA buffer size to avoid extreme default latency (cpal#446).
+            // macOS CoreAudio (512 frames) and Android Oboe have reasonable defaults.
+            #[cfg(target_os = "linux")]
+            let stream = OutputStreamBuilder::from_default_device()
+                .map(|b| b.with_buffer_size(rodio::cpal::BufferSize::Fixed(1024)))
+                .and_then(|b| b.open_stream_or_fallback())
+                .or_else(|e| {
+                    tracing::warn!("Audio: explicit buffer setup failed ({e}), trying default");
+                    OutputStreamBuilder::open_default_stream()
+                })
+                .map_err(|e| format!("Failed to create audio output: {e}"))?;
+
+            #[cfg(not(target_os = "linux"))]
             let stream = OutputStreamBuilder::open_default_stream()
                 .map_err(|e| format!("Failed to create audio output: {e}"))?;
 
@@ -679,28 +692,25 @@ mod rodio_impl {
             let counting_source = SampleCountingSource::new(buffer, self.handle.clone());
 
             // Append to sink and update volume dynamically
-            if let Ok(sink) = self.sink.lock() {
-                // Apply current volume/mute state to sink (dynamic, affects all queued audio)
-                sink.set_volume(self.handle.effective_volume());
-                sink.append(counting_source);
-            }
+            let sink = self.sink.lock();
+            // Apply current volume/mute state to sink (dynamic, affects all queued audio)
+            sink.set_volume(self.handle.effective_volume());
+            sink.append(counting_source);
             // Position is now computed on-demand in AudioHandle::position()
         }
 
         /// Starts audio playback.
         pub fn play(&mut self) {
-            if let Ok(sink) = self.sink.lock() {
-                sink.play();
-                self.state = AudioState::Playing;
-            }
+            let sink = self.sink.lock();
+            sink.play();
+            self.state = AudioState::Playing;
         }
 
         /// Pauses audio playback.
         pub fn pause(&mut self) {
-            if let Ok(sink) = self.sink.lock() {
-                sink.pause();
-                self.state = AudioState::Paused;
-            }
+            let sink = self.sink.lock();
+            sink.pause();
+            self.state = AudioState::Paused;
         }
 
         /// Returns the current state.
@@ -713,9 +723,9 @@ mod rodio_impl {
         /// Note: After clear(), the sink may be paused. Caller should call play()
         /// if playback should continue (e.g., during seek).
         pub fn clear(&mut self) {
-            if let Ok(sink) = self.sink.lock() {
-                sink.clear();
-            }
+            let sink = self.sink.lock();
+            sink.clear();
+            drop(sink);
             // Reset all position tracking so next queued samples establish new timeline
             self.initial_pts = None;
             self.handle.clear_playback_epoch();
@@ -729,7 +739,7 @@ mod rodio_impl {
 // Placeholder implementation (when ffmpeg feature is disabled)
 // ============================================================================
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
 mod placeholder_impl {
     use super::*;
 
@@ -792,10 +802,10 @@ mod placeholder_impl {
 }
 
 // Re-export the appropriate implementation
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 pub use rodio_impl::AudioPlayer;
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
 pub use placeholder_impl::AudioPlayer;
 
 #[cfg(test)]

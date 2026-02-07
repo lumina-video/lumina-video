@@ -47,7 +47,10 @@ pub mod linux_video_gst;
 pub mod macos_video;
 #[cfg(all(not(target_arch = "wasm32"), feature = "moq"))]
 pub mod moq;
-#[cfg(all(feature = "moq", any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    feature = "moq",
+    any(target_os = "macos", target_os = "linux", target_os = "android")
+))]
 pub(crate) mod moq_audio;
 #[cfg(all(not(target_arch = "wasm32"), feature = "moq"))]
 pub mod moq_decoder;
