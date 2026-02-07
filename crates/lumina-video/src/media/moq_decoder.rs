@@ -812,12 +812,15 @@ impl MoqDecoder {
                 "VTDecoder: no frame decoded (async?)".to_string(),
             )),
             Err(e) => {
-                // Decode error - enter IDR resync mode
+                // Decode error - destroy VT session and enter IDR resync mode.
+                // Simply clearing the queue (prepare_for_idr_resync) is insufficient:
+                // VT's internal decoder state is corrupted after -12909 and subsequent
+                // keyframes will also fail. Destroying the session forces a fresh
+                // VTDecompressionSession to be created from catalog SPS/PPS when the
+                // next keyframe arrives (handled by init code at top of decode_frame).
                 self.waiting_for_idr_after_error = true;
-                if let Some(ref mut decoder) = self.vt_decoder {
-                    decoder.prepare_for_idr_resync();
-                }
-                tracing::warn!("MoQ: VT decode failed, entering IDR resync mode: {}", e);
+                self.vt_decoder = None;
+                tracing::warn!("MoQ: VT decode failed, destroyed session and entering IDR resync mode: {}", e);
                 Err(e)
             }
         }

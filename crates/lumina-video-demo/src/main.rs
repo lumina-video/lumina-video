@@ -471,7 +471,7 @@ impl eframe::App for DemoApp {
         // Top panel with controls
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("lumina-video Demo");
+                ui.heading(format!("lumina-video Demo  [{}]", env!("LUMINA_BUILD_ID", "dev")));
                 ui.separator();
 
                 // Source type selector
