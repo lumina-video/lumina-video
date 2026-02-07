@@ -107,6 +107,8 @@ symphonia-codec-aac = { workspace = true }
 windows = { version = "0.58", features = [
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Direct3D12",
@@ -115,6 +117,8 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security",
 ], optional = true }
+# wgpu with HAL access for zero-copy D3D11→D3D12 shared handle import
+wgpu = { version = "24", features = ["dx12"], optional = true }
 rodio = { workspace = true, optional = true }
 
 # Native-only dependencies (not available on wasm32)
@@ -230,7 +234,7 @@ default = []
 
 # Windows: Native Media Foundation + DXVA2/D3D11VA hardware acceleration
 # This is opt-in until the Windows zero-copy implementation is validated
-windows-native-video = ["windows", "rodio", "profiling"]
+windows-native-video = ["windows", "wgpu", "rodio", "profiling"]
 
 # Profiling support (enabled automatically with windows-native-video)
 profiling = ["dep:profiling"]

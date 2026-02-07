@@ -332,20 +332,20 @@ impl QueueAudioSource {
 }
 
 impl Iterator for QueueAudioSource {
-    type Item = i16;
+    type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
         // First, emit any pending silence samples for PTS gap
         if self.silence_samples > 0 {
             self.silence_samples -= 1;
             self.clock.add_samples(1);
-            return Some(0);
+            return Some(0.0);
         }
 
         // Try to get sample from current frame
         if let Some(ref frame) = self.current_frame {
             if self.frame_pos < frame.data.len() {
-                let sample = frame.data[self.frame_pos];
+                let sample = frame.data[self.frame_pos] as f32 / 32768.0;
                 self.frame_pos += 1;
                 self.clock.add_samples(1);
                 return Some(sample);
@@ -364,11 +364,11 @@ impl Iterator for QueueAudioSource {
             if self.silence_samples > 0 {
                 self.silence_samples -= 1;
                 self.clock.add_samples(1);
-                return Some(0);
+                return Some(0.0);
             }
 
             if !frame.data.is_empty() {
-                let sample = frame.data[0];
+                let sample = frame.data[0] as f32 / 32768.0;
                 self.frame_pos = 1;
                 self.clock.add_samples(1);
                 return Some(sample);
@@ -379,12 +379,12 @@ impl Iterator for QueueAudioSource {
         // This prevents rodio from ending the stream during buffer underruns
         // Advance the clock even for silence so playback time keeps moving
         self.clock.add_samples(1);
-        Some(0)
+        Some(0.0)
     }
 }
 
 impl rodio::Source for QueueAudioSource {
-    fn current_frame_len(&self) -> Option<usize> {
+    fn current_span_len(&self) -> Option<usize> {
         // We don't know the total length
         None
     }
@@ -457,11 +457,10 @@ impl WindowsAudioPlayback {
         queue: Arc<AudioQueue>,
         clock: Arc<AudioClock>,
     ) -> Result<Self, String> {
-        let (stream, stream_handle) = rodio::OutputStream::try_default()
+        let stream = rodio::OutputStreamBuilder::open_default_stream()
             .map_err(|e| format!("Failed to open audio output: {}", e))?;
 
-        let sink = rodio::Sink::try_new(&stream_handle)
-            .map_err(|e| format!("Failed to create audio sink: {}", e))?;
+        let sink = rodio::Sink::connect_new(stream.mixer());
 
         let source = QueueAudioSource::new(
             Arc::clone(&queue),

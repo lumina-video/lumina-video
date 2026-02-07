@@ -21,6 +21,52 @@
 //!     → VideoFrame
 //! ```
 //!
+//! # A/V Synchronization
+//!
+//! Following the macOS FFmpeg fallback pattern, audio position serves as the
+//! master clock for video frame timing. The integration works as follows:
+//!
+//! 1. **Video Decode**: This decoder provides video frames with PTS timestamps
+//! 2. **Audio Decode**: `read_audio_sample()` provides audio frames with PTS
+//! 3. **Audio Playback**: `WindowsAudioPlayback` plays audio and tracks position
+//!    via `AudioClock` (sample-based, accounts for ~50ms WASAPI latency)
+//! 4. **Clock Bridge**: `WindowsAudioBridge` syncs `AudioClock` to the common
+//!    `AudioHandle` used by `FrameScheduler`
+//! 5. **Frame Scheduling**: `FrameScheduler` uses `AudioHandle.position_for_sync()`
+//!    to determine when to present video frames
+//! 6. **Drift Tracking**: `SyncMetrics` records drift (video_pts - audio_pos)
+//!    for quality monitoring and debugging
+//!
+//! ## Stream PTS Offset
+//!
+//! Audio and video streams may have different start times (first PTS values).
+//! The `stream_pts_offset` in `AudioHandle` normalizes positions so drift
+//! calculation compares apples-to-apples timestamps.
+//!
+//! ## Integration Example
+//!
+//! ```ignore
+//! // In decode thread setup:
+//! let decoder = WindowsVideoDecoder::new(url, debug)?;
+//! let audio_format = decoder.audio_format().unwrap();
+//! let audio_playback = WindowsAudioPlayback::new_with_queue(...)?;
+//! let audio_bridge = audio_playback.create_bridge(audio_handle.clone());
+//!
+//! // In decode loop:
+//! if let Some(audio_frame) = decoder.read_audio_sample()? {
+//!     audio_bridge.set_base_pts(audio_frame.pts);
+//!     audio_queue.push(audio_frame);
+//! }
+//! if let Some(video_frame) = decoder.decode_next()? {
+//!     frame_queue.push(video_frame);
+//! }
+//! audio_bridge.sync(); // Sync clock to AudioHandle
+//!
+//! // In render loop (FrameScheduler handles this):
+//! let frame = scheduler.get_next_frame(&frame_queue); // Uses audio clock
+//! scheduler.sync_metrics().record_frame(frame.pts, audio_pos); // Drift tracking
+//! ```
+//!
 //! # Zero-Copy GPU Rendering (Future)
 //!
 //! True zero-copy from D3D11 to wgpu requires:
@@ -37,9 +83,19 @@
 //! When `MF_SOURCE_READER_D3D11_DEVICE` is set, Media Foundation automatically
 //! uses DXVA2/D3D11VA for hardware decoding when available. The decoder falls
 //! back to software decode if hardware acceleration fails.
+//!
+//! # Zero-Copy Diagnostics
+//!
+//! For third-party testing (user does not have Windows machine), the following
+//! environment variables enable verbose diagnostics:
+//!
+//! - `LUMINA_VIDEO_ZERO_COPY_DEBUG=1`: Enable verbose zero-copy logging
+//! - `LUMINA_VIDEO_FORCE_CPU_FALLBACK=1`: Force CPU fallback path for testing
+//! - `LUMINA_VIDEO_GPU_SYNC_VERBOSE=1`: Log GPU sync timing details
+//!
+//! Statistics are exposed via `WindowsZeroCopyStatsSnapshot` for runtime monitoring.
 
 use super::windows_audio::{AudioFormatInfo, AudioFrame};
-#[cfg(feature = "zero-copy")]
 use crate::media::video::WindowsGpuSurface;
 use crate::media::{
     CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend, VideoError,
@@ -50,6 +106,150 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
+
+// ============================================================================
+// Zero-Copy Statistics and Diagnostics (Public API)
+// ============================================================================
+//
+// These types provide visibility into zero-copy rendering status for third-party
+// testers who don't have access to the source code or debug builds.
+// ============================================================================
+
+/// Reason for falling back from zero-copy to CPU path.
+///
+/// Used for detailed diagnostics when zero-copy rendering is unavailable.
+/// Third-party testers can use this to understand why zero-copy isn't working
+/// on their specific hardware/driver configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+
+pub enum WindowsFallbackReason {
+    /// No DXGI buffer available (software decode active)
+    NoDxgiBuffer,
+    /// NV12 format requires YCbCr conversion (wgpu doesn't support yet)
+    Nv12FormatUnsupported,
+    /// CreateSharedHandle() failed
+    SharedHandleCreationFailed,
+    /// GPU sync timeout (event query exceeded 5 second limit)
+    GpuSyncTimeout,
+    /// D3D11 device lost or reset
+    DeviceLost,
+    /// wgpu ExternalTexture API not yet available
+    WgpuApiMissing,
+    /// Force CPU fallback via environment variable
+    ForcedByEnvVar,
+    /// Unknown or unspecified reason
+    Unknown,
+}
+
+impl std::fmt::Display for WindowsFallbackReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoDxgiBuffer => write!(f, "No DXGI buffer (software decode)"),
+            Self::Nv12FormatUnsupported => write!(f, "NV12 format (YCbCr not supported by wgpu)"),
+            Self::SharedHandleCreationFailed => write!(f, "CreateSharedHandle failed"),
+            Self::GpuSyncTimeout => write!(f, "GPU sync timeout"),
+            Self::DeviceLost => write!(f, "D3D11 device lost"),
+            Self::WgpuApiMissing => write!(f, "wgpu ExternalTexture API not available"),
+            Self::ForcedByEnvVar => write!(f, "Forced by LUMINA_VIDEO_FORCE_CPU_FALLBACK"),
+            Self::Unknown => write!(f, "Unknown"),
+        }
+    }
+}
+
+/// Snapshot of Windows zero-copy rendering statistics for diagnostics.
+///
+/// This is a public read-only view of internal decoding statistics, matching
+/// the pattern used by `MacOSZeroCopyStatsSnapshot`. Useful for performance
+/// monitoring, debugging fallback paths, and third-party testing.
+///
+/// # Example
+///
+/// ```ignore
+/// let stats = decoder.zero_copy_stats();
+/// println!("Zero-copy success rate: {:.1}%", stats.d3d11_shared_percentage());
+/// println!("Hardware decode rate: {:.1}%", stats.hardware_decode_percentage());
+/// if stats.frames_cpu_fallback > 0 {
+///     println!("Last fallback reason: {:?}", stats.last_fallback_reason);
+/// }
+/// ```
+#[derive(Debug, Clone, Default)]
+
+pub struct WindowsZeroCopyStatsSnapshot {
+    /// Total frames decoded.
+    pub frames_total: u64,
+    /// Frames where DXGI buffer was available (hardware decode confirmed).
+    pub frames_dxgi_available: u64,
+    /// Frames successfully using D3D11 shared texture path.
+    pub frames_d3d11_shared: u64,
+    /// Frames where NV12 format required CPU conversion.
+    pub frames_nv12_cpu_convert: u64,
+    /// Frames using full CPU fallback path.
+    pub frames_cpu_fallback: u64,
+    /// Frames where GPU sync (event query) timed out.
+    pub frames_gpu_sync_timeout: u64,
+    /// Last fallback reason encountered (if any).
+    pub last_fallback_reason: Option<WindowsFallbackReason>,
+    /// Output format from decoder (NV12 or RGB32).
+    pub output_format: String,
+}
+
+impl WindowsZeroCopyStatsSnapshot {
+    /// Returns the percentage of frames using D3D11 shared texture (0.0 - 100.0).
+    ///
+    /// This is the true zero-copy success rate. 100% means all frames went through
+    /// the zero-copy D3D11→D3D12 shared handle path.
+    pub fn d3d11_shared_percentage(&self) -> f64 {
+        if self.frames_total == 0 {
+            return 0.0;
+        }
+        (self.frames_d3d11_shared as f64 / self.frames_total as f64) * 100.0
+    }
+
+    /// Returns the percentage of frames with DXGI buffer available (0.0 - 100.0).
+    ///
+    /// This indicates hardware decode success rate. If this is low, the decoder
+    /// is falling back to software decode (possibly unsupported codec or GPU).
+    pub fn hardware_decode_percentage(&self) -> f64 {
+        if self.frames_total == 0 {
+            return 0.0;
+        }
+        (self.frames_dxgi_available as f64 / self.frames_total as f64) * 100.0
+    }
+
+    /// Returns a formatted summary suitable for logging.
+    ///
+    /// Example output:
+    /// ```text
+    /// Windows Zero-Copy: 1000 frames, 95.0% D3D11 shared, 98.0% HW decode, 5.0% NV12 CPU
+    /// ```
+    pub fn summary(&self) -> String {
+        format!(
+            "Windows Zero-Copy: {} frames, {:.1}% D3D11 shared, {:.1}% HW decode, {:.1}% NV12 CPU, format={}",
+            self.frames_total,
+            self.d3d11_shared_percentage(),
+            self.hardware_decode_percentage(),
+            if self.frames_total > 0 {
+                (self.frames_nv12_cpu_convert as f64 / self.frames_total as f64) * 100.0
+            } else {
+                0.0
+            },
+            self.output_format,
+        )
+    }
+}
+
+/// Internal zero-copy statistics tracking (thread-safe).
+
+struct ZeroCopyStatsInner {
+    frames_total: AtomicU64,
+    frames_dxgi_available: AtomicU64,
+    frames_d3d11_shared: AtomicU64,
+    frames_nv12_cpu_convert: AtomicU64,
+    frames_cpu_fallback: AtomicU64,
+    frames_gpu_sync_timeout: AtomicU64,
+    last_fallback_reason: Mutex<Option<WindowsFallbackReason>>,
+    fallback_logged: AtomicBool,
+}
 
 // ============================================================================
 // Media Foundation Lifecycle Guard
@@ -148,9 +348,11 @@ impl ComGuard {
     /// Creates a new COM guard, calling CoInitializeEx.
     fn new(debug: bool) -> Result<Self, VideoError> {
         unsafe {
-            CoInitializeEx(None, COINIT_MULTITHREADED).map_err(|e| {
-                VideoError::DecoderInit(format!("COM initialization failed: {}", e))
-            })?;
+            CoInitializeEx(None, COINIT_MULTITHREADED)
+                .ok()
+                .map_err(|e| {
+                    VideoError::DecoderInit(format!("COM initialization failed: {}", e))
+                })?;
         }
         if debug {
             debug!("COM initialized for this thread");
@@ -170,7 +372,7 @@ impl Drop for ComGuard {
     }
 }
 use windows::{
-    core::{Interface, HSTRING, PCWSTR},
+    core::{Interface, HSTRING, PCWSTR, PROPVARIANT},
     Win32::{
         Foundation::HANDLE,
         Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0},
@@ -228,7 +430,7 @@ use windows::{
             MF_SOURCE_READER_MEDIASOURCE,
         },
         Security::SECURITY_ATTRIBUTES,
-        System::Com::StructuredStorage::{PropVariantClear, PROPVARIANT},
+        System::Com::StructuredStorage::PropVariantClear,
         System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED},
     },
 };
@@ -267,6 +469,9 @@ pub struct WindowsVideoDecoder {
     /// Current playback position.
     position: Duration,
 
+    /// PTS of the first decoded video frame (for A/V sync offset calculation).
+    first_video_pts: Option<Duration>,
+
     /// Whether end-of-stream has been reached.
     eof: AtomicBool,
 
@@ -278,26 +483,20 @@ pub struct WindowsVideoDecoder {
 
     /// Shared texture for zero-copy rendering via D3D11→D3D12 interop.
     /// Created with D3D11_RESOURCE_MISC_SHARED_NTHANDLE flag.
-    #[cfg(feature = "zero-copy")]
     shared_texture: Option<ID3D11Texture2D>,
 
     /// Shared NT handle for the shared texture.
     /// Obtained via IDXGIResource1::CreateSharedHandle().
-    #[cfg(feature = "zero-copy")]
     shared_handle: Option<HANDLE>,
 
     /// Whether zero-copy is enabled (feature flag + successful shared texture creation).
-    #[cfg(feature = "zero-copy")]
     zero_copy_enabled: bool,
 
-    /// Count of frames using CPU fallback (for zero-copy tracking).
-    /// Incremented each frame since zero-copy to wgpu is not yet available.
-    #[cfg(feature = "zero-copy")]
-    cpu_fallback_count: AtomicU64,
+    /// Whether CPU fallback is forced via environment variable.
+    force_cpu_fallback: bool,
 
-    /// Whether the CPU fallback warning has been logged (avoid spam).
-    #[cfg(feature = "zero-copy")]
-    fallback_logged: AtomicBool,
+    /// Comprehensive zero-copy statistics for diagnostics.
+    zero_copy_stats: ZeroCopyStatsInner,
 
     /// Debug logging enabled.
     debug_logging: bool,
@@ -324,6 +523,17 @@ pub struct WindowsVideoDecoder {
     /// remains initialized while other COM objects are being dropped.
     _com_guard: ComGuard,
 }
+
+// SAFETY: WindowsVideoDecoder is Send because:
+// 1. All COM interfaces (IMFSourceReader, ID3D11Device, etc.) are thread-safe
+//    when COM is initialized with COINIT_MULTITHREADED (which we do in ComGuard)
+// 2. The shared_texture_handle is an NT HANDLE which is process-global and thread-safe
+// 3. All other fields are trivially Send (atomics, Mutex, primitives)
+//
+// In windows crate 0.58+, COM interface wrappers no longer auto-implement Send
+// because the crate cannot know the COM threading model. We know it's safe here
+// because we explicitly use COINIT_MULTITHREADED.
+unsafe impl Send for WindowsVideoDecoder {}
 
 impl WindowsVideoDecoder {
     /// Creates a new Windows video decoder with debug logging control.
@@ -390,6 +600,39 @@ impl WindowsVideoDecoder {
             );
         }
 
+        // Check environment variables for diagnostics
+        // These enable detailed logging for third-party testers without source access
+
+        let zero_copy_debug = std::env::var("LUMINA_VIDEO_ZERO_COPY_DEBUG")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+
+        let gpu_sync_verbose = std::env::var("LUMINA_VIDEO_GPU_SYNC_VERBOSE")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+
+        let force_cpu_fallback = std::env::var("LUMINA_VIDEO_FORCE_CPU_FALLBACK")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+
+        // Override debug_logging if zero-copy debug env var is set
+
+        let debug_logging = debug_logging || zero_copy_debug || gpu_sync_verbose;
+
+        if zero_copy_debug {
+            info!("Windows zero-copy: Debug logging ENABLED via LUMINA_VIDEO_ZERO_COPY_DEBUG");
+        }
+
+        if gpu_sync_verbose {
+            info!(
+                "Windows zero-copy: GPU sync verbose logging ENABLED via LUMINA_VIDEO_GPU_SYNC_VERBOSE"
+            );
+        }
+
+        if force_cpu_fallback {
+            info!("Windows zero-copy: CPU fallback FORCED via LUMINA_VIDEO_FORCE_CPU_FALLBACK");
+        }
+
         Ok(Self {
             source_reader,
             device,
@@ -397,19 +640,29 @@ impl WindowsVideoDecoder {
             dxgi_manager,
             metadata,
             position: Duration::ZERO,
+            first_video_pts: None,
             eof: AtomicBool::new(false),
             hw_accel,
             staging_texture: None,
-            #[cfg(feature = "zero-copy")]
+
             shared_texture: None,
-            #[cfg(feature = "zero-copy")]
+
             shared_handle: None,
-            #[cfg(feature = "zero-copy")]
+
             zero_copy_enabled: true, // Will be disabled if shared texture creation fails
-            #[cfg(feature = "zero-copy")]
-            cpu_fallback_count: AtomicU64::new(0),
-            #[cfg(feature = "zero-copy")]
-            fallback_logged: AtomicBool::new(false),
+
+            force_cpu_fallback,
+
+            zero_copy_stats: ZeroCopyStatsInner {
+                frames_total: AtomicU64::new(0),
+                frames_dxgi_available: AtomicU64::new(0),
+                frames_d3d11_shared: AtomicU64::new(0),
+                frames_nv12_cpu_convert: AtomicU64::new(0),
+                frames_cpu_fallback: AtomicU64::new(0),
+                frames_gpu_sync_timeout: AtomicU64::new(0),
+                last_fallback_reason: Mutex::new(None),
+                fallback_logged: AtomicBool::new(false),
+            },
             debug_logging,
             _mf_guard: mf_guard,
             output_format,
@@ -474,11 +727,15 @@ impl WindowsVideoDecoder {
         }
 
         let mut reset_token: u32 = 0;
-        let manager: IMFDXGIDeviceManager = unsafe {
-            MFCreateDXGIDeviceManager(&mut reset_token).map_err(|e| {
+        let mut manager: Option<IMFDXGIDeviceManager> = None;
+        unsafe {
+            MFCreateDXGIDeviceManager(&mut reset_token, &mut manager).map_err(|e| {
                 VideoError::DecoderInit(format!("MFCreateDXGIDeviceManager failed: {}", e))
-            })?
-        };
+            })?;
+        }
+        let manager = manager.ok_or_else(|| {
+            VideoError::DecoderInit("MFCreateDXGIDeviceManager returned null".to_string())
+        })?;
 
         unsafe {
             manager
@@ -506,10 +763,15 @@ impl WindowsVideoDecoder {
         }
 
         // Create attributes for source reader
-        let attributes: IMFAttributes = unsafe {
-            MFCreateAttributes(4)
-                .map_err(|e| VideoError::DecoderInit(format!("MFCreateAttributes failed: {}", e)))?
-        };
+        let mut attributes: Option<IMFAttributes> = None;
+        unsafe {
+            MFCreateAttributes(&mut attributes, 4).map_err(|e| {
+                VideoError::DecoderInit(format!("MFCreateAttributes failed: {}", e))
+            })?;
+        }
+        let attributes = attributes.ok_or_else(|| {
+            VideoError::DecoderInit("MFCreateAttributes returned null".to_string())
+        })?;
 
         // Enable hardware transforms
         unsafe {
@@ -546,7 +808,7 @@ impl WindowsVideoDecoder {
             })?
         };
 
-        // Configure output format (NV12 preferred, RGB32 fallback)
+        // Configure output format (RGB32/BGRA preferred for zero-copy, NV12 fallback)
         let output_format = Self::configure_output_format(&reader, debug_logging)?;
 
         if debug_logging {
@@ -561,8 +823,16 @@ impl WindowsVideoDecoder {
 
     /// Configures the source reader output format.
     ///
-    /// Tries NV12 first (native hardware decoder format), falls back to RGB32
-    /// if the GPU doesn't support NV12 output.
+    /// Tries RGB32 (BGRA) first for zero-copy compatibility, falls back to NV12
+    /// only if RGB32 is not supported.
+    ///
+    /// # Zero-Copy Requirement
+    ///
+    /// wgpu can directly import BGRA textures via D3D11 shared handles, but NV12
+    /// requires YCbCr sampler conversion which wgpu doesn't support yet. By
+    /// requesting RGB32/BGRA output, Media Foundation will use the GPU to convert
+    /// internally (still hardware accelerated) and provide a zero-copy compatible
+    /// format.
     ///
     /// Returns the format that was successfully configured.
     fn configure_output_format(
@@ -576,35 +846,35 @@ impl WindowsVideoDecoder {
                 .map_err(|e| VideoError::DecoderInit(format!("GetNativeMediaType failed: {}", e)))?
         };
 
-        let mut frame_size: u64 = 0;
-        unsafe {
-            native_type
-                .GetUINT64(&MF_MT_FRAME_SIZE, &mut frame_size)
-                .ok();
-        }
+        let frame_size: u64 = unsafe { native_type.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0) };
 
-        // Try NV12 first (native HW decoder format)
-        if Self::try_set_output_format(reader, &MFVideoFormat_NV12, frame_size, debug_logging) {
-            if debug_logging {
-                debug!("Output format configured to NV12");
-            }
-            return Ok(OutputFormat::Nv12);
-        }
-
-        // Fall back to RGB32 if NV12 not supported
-        if debug_logging {
-            warn!("NV12 output not supported, falling back to RGB32");
-        }
-
+        // Try RGB32 (BGRA) first for zero-copy compatibility
+        // Media Foundation will use GPU to convert from native NV12 internally
         if Self::try_set_output_format(reader, &MFVideoFormat_RGB32, frame_size, debug_logging) {
             if debug_logging {
-                debug!("Output format configured to RGB32");
+                debug!("Output format configured to RGB32 (BGRA) for zero-copy");
             }
             return Ok(OutputFormat::Rgb32);
         }
 
+        // Fall back to NV12 only if RGB32 not supported
+        // This path requires CPU conversion (violates zero-copy requirement)
+        if debug_logging {
+            warn!(
+                "RGB32 output not supported, falling back to NV12. \
+                 This will require CPU conversion and violates zero-copy requirement."
+            );
+        }
+
+        if Self::try_set_output_format(reader, &MFVideoFormat_NV12, frame_size, debug_logging) {
+            if debug_logging {
+                debug!("Output format configured to NV12 (CPU conversion required)");
+            }
+            return Ok(OutputFormat::Nv12);
+        }
+
         Err(VideoError::DecoderInit(
-            "Failed to configure output format (neither NV12 nor RGB32 supported)".to_string(),
+            "Failed to configure output format (neither RGB32 nor NV12 supported)".to_string(),
         ))
     }
 
@@ -681,24 +951,15 @@ impl WindowsVideoDecoder {
         };
 
         // Extract frame size
-        let mut frame_size: u64 = 0;
-        unsafe {
-            media_type
-                .GetUINT64(&MF_MT_FRAME_SIZE, &mut frame_size)
-                .ok();
-        }
+        let frame_size: u64 = unsafe { media_type.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0) };
         let width = (frame_size >> 32) as u32;
         let height = (frame_size & 0xFFFFFFFF) as u32;
 
         // Extract frame rate
-        let mut frame_rate: u64 = 0;
-        unsafe {
-            media_type
-                .GetUINT64(&MF_MT_FRAME_RATE, &mut frame_rate)
-                .ok();
-        }
-        let fps_num = (frame_rate >> 32) as f32;
-        let fps_den = (frame_rate & 0xFFFFFFFF) as f32;
+        let frame_rate_packed: u64 =
+            unsafe { media_type.GetUINT64(&MF_MT_FRAME_RATE).unwrap_or(0) };
+        let fps_num = (frame_rate_packed >> 32) as f32;
+        let fps_den = (frame_rate_packed & 0xFFFFFFFF) as f32;
         let frame_rate = if fps_den > 0.0 {
             fps_num / fps_den
         } else {
@@ -706,12 +967,7 @@ impl WindowsVideoDecoder {
         };
 
         // Extract pixel aspect ratio
-        let mut par: u64 = 0;
-        unsafe {
-            media_type
-                .GetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, &mut par)
-                .ok();
-        }
+        let par: u64 = unsafe { media_type.GetUINT64(&MF_MT_PIXEL_ASPECT_RATIO).unwrap_or(0) };
         let par_num = (par >> 32) as f32;
         let par_den = (par & 0xFFFFFFFF) as f32;
         let pixel_aspect_ratio = if par_den > 0.0 {
@@ -730,6 +986,7 @@ impl WindowsVideoDecoder {
             frame_rate,
             codec: "h264".to_string(), // TODO: Extract actual codec
             pixel_aspect_ratio,
+            start_time: None, // Set when first frame is decoded via video_start_time()
         };
 
         if debug_logging {
@@ -747,28 +1004,23 @@ impl WindowsVideoDecoder {
         // MF_PD_DURATION GUID: {6C990D33-BB8E-477A-8598-0D5D96FCD88A}
         let mf_pd_duration = windows::core::GUID::from_u128(0x6c990d33_bb8e_477a_8598_0d5d96fcd88a);
 
-        let mut var = PROPVARIANT::default();
         unsafe {
             // Use GetPresentationAttribute with MF_SOURCE_READER_MEDIASOURCE to get duration
-            if reader
-                .GetPresentationAttribute(
-                    MF_SOURCE_READER_MEDIASOURCE.0 as u32,
-                    &mf_pd_duration,
-                    &mut var,
-                )
-                .is_ok()
+            if let Ok(var) = reader
+                .GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &mf_pd_duration)
             {
                 // Duration is stored as a 64-bit value in 100-nanosecond units
-                let duration_100ns = var.Anonymous.Anonymous.Anonymous.hVal.max(0) as u64;
-                let _ = PropVariantClear(&mut var);
-                return Some(Duration::from_nanos(duration_100ns * 100));
+                // PROPVARIANT from windows::core can be converted to i64 for VT_I8 values
+                if let Ok(duration_100ns) = i64::try_from(&var) {
+                    return Some(Duration::from_nanos(duration_100ns.max(0) as u64 * 100));
+                }
             }
         }
         None
     }
 
     /// Reads and decodes the next video frame.
-    #[profiling::function]
+    #[cfg_attr(feature = "profiling", profiling::function)]
     fn read_sample(&mut self) -> Result<Option<VideoFrame>, VideoError> {
         let mut flags: u32 = 0;
         let mut timestamp: i64 = 0;
@@ -788,7 +1040,7 @@ impl WindowsVideoDecoder {
         }
 
         // Check for end of stream (use imported constant)
-        if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 != 0 {
+        if flags & (MF_SOURCE_READERF_ENDOFSTREAM.0 as u32) != 0 {
             self.eof.store(true, Ordering::SeqCst);
             if self.debug_logging {
                 debug!("End of stream reached");
@@ -797,7 +1049,7 @@ impl WindowsVideoDecoder {
         }
 
         // Check for stream tick (no data yet) (use imported constant)
-        if flags & MF_SOURCE_READERF_STREAMTICK.0 != 0 {
+        if flags & (MF_SOURCE_READERF_STREAMTICK.0 as u32) != 0 {
             if self.debug_logging {
                 debug!("Stream tick, no frame yet");
             }
@@ -805,7 +1057,7 @@ impl WindowsVideoDecoder {
         }
 
         // Check for media type change (HLS/adaptive streams may change resolution)
-        if flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 != 0 {
+        if flags & (MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 as u32) != 0 {
             if self.debug_logging {
                 info!("Media type changed, reconfiguring decoder");
             }
@@ -835,6 +1087,14 @@ impl WindowsVideoDecoder {
         let pts = Duration::from_nanos(timestamp.max(0) as u64 * 100);
         self.position = pts;
 
+        // Track first video PTS for A/V sync offset calculation
+        if self.first_video_pts.is_none() {
+            self.first_video_pts = Some(pts);
+            if self.debug_logging {
+                debug!("First video PTS recorded: {:?}", pts);
+            }
+        }
+
         // Extract frame data from sample
         let frame = self.extract_frame(&sample)?;
 
@@ -849,7 +1109,7 @@ impl WindowsVideoDecoder {
     ///
     /// Checks for DXGI buffers BEFORE calling ConvertToContiguousBuffer,
     /// since that operation may copy GPU data to system memory.
-    #[profiling::function]
+    #[cfg_attr(feature = "profiling", profiling::function)]
     fn extract_frame(&mut self, sample: &IMFSample) -> Result<DecodedFrame, VideoError> {
         // First, check original sample buffers for DXGI (hardware decode path)
         // We must do this BEFORE ConvertToContiguousBuffer which may copy to CPU memory.
@@ -876,7 +1136,17 @@ impl WindowsVideoDecoder {
             }
         }
 
-        // No DXGI buffer found - use CPU path
+        // No DXGI buffer found - software decode path
+        // This should not happen for hardware-supported formats
+
+        {
+            self.zero_copy_stats
+                .frames_total
+                .fetch_add(1, Ordering::Relaxed);
+            // record_fallback handles both counting and gated logging
+            self.record_fallback(WindowsFallbackReason::NoDxgiBuffer);
+        }
+
         // ConvertToContiguousBuffer is safe here since we're already on CPU path
         let buffer: IMFMediaBuffer = unsafe {
             sample.ConvertToContiguousBuffer().map_err(|e| {
@@ -896,7 +1166,7 @@ impl WindowsVideoDecoder {
     ///
     /// Falls back to CPU readback via staging texture when zero-copy is disabled
     /// or shared texture creation fails.
-    #[profiling::function]
+    #[cfg_attr(feature = "profiling", profiling::function)]
     fn extract_frame_from_dxgi(
         &mut self,
         dxgi_buffer: &IMFDXGIBuffer,
@@ -908,15 +1178,12 @@ impl WindowsVideoDecoder {
         // Get the D3D11 texture and subresource index from DXGI buffer
         let (texture, subresource_index): (ID3D11Texture2D, u32) = unsafe {
             let mut resource: Option<ID3D11Texture2D> = None;
-            let mut subresource: u32 = 0;
             dxgi_buffer
                 .GetResource(&ID3D11Texture2D::IID, &mut resource as *mut _ as *mut _)
                 .map_err(|e| VideoError::DecodeFailed(format!("GetResource failed: {}", e)))?;
-            dxgi_buffer
-                .GetSubresourceIndex(&mut subresource)
-                .map_err(|e| {
-                    VideoError::DecodeFailed(format!("GetSubresourceIndex failed: {}", e))
-                })?;
+            let subresource = dxgi_buffer.GetSubresourceIndex().map_err(|e| {
+                VideoError::DecodeFailed(format!("GetSubresourceIndex failed: {}", e))
+            })?;
 
             let tex = resource.ok_or_else(|| {
                 VideoError::DecodeFailed("DXGI buffer resource is null".to_string())
@@ -937,9 +1204,27 @@ impl WindowsVideoDecoder {
             );
         }
 
+        // Track frame for statistics
+
+        {
+            self.zero_copy_stats
+                .frames_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.zero_copy_stats
+                .frames_dxgi_available
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Check for forced CPU fallback (testing only)
+
+        if self.force_cpu_fallback {
+            self.record_fallback(WindowsFallbackReason::ForcedByEnvVar);
+            // Fall through to CPU path below
+        }
+
         // Zero-copy path: Create shared texture and export NT handle
-        #[cfg(feature = "zero-copy")]
-        if self.zero_copy_enabled {
+
+        if self.zero_copy_enabled && !self.force_cpu_fallback {
             // Only support BGRA format for zero-copy (NV12 requires YCbCr conversion)
             let is_bgra = desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM;
 
@@ -986,6 +1271,11 @@ impl WindowsVideoDecoder {
                                     )
                                 };
 
+                                // Track successful zero-copy frame
+                                self.zero_copy_stats
+                                    .frames_d3d11_shared
+                                    .fetch_add(1, Ordering::Relaxed);
+
                                 if self.debug_logging {
                                     debug!(
                                         "Zero-copy: returning WindowsGpuSurface {}x{} handle={:?}",
@@ -998,8 +1288,13 @@ impl WindowsVideoDecoder {
                             Err(e) => {
                                 // GPU sync failed - shared_texture may contain incomplete data.
                                 // Fall through to CPU fallback rather than returning corrupt frame.
-                                warn!(
-                                    "Windows zero-copy: wait_for_gpu failed, using CPU fallback: {}",
+                                self.zero_copy_stats
+                                    .frames_gpu_sync_timeout
+                                    .fetch_add(1, Ordering::Relaxed);
+                                self.record_fallback(WindowsFallbackReason::GpuSyncTimeout);
+                                error!(
+                                    "Windows zero-copy: wait_for_gpu failed: {}. \
+                                     This indicates a GPU driver issue.",
                                     e
                                 );
                                 // Don't disable zero_copy_enabled - this may be transient
@@ -1009,32 +1304,38 @@ impl WindowsVideoDecoder {
                     Err(e) => {
                         // Disable zero-copy for future frames after first failure
                         self.zero_copy_enabled = false;
-                        warn!(
-                            "Windows zero-copy: shared texture creation failed, disabling: {}",
+                        self.record_fallback(WindowsFallbackReason::SharedHandleCreationFailed);
+                        error!(
+                            "Windows zero-copy: shared texture creation failed, disabling: {}. \
+                             Check GPU driver and D3D11 capabilities.",
                             e
                         );
                     }
                 }
-            } else if self.debug_logging {
-                debug!(
-                    "Zero-copy: format {:?} not supported, using CPU fallback",
-                    desc.Format
-                );
+            } else {
+                // NV12 format - requires YCbCr sampler conversion not yet in wgpu
+                self.zero_copy_stats
+                    .frames_nv12_cpu_convert
+                    .fetch_add(1, Ordering::Relaxed);
+                self.record_fallback(WindowsFallbackReason::Nv12FormatUnsupported);
+                if self.debug_logging {
+                    debug!(
+                        "Zero-copy: NV12 format {:?} requires YCbCr conversion (tracked as wgpu dependency)",
+                        desc.Format
+                    );
+                }
             }
         }
 
-        // CPU fallback path
-        // Track CPU fallback for zero-copy visibility
-        #[cfg(feature = "zero-copy")]
+        // CPU fallback path - this should not happen for natively supported formats
+
         {
-            let _fallback_count = self.cpu_fallback_count.fetch_add(1, Ordering::Relaxed) + 1;
-            if !self.fallback_logged.swap(true, Ordering::Relaxed) {
-                warn!(
-                    "Windows zero-copy: CPU fallback active. \
-                     DXGI format={:?}, size={}x{}, MiscFlags={:?}",
-                    desc.Format, desc.Width, desc.Height, desc.MiscFlags
-                );
-            }
+            // Always increment fallback counter. Use existing reason if already set
+            // (e.g., NV12 format), otherwise record as Unknown.
+            // record_fallback handles gated logging (first occurrence or reason change).
+            let current_reason = self.zero_copy_stats.last_fallback_reason.lock().clone();
+            let reason = current_reason.unwrap_or(WindowsFallbackReason::Unknown);
+            self.record_fallback(reason);
         }
 
         // Create or reuse staging texture for CPU readback
@@ -1060,13 +1361,80 @@ impl WindowsVideoDecoder {
         self.map_staging_texture(&staging, desc.Width, desc.Height, desc.Format)
     }
 
+    /// Returns comprehensive zero-copy statistics for diagnostics.
+    ///
+    /// This provides visibility into the zero-copy rendering pipeline for
+    /// third-party testing and performance monitoring.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let stats = decoder.zero_copy_stats();
+    /// println!("{}", stats.summary());
+    /// // Output: "Windows Zero-Copy: 1000 frames, 95.0% D3D11 shared, 98.0% HW decode, 5.0% NV12 CPU"
+    /// ```
+
+    pub fn zero_copy_stats(&self) -> WindowsZeroCopyStatsSnapshot {
+        let last_reason = self.zero_copy_stats.last_fallback_reason.lock().clone();
+        WindowsZeroCopyStatsSnapshot {
+            frames_total: self.zero_copy_stats.frames_total.load(Ordering::Relaxed),
+            frames_dxgi_available: self
+                .zero_copy_stats
+                .frames_dxgi_available
+                .load(Ordering::Relaxed),
+            frames_d3d11_shared: self
+                .zero_copy_stats
+                .frames_d3d11_shared
+                .load(Ordering::Relaxed),
+            frames_nv12_cpu_convert: self
+                .zero_copy_stats
+                .frames_nv12_cpu_convert
+                .load(Ordering::Relaxed),
+            frames_cpu_fallback: self
+                .zero_copy_stats
+                .frames_cpu_fallback
+                .load(Ordering::Relaxed),
+            frames_gpu_sync_timeout: self
+                .zero_copy_stats
+                .frames_gpu_sync_timeout
+                .load(Ordering::Relaxed),
+            last_fallback_reason: last_reason,
+            output_format: format!("{:?}", self.output_format),
+        }
+    }
+
     /// Returns the number of frames that used CPU fallback instead of zero-copy.
     ///
     /// This is useful for performance monitoring and debugging. A high count
     /// indicates zero-copy is not available (expected until wgpu exposes the API).
-    #[cfg(feature = "zero-copy")]
+
     pub fn cpu_fallback_count(&self) -> u64 {
-        self.cpu_fallback_count.load(Ordering::Relaxed)
+        self.zero_copy_stats
+            .frames_cpu_fallback
+            .load(Ordering::Relaxed)
+    }
+
+    /// Records a fallback event with the specified reason.
+
+    fn record_fallback(&self, reason: WindowsFallbackReason) {
+        self.zero_copy_stats
+            .frames_cpu_fallback
+            .fetch_add(1, Ordering::Relaxed);
+        *self.zero_copy_stats.last_fallback_reason.lock() = Some(reason);
+
+        // Log on first occurrence only (avoid spam)
+        if !self
+            .zero_copy_stats
+            .fallback_logged
+            .swap(true, Ordering::Relaxed)
+        {
+            error!(
+                "Windows zero-copy: CPU fallback triggered - reason: {}. \
+                 This should not happen for natively supported formats. \
+                 Set LUMINA_VIDEO_ZERO_COPY_DEBUG=1 for detailed diagnostics.",
+                reason
+            );
+        }
     }
 
     /// Waits for all GPU commands to complete using a D3D11 event query.
@@ -1077,7 +1445,7 @@ impl WindowsVideoDecoder {
     /// (blocking is only forbidden on the UI/render thread).
     ///
     /// Uses `D3D11_QUERY_EVENT` which signals when all prior GPU work completes.
-    #[cfg(feature = "zero-copy")]
+
     fn wait_for_gpu(&self) -> Result<(), VideoError> {
         // Create an event query
         let query_desc = D3D11_QUERY_DESC {
@@ -1153,7 +1521,7 @@ impl WindowsVideoDecoder {
     ///
     /// The shared texture is created with D3D11_RESOURCE_MISC_SHARED_NTHANDLE flag
     /// to enable D3D11→D3D12 interop via NT handles.
-    #[cfg(feature = "zero-copy")]
+
     fn get_or_create_shared_texture(
         &mut self,
         width: u32,
@@ -1191,9 +1559,9 @@ impl WindowsVideoDecoder {
                 Quality: 0,
             },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_SHADER_RESOURCE,
-            CPUAccessFlags: windows::Win32::Graphics::Direct3D11::D3D11_CPU_ACCESS_FLAG(0),
-            MiscFlags: D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 as u32,
         };
 
         let shared_texture: ID3D11Texture2D = unsafe {
@@ -1223,7 +1591,7 @@ impl WindowsVideoDecoder {
             dxgi_resource
                 .CreateSharedHandle(
                     None::<*const SECURITY_ATTRIBUTES>,
-                    DXGI_SHARED_RESOURCE_READ,
+                    DXGI_SHARED_RESOURCE_READ.0,
                     None,
                 )
                 .map_err(|e| {
@@ -1253,11 +1621,14 @@ impl WindowsVideoDecoder {
     ) -> Result<ID3D11Texture2D, VideoError> {
         // Check if existing staging texture is compatible
         if let Some(ref staging) = self.staging_texture {
-            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            let mut existing_desc = D3D11_TEXTURE2D_DESC::default();
             unsafe {
-                staging.GetDesc(&mut desc);
+                staging.GetDesc(&mut existing_desc);
             }
-            if desc.Width == width && desc.Height == height && desc.Format == format {
+            if existing_desc.Width == width
+                && existing_desc.Height == height
+                && existing_desc.Format == format
+            {
                 return Ok(staging.clone());
             }
         }
@@ -1274,9 +1645,9 @@ impl WindowsVideoDecoder {
                 Quality: 0,
             },
             Usage: D3D11_USAGE_STAGING,
-            BindFlags: windows::Win32::Graphics::Direct3D11::D3D11_BIND_FLAG(0),
-            CPUAccessFlags: D3D11_CPU_ACCESS_READ,
-            MiscFlags: windows::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG(0),
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
         };
 
         let staging: ID3D11Texture2D = unsafe {
@@ -1531,7 +1902,7 @@ impl WindowsVideoDecoder {
     /// # Returns
     /// `Ok(AudioFormatInfo)` on success, `Err(VideoError)` if no audio stream
     /// or configuration fails.
-    #[profiling::function]
+    #[cfg_attr(feature = "profiling", profiling::function)]
     fn configure_audio_stream(
         reader: &IMFSourceReader,
         _preferred_sample_rate: u32,
@@ -1598,60 +1969,47 @@ impl WindowsVideoDecoder {
 
         // Read all required audio attributes
         let sample_rate = unsafe {
-            let mut val: u32 = 0;
             resolved_type
-                .GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, &mut val)
-                .map_err(|e| {
-                    VideoError::DecoderInit(format!("Failed to get sample rate: {}", e))
-                })?;
-            val
+                .GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND)
+                .map_err(|e| VideoError::DecoderInit(format!("Failed to get sample rate: {}", e)))?
         };
 
         let channels = unsafe {
-            let mut val: u32 = 0;
             resolved_type
-                .GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, &mut val)
+                .GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS)
                 .map_err(|e| {
                     VideoError::DecoderInit(format!("Failed to get channel count: {}", e))
-                })?;
-            val as u16
+                })? as u16
         };
 
         let bits_per_sample = unsafe {
-            let mut val: u32 = 0;
             resolved_type
-                .GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, &mut val)
+                .GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE)
                 .map_err(|e| {
                     VideoError::DecoderInit(format!("Failed to get bits per sample: {}", e))
-                })?;
-            val as u16
+                })? as u16
         };
 
         let block_align = unsafe {
-            let mut val: u32 = 0;
             resolved_type
-                .GetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, &mut val)
+                .GetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT)
                 .map_err(|e| {
                     VideoError::DecoderInit(format!("Failed to get block alignment: {}", e))
-                })?;
-            val as u16
+                })? as u16
         };
 
         let avg_bytes_per_sec = unsafe {
-            let mut val: u32 = 0;
             resolved_type
-                .GetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, &mut val)
+                .GetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND)
                 .map_err(|e| {
                     VideoError::DecoderInit(format!("Failed to get avg bytes per sec: {}", e))
-                })?;
-            val
+                })?
         };
 
         // Check if the resolved format is float (MFAudioFormat_Float) vs integer PCM.
         // We request PCM, but check the resolved type to be defensive.
         let is_float = unsafe {
-            let mut subtype = windows::core::GUID::default();
-            if resolved_type.GetGUID(&MF_MT_SUBTYPE, &mut subtype).is_ok() {
+            if let Ok(subtype) = resolved_type.GetGUID(&MF_MT_SUBTYPE) {
                 subtype == MFAudioFormat_Float
             } else {
                 false
@@ -1691,7 +2049,7 @@ impl WindowsVideoDecoder {
     /// - `MF_SOURCE_READERF_STREAMTICK`: Returns None (gap in stream)
     /// - `MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED`: Logs warning, continues
     /// - `MF_SOURCE_READERF_NEWSTREAM`: Logs info, continues
-    #[profiling::function]
+    #[cfg_attr(feature = "profiling", profiling::function)]
     pub fn read_audio_sample(&mut self) -> Result<Option<AudioFrame>, VideoError> {
         if !self.audio_enabled {
             return Ok(None);
@@ -1720,7 +2078,7 @@ impl WindowsVideoDecoder {
         }
 
         // Handle MF reader flags
-        if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 != 0 {
+        if flags & (MF_SOURCE_READERF_ENDOFSTREAM.0 as u32) != 0 {
             self.audio_eof.store(true, Ordering::SeqCst);
             if self.debug_logging {
                 debug!("Audio end of stream reached");
@@ -1728,19 +2086,19 @@ impl WindowsVideoDecoder {
             return Ok(None);
         }
 
-        if flags & MF_SOURCE_READERF_STREAMTICK.0 != 0 {
+        if flags & (MF_SOURCE_READERF_STREAMTICK.0 as u32) != 0 {
             if self.debug_logging {
                 debug!("Audio stream tick (gap in stream)");
             }
             return Ok(None);
         }
 
-        if flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 != 0 {
+        if flags & (MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 as u32) != 0 {
             warn!("Audio media type changed mid-stream");
             // Could re-read format here, but for now just log
         }
 
-        if flags & MF_SOURCE_READERF_NEWSTREAM.0 != 0 {
+        if flags & (MF_SOURCE_READERF_NEWSTREAM.0 as u32) != 0 {
             if self.debug_logging {
                 info!("New audio stream detected");
             }
@@ -1867,6 +2225,20 @@ impl WindowsVideoDecoder {
         self.audio_eof.store(false, Ordering::SeqCst);
     }
 
+    /// Returns the video stream start time if known.
+    ///
+    /// This is typically the PTS of the first video frame. Used to calculate
+    /// the stream PTS offset for A/V sync when audio and video have different
+    /// start times.
+    ///
+    /// Note: Media Foundation doesn't directly expose stream start time.
+    /// Use the PTS of the first decoded frame as the start time.
+    pub fn video_start_time(&self) -> Option<Duration> {
+        // Return the first decoded video frame's PTS for A/V sync offset calculation.
+        // This is set when decoding the first frame in decode_video_frame().
+        self.first_video_pts
+    }
+
     /// Extracts frame from IMF2DBuffer2 with proper stride handling.
     fn extract_from_2d_buffer(
         &self,
@@ -1980,7 +2352,7 @@ impl WindowsVideoDecoder {
 }
 
 impl VideoDecoderBackend for WindowsVideoDecoder {
-    #[profiling::function]
+    #[cfg_attr(feature = "profiling", profiling::function)]
     fn open(url: &str) -> Result<Self, VideoError>
     where
         Self: Sized,
@@ -1994,12 +2366,12 @@ impl VideoDecoderBackend for WindowsVideoDecoder {
         Self::new(url, debug_logging)
     }
 
-    #[profiling::function]
+    #[cfg_attr(feature = "profiling", profiling::function)]
     fn decode_next(&mut self) -> Result<Option<VideoFrame>, VideoError> {
         self.read_sample()
     }
 
-    #[profiling::function]
+    #[cfg_attr(feature = "profiling", profiling::function)]
     fn seek(&mut self, position: Duration) -> Result<(), VideoError> {
         if self.debug_logging {
             debug!("Seeking to {:?}", position);
@@ -2010,23 +2382,8 @@ impl VideoDecoderBackend for WindowsVideoDecoder {
 
         // Create PROPVARIANT for seek position.
         // Media Foundation expects VT_I8 (64-bit signed integer) in 100ns units.
-        // The PROPVARIANT union layout is:
-        //   - Anonymous.Anonymous.vt: variant type tag (VT_I8 = 20)
-        //   - Anonymous.Anonymous.Anonymous.hVal: i64 value for VT_I8
-        //
-        // We use default() for safe initialization, then set fields explicitly
-        // to avoid UB from uninitialized union fields.
-        let mut prop_variant =
-            windows::Win32::System::Com::StructuredStorage::PROPVARIANT::default();
-
-        unsafe {
-            // Access the inner union fields through the Anonymous chain.
-            // This is the documented structure of PROPVARIANT:
-            // PROPVARIANT { Anonymous: PROPVARIANT_0 { Anonymous: PROPVARIANT_0_0 { vt, ..., Anonymous: PROPVARIANT_0_0_0 { hVal, ... } } } }
-            prop_variant.Anonymous.Anonymous.vt = windows::Win32::System::Variant::VT_I8;
-            // hVal is the LARGE_INTEGER field for VT_I8, which is equivalent to i64
-            prop_variant.Anonymous.Anonymous.Anonymous.hVal = position_100ns;
-        }
+        // windows::core::PROPVARIANT implements From<i64> for VT_I8 values.
+        let prop_variant = PROPVARIANT::from(position_100ns);
 
         unsafe {
             self.source_reader
@@ -2062,11 +2419,6 @@ impl VideoDecoderBackend for WindowsVideoDecoder {
     fn hw_accel_type(&self) -> HwAccelType {
         self.hw_accel
     }
-
-    /// Windows Media Foundation handles audio internally with its own A/V sync.
-    fn handles_audio_internally(&self) -> bool {
-        true
-    }
 }
 
 impl Drop for WindowsVideoDecoder {
@@ -2075,15 +2427,33 @@ impl Drop for WindowsVideoDecoder {
             debug!("WindowsVideoDecoder dropping, cleaning up");
         }
 
-        // Log zero-copy stats
-        #[cfg(feature = "zero-copy")]
+        // Log comprehensive zero-copy stats
+
         {
-            let fallback_count = self.cpu_fallback_count.load(Ordering::Relaxed);
-            if fallback_count > 0 {
-                info!(
-                    "WindowsVideoDecoder zero-copy stats: {} frames used CPU fallback \
-                     (zero-copy awaits wgpu ExternalTexture API)",
-                    fallback_count
+            let stats = self.zero_copy_stats();
+            info!("{}", stats.summary());
+
+            // Warn if any frames used CPU fallback (violates requirement)
+            if stats.frames_cpu_fallback > 0 {
+                error!(
+                    "WindowsVideoDecoder: {} frames ({:.1}%) used CPU fallback. \
+                     Zero-copy requirement violated. Last reason: {:?}",
+                    stats.frames_cpu_fallback,
+                    if stats.frames_total > 0 {
+                        (stats.frames_cpu_fallback as f64 / stats.frames_total as f64) * 100.0
+                    } else {
+                        0.0
+                    },
+                    stats.last_fallback_reason
+                );
+            }
+
+            // Warn if NV12 conversion was used (indicates wgpu YCbCr dependency)
+            if stats.frames_nv12_cpu_convert > 0 {
+                warn!(
+                    "WindowsVideoDecoder: {} frames required NV12→BGRA CPU conversion. \
+                     This will be resolved when wgpu adds YCbCr sampler support.",
+                    stats.frames_nv12_cpu_convert
                 );
             }
         }
@@ -2092,7 +2462,7 @@ impl Drop for WindowsVideoDecoder {
         self.staging_texture = None;
 
         // Close shared handle to prevent NT handle leak
-        #[cfg(feature = "zero-copy")]
+
         if let Some(handle) = self.shared_handle.take() {
             if !handle.is_invalid() {
                 unsafe {

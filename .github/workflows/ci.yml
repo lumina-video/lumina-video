@@ -96,11 +96,6 @@ jobs:
   test-windows:
     name: Test (Windows)
     runs-on: windows-latest
-    # Windows support is in progress - disabled until other platforms are stable
-    if: false
-    continue-on-error: true
-    env:
-      VCPKGRS_DYNAMIC: 1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -109,15 +104,12 @@ jobs:
         run: choco install llvm -y
       - name: Set LIBCLANG_PATH
         run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
-      - name: Install FFmpeg via vcpkg
-        run: |
-          vcpkg install ffmpeg:x64-windows
-          echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
-      # Exclude lumina-video-android from non-Android builds
-      - name: Build
-        run: cargo build --package lumina-video --package lumina-video-demo --verbose
+      # Windows uses native Media Foundation - no FFmpeg needed
+      # lumina-video-demo is excluded because it hardcodes the ffmpeg feature
+      - name: Build (native video only)
+        run: cargo build --package lumina-video --no-default-features --features windows-native-video --verbose
       - name: Run tests
-        run: cargo test --package lumina-video --package lumina-video-demo --verbose
+        run: cargo test --package lumina-video --no-default-features --features windows-native-video --verbose
 
   check-android:
     name: Check (Android)
@@ -144,8 +136,7 @@ jobs:
   # Summary job for branch protection
   ci-success:
     name: CI Success
-    # Note: test-windows is disabled (if: false) until other platforms are stable
-    needs: [fmt, clippy, test-linux, test-macos, check-android]
+    needs: [fmt, clippy, test-linux, test-macos, test-windows, check-android]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -155,9 +146,9 @@ jobs:
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
              [[ "${{ needs.test-linux.result }}" != "success" ]] || \
              [[ "${{ needs.test-macos.result }}" != "success" ]] || \
+             [[ "${{ needs.test-windows.result }}" != "success" ]] || \
              [[ "${{ needs.check-android.result }}" != "success" ]]; then
             echo "Some jobs failed"
             exit 1
           fi
           echo "All required jobs passed!"
-          echo "Note: Windows build is disabled until other platforms are stable"

@@ -111,7 +111,7 @@ pub use linux_video::{LinuxZeroCopyMetricsSnapshot, ZeroCopyGStreamerDecoder};
 pub use linux_video_gst::GStreamerDecoder;
 
 #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
-pub use windows_video::WindowsVideoDecoder;
+pub use windows_video::{WindowsFallbackReason, WindowsVideoDecoder, WindowsZeroCopyStatsSnapshot};
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "moq"))]
 pub use moq::{MoqError, MoqUrl};
