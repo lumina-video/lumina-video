@@ -61,8 +61,8 @@ wgpu = { version = "24" }
 libc = { version = "0.2" }
 # Audio playback for MoQ (cpal wraps Oboe NDK on Android — same pipeline as desktop)
 rodio = { workspace = true }
-symphonia-core = { workspace = true }
 symphonia-codec-aac = { workspace = true }
+symphonia-core = { workspace = true }
 
 # Linux GStreamer-based video decoder + zero-copy (always enabled on Linux)
 [target.'cfg(target_os = "linux")'.dependencies]
