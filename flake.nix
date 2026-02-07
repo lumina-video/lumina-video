@@ -2,7 +2,8 @@
   description = "lumina-video - Hardware-accelerated video player for egui with zero-copy GPU rendering";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # NixOS 24.11 stable - has GStreamer 1.24 for zero-copy DMABuf support
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
@@ -42,9 +43,11 @@
         runtimeDeps = with pkgs; [
           # Vulkan for zero-copy rendering
           vulkan-loader
-          # Graphics
+          # Graphics - libglvnd provides EGL/GL dispatch (required by wgpu GLES backend)
           libGL
+          libglvnd
           mesa  # VA-API support for AMD/Intel
+          egl-wayland  # EGL platform for Wayland
           # Windowing
           wayland
           libxkbcommon
@@ -72,6 +75,15 @@
 
             cargoLock = {
               lockFile = ./Cargo.lock;
+              # Git dependencies require explicit hashes for Nix reproducibility.
+              # To update these hashes after changing Cargo.lock:
+              #   1. Set hash to empty string: "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+              #   2. Run: nix build .#default
+              #   3. Nix will error with the correct hash - copy it here
+              outputHashes = {
+                "android-activity-0.6.0" = "sha256-GhaSPprANT1A9lJYnYmkKeDsHHWAEqCpOAZi/sHi5Wc=";
+                "wgpu-24.0.0" = "sha256-p6T3Jw4k8v5VViZLEatFNVeMYjzaBdlU5WTHNM1wv8E=";
+              };
             };
 
             nativeBuildInputs = buildDeps ++ [ pkgs.makeWrapper ];
@@ -102,6 +114,9 @@
           buildInputs = buildDeps ++ runtimeDeps ++ [
             rustToolchain
             pkgs.rust-analyzer
+            # Diagnostic tools
+            pkgs.libva-utils   # vainfo
+            pkgs.vulkan-tools  # vulkaninfo
           ];
 
           # Environment variables for GStreamer zero-copy
@@ -115,14 +130,50 @@
           #   export LIBVA_DRIVER_NAME=radeonsi  # AMD
 
           shellHook = ''
-            echo "lumina-video development shell"
-            echo "GStreamer plugins: $GST_PLUGIN_PATH"
-            echo ""
-            echo "VA-API driver: auto-detected by libva"
-            echo "  Override if needed: export LIBVA_DRIVER_NAME=radeonsi (AMD) or iHD (Intel)"
+            echo "══════════════════════════════════════════════════════════════"
+            echo "  lumina-video development shell"
+            echo "══════════════════════════════════════════════════════════════"
             echo ""
             echo "Build: cargo build --package lumina-video-demo"
             echo "Run:   cargo run --package lumina-video-demo"
+            echo ""
+            echo "── Hardware Acceleration ──────────────────────────────────────"
+            echo ""
+            echo "For zero-copy VA-API on NixOS, add to configuration.nix:"
+            echo ""
+            echo "NixOS 24.11+ (hardware.graphics):"
+            echo ""
+            echo "  hardware.graphics = {"
+            echo "    enable = true;"
+            echo "    extraPackages = with pkgs; ["
+            echo "      intel-media-driver  # Intel Broadwell+ (iHD)"
+            echo "      # vaapiIntel        # Intel pre-Broadwell (i965)"
+            echo "    ];"
+            echo "  };"
+            echo ""
+            echo "NixOS 24.05 and earlier (hardware.opengl):"
+            echo ""
+            echo "  hardware.opengl = {"
+            echo "    enable = true;"
+            echo "    extraPackages = with pkgs; ["
+            echo "      intel-media-driver  # Intel Broadwell+ (iHD)"
+            echo "      # vaapiIntel        # Intel pre-Broadwell (i965)"
+            echo "    ];"
+            echo "  };"
+            echo ""
+            echo "AMD GPUs: VA-API is provided by Mesa (radeonsi), included in this"
+            echo "dev shell. No extraPackages needed. (amdvlk is Vulkan-only, not VA-API.)"
+            echo ""
+            echo "Check your NixOS release manual before applying these snippets."
+            echo ""
+            echo "Diagnostics:"
+            echo "  vainfo                  # Check VA-API driver"
+            echo "  vulkaninfo | grep dma   # Check Vulkan DMA-BUF support"
+            echo "  ls /dev/dri/            # Check DRM devices"
+            echo ""
+            echo "If VA-API shows 'libva error', your system needs hardware.graphics"
+            echo "(or hardware.opengl on older releases) in configuration.nix."
+            echo "══════════════════════════════════════════════════════════════"
           '';
         };
 
