@@ -40,6 +40,8 @@ pub mod media_source;
 pub mod subscriber;
 pub mod transport;
 pub mod url;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+pub(crate) mod worker;
 
 // Re-export main types
 pub use catalog::{AudioCodec, AudioTrackInfo, MoqCatalog, VideoCodec, VideoTrackInfo};
