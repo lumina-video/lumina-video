@@ -132,7 +132,8 @@ pub enum MoqDecoderState {
 pub struct MoqDecoderConfig {
     /// Transport configuration
     pub transport: MoqTransportConfig,
-    /// Hardware acceleration configuration
+    /// Hardware acceleration configuration (macOS only)
+    #[cfg(target_os = "macos")]
     pub hw_accel: HwAccelConfig,
     /// Maximum latency for track subscription (frames older than this are skipped)
     pub max_latency_ms: u64,
@@ -151,6 +152,7 @@ impl Default for MoqDecoderConfig {
     fn default() -> Self {
         Self {
             transport: MoqTransportConfig::default(),
+            #[cfg(target_os = "macos")]
             hw_accel: HwAccelConfig::default(),
             max_latency_ms: 500, // 500ms max latency for live streaming
             enable_audio: true,
@@ -3890,6 +3892,7 @@ impl MoqGStreamerDecoder {
             }
         });
 
+        let initial_volume = config.initial_volume;
         Ok(Self {
             pipeline,
             appsrc,
@@ -3902,7 +3905,7 @@ impl MoqGStreamerDecoder {
             _owned_runtime: owned_runtime,
             _runtime: runtime,
             audio_muted: false,
-            audio_volume: config.initial_volume,
+            audio_volume: initial_volume,
             position: Duration::ZERO,
             received_keyframe: false,
             codec,
