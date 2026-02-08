@@ -388,8 +388,12 @@ pub(crate) async fn run_moq_worker(
                             let timed_out = elapsed > IDR_GATE_TIMEOUT;
                             let groups_exhausted = idr_gate_groups_seen >= IDR_GATE_MAX_GROUPS;
 
+                            // Use format-aware NAL parsing: idr_gate_enabled implies AVCC
+                            // (from catalog avcC). The heuristic data_is_annex_b() misclassifies
+                            // AVCC frames with 256-511 byte NALs, causing missed IDRs.
+                            let is_avcc = idr_gate_enabled; // gate only enabled for avcC streams
                             let (nal_arr, nal_count) =
-                                MoqDecoder::find_nal_types(&data, nal_length_size);
+                                MoqDecoder::find_nal_types_for_format(&data, nal_length_size, is_avcc);
                             let has_idr = nal_arr[..nal_count].contains(&5);
 
                             if frame.keyframe && has_idr {
@@ -926,7 +930,10 @@ async fn fetch_and_validate_catalog(
         let mut metadata = shared.metadata.lock();
         metadata.width = video_config.coded_width.unwrap_or(1920);
         metadata.height = video_config.coded_height.unwrap_or(1080);
-        metadata.frame_rate = video_config.framerate.unwrap_or(30.0) as f32;
+        // Use catalog framerate if available; default to 24fps (common for MoQ live)
+        // rather than 30fps since most MoQ streams (BBB, etc.) are 24fps.
+        // A wrong default affects frame scheduling and measured FPS display.
+        metadata.frame_rate = video_config.framerate.unwrap_or(24.0) as f32;
         metadata.codec = format!("{:?}", video_config.codec);
     }
 

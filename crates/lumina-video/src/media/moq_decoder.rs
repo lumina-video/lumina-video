@@ -412,6 +412,11 @@ pub struct MoqDecoder {
     /// H.264 AVCC NAL length field size (1, 2, or 4 bytes), from avcC.
     #[cfg(target_os = "macos")]
     h264_nal_length_size: usize,
+    /// True if stream is AVCC format (from catalog avcC). Used for correct NAL
+    /// parsing in `find_nal_types_for_format`, avoiding the `data_is_annex_b`
+    /// heuristic which misclassifies 256-511 byte NALs.
+    #[cfg(target_os = "macos")]
+    is_avcc: bool,
     /// True after a decode error; decoder must wait for next IDR to resync.
     #[cfg(target_os = "macos")]
     waiting_for_idr_after_error: bool,
@@ -507,6 +512,8 @@ impl MoqDecoder {
             #[cfg(target_os = "macos")]
             h264_nal_length_size: 4,
             #[cfg(target_os = "macos")]
+            is_avcc: false, // updated when VT session is created from catalog avcC
+            #[cfg(target_os = "macos")]
             waiting_for_idr_after_error: false,
             #[cfg(target_os = "macos")]
             consecutive_decode_errors: 0,
@@ -588,8 +595,29 @@ impl MoqDecoder {
     /// Max NAL units we track per sample (AUD + SPS + PPS + SEI + IDR + spare).
     const MAX_NAL_TYPES: usize = 8;
 
+    /// Returns all NAL types found in data, using known format context.
+    ///
+    /// When `is_avcc` is known from catalog/init context, use this to avoid
+    /// the `data_is_annex_b()` heuristic which misclassifies AVCC frames
+    /// whose first NAL is 256-511 bytes (length prefix `[0,0,1,X]` looks
+    /// like an Annex B start code).
+    pub(crate) fn find_nal_types_for_format(
+        nal_data: &[u8],
+        nal_length_size: usize,
+        is_avcc: bool,
+    ) -> ([u8; Self::MAX_NAL_TYPES], usize) {
+        if is_avcc {
+            Self::find_nal_types_avcc(nal_data, nal_length_size)
+        } else {
+            Self::find_nal_types_annex_b(nal_data)
+        }
+    }
+
     /// Returns all NAL types found in data, auto-detecting Annex B vs AVCC format.
-    /// Uses a fixed-size stack buffer to avoid heap allocation on the per-frame path.
+    ///
+    /// WARNING: The heuristic `data_is_annex_b()` misclassifies AVCC frames whose
+    /// first NAL is 256-511 bytes. Prefer `find_nal_types_for_format()` when the
+    /// format is known from catalog context.
     pub(crate) fn find_nal_types(
         nal_data: &[u8],
         nal_length_size: usize,
@@ -602,6 +630,9 @@ impl MoqDecoder {
     }
 
     /// Check if data starts with Annex B start codes.
+    ///
+    /// WARNING: This is a heuristic that can produce false positives for AVCC data
+    /// where the first NAL length is 256-511 bytes (prefix `[0,0,1,X]`).
     pub(crate) fn data_is_annex_b(data: &[u8]) -> bool {
         matches!(data, [0, 0, 0, 1, ..] | [0, 0, 1, ..])
     }
@@ -672,8 +703,12 @@ impl MoqDecoder {
         if !self.waiting_for_idr_after_error {
             return false;
         }
-        // Accept IDR (NAL 5) or hang's is_keyframe flag as resync point
-        !Self::is_idr_frame(&moq_frame.data, self.h264_nal_length_size) && !moq_frame.is_keyframe
+        // Accept IDR (NAL 5) or hang's is_keyframe flag as resync point.
+        // Use format-aware parsing to avoid data_is_annex_b() heuristic bug.
+        let (types, count) =
+            Self::find_nal_types_for_format(&moq_frame.data, self.h264_nal_length_size, self.is_avcc);
+        let is_idr = types[..count].contains(&5);
+        !is_idr && !moq_frame.is_keyframe
     }
 
     /// Decodes an encoded frame.
@@ -699,6 +734,7 @@ impl MoqDecoder {
                         )?;
                         self.vt_decoder = Some(decoder);
                         self.h264_nal_length_size = nal_length_size;
+                        self.is_avcc = true;
                         tracing::info!("MoQ: initialized VTDecoder from catalog avcC ({} bytes SPS, {} bytes PPS, NAL len size {})", sps.len(), pps.len(), nal_length_size);
                     }
                     Err(e) => {
@@ -742,7 +778,8 @@ impl MoqDecoder {
 
         // Check if we're waiting for IDR resync after a decode error
         if self.should_wait_for_idr(moq_frame) {
-            let nal_type = Self::get_nal_type(&moq_frame.data, self.h264_nal_length_size);
+            let (t, c) = Self::find_nal_types_for_format(&moq_frame.data, self.h264_nal_length_size, self.is_avcc);
+            let nal_type = if c > 0 { t[0] } else { 0 };
             tracing::debug!(
                 "MoQ: waiting for IDR resync after decode error (got NAL type {}, is_keyframe={}, {} bytes)",
                 nal_type, moq_frame.is_keyframe, moq_frame.data.len()
@@ -754,13 +791,10 @@ impl MoqDecoder {
         }
 
         // Check NAL types for diagnostics and keyframe validation.
-        // H.264 keyframes can be either NAL type 5 (IDR) or NAL type 1 (non-IDR I-frame).
-        // moq-lite guarantees group-boundary joins, so the first frame in a group is always
-        // a keyframe. We trust hang's is_keyframe flag for first-frame acceptance.
+        // Use format-aware parsing (self.is_avcc) to avoid data_is_annex_b() heuristic bug.
         let (nal_types_arr, nal_count) =
-            Self::find_nal_types(&moq_frame.data, self.h264_nal_length_size);
+            Self::find_nal_types_for_format(&moq_frame.data, self.h264_nal_length_size, self.is_avcc);
         let nal_types = &nal_types_arr[..nal_count];
-        let is_annex_b = Self::data_is_annex_b(&moq_frame.data);
         let is_idr = nal_types.contains(&5);
         if let Some(ref decoder) = self.vt_decoder {
             let frame_count = decoder.frame_count();
@@ -775,7 +809,7 @@ impl MoqDecoder {
                     frame_count,
                     moq_frame.data.len(),
                     moq_frame.is_keyframe,
-                    if is_annex_b { "AnnexB" } else { "AVCC" },
+                    if self.is_avcc { "AVCC" } else { "AnnexB" },
                     nal_types,
                     is_idr,
                     &preview[..preview_len],
@@ -792,7 +826,7 @@ impl MoqDecoder {
                     nal_types,
                     moq_frame.is_keyframe,
                     moq_frame.data.len(),
-                    if is_annex_b { "AnnexB" } else { "AVCC" },
+                    if self.is_avcc { "AVCC" } else { "AnnexB" },
                 );
                 return Err(VideoError::DecodeFailed(format!(
                     "Waiting for keyframe (got NAL types {:?})",
@@ -853,16 +887,18 @@ impl MoqDecoder {
                 self.consecutive_decode_errors += 1;
 
                 if self.consecutive_decode_errors < 3 {
-                    // Isolated error: skip this frame but keep the VT session alive.
-                    // -12909 (kVTVideoDecoderBadDataErr) means the frame data is bad,
-                    // NOT that the session is corrupted. The session's DPB and reference
-                    // frames are still valid — destroying would lose ~48 frames during
-                    // IDR resync.
+                    // Isolated error: skip this frame AND gate subsequent P-frames.
+                    // The VT session's DPB now has a gap from the skipped frame —
+                    // subsequent P-frames would decode "successfully" but reference
+                    // stale/missing data, causing visible pixelation until next IDR.
+                    // Keep the session alive (avoids 15ms recreation cost) but stop
+                    // feeding P-frames until the next IDR resets the DPB.
+                    self.waiting_for_idr_after_error = true;
                     if let Some(ref mut decoder) = self.vt_decoder {
-                        decoder.prepare_for_idr_resync(); // clears error flag
+                        decoder.prepare_for_idr_resync();
                     }
                     tracing::warn!(
-                        "MoQ: VT decode error #{}, skipping frame (session kept): {}",
+                        "MoQ: VT decode error #{}, gating on IDR (session kept): {}",
                         self.consecutive_decode_errors,
                         e
                     );
