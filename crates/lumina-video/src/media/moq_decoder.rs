@@ -70,6 +70,10 @@ use tokio::runtime::Handle;
 #[cfg(target_os = "macos")]
 use super::video::MacOSGpuSurface;
 
+/// Hard failsafe timeout for startup gating (seconds). Used by worker IDR gate
+/// (directly) and audio pre-buffer (derived as +1s). Single source of truth.
+pub(crate) const MOQ_STARTUP_HARD_FAILSAFE_SECS: u64 = 10;
+
 /// Audio pipeline lifecycle state.
 ///
 /// Defined here (not `moq_audio.rs`) because [`MoqSharedState`] and
@@ -81,6 +85,8 @@ pub enum MoqAudioStatus {
     Unavailable,
     /// Track subscribed, audio thread spawning.
     Starting,
+    /// Pre-buffering audio frames, waiting for first video decode.
+    Buffering,
     /// Decoding and playing audio.
     Running,
     /// Initialisation or sustained runtime failure.
@@ -98,6 +104,11 @@ pub(crate) struct MoqAudioShared {
     pub moq_audio_handle: parking_lot::Mutex<Option<super::audio::AudioHandle>>,
     /// Current audio pipeline status.
     pub audio_status: parking_lot::Mutex<MoqAudioStatus>,
+    /// Set to true by decoder on first successful video decode.
+    /// Audio pre-buffer waits for this before starting playback.
+    pub video_started: std::sync::atomic::AtomicBool,
+    /// Count of LiveEdgeSender live-edge eviction events (pressure telemetry).
+    pub audio_live_edge_evictions: AtomicU64,
 }
 
 impl MoqAudioShared {
@@ -107,6 +118,8 @@ impl MoqAudioShared {
             internal_audio_ready: std::sync::atomic::AtomicBool::new(false),
             moq_audio_handle: parking_lot::Mutex::new(None),
             audio_status: parking_lot::Mutex::new(MoqAudioStatus::Unavailable),
+            video_started: std::sync::atomic::AtomicBool::new(false),
+            audio_live_edge_evictions: AtomicU64::new(0),
         }
     }
 }
@@ -183,6 +196,8 @@ pub(crate) struct FrameStats {
     pub(crate) dropped_backpressure: AtomicU64,
     /// Frames dropped waiting for IDR
     pub(crate) dropped_waiting_idr: AtomicU64,
+    /// Frames skipped by startup IDR gate (before first valid IDR)
+    pub(crate) skipped_startup_frames: AtomicU64,
     /// Frames passed to VT decoder
     pub(crate) submitted_to_decoder: AtomicU64,
     /// Frames decoded successfully (VT callback)
@@ -198,14 +213,15 @@ impl FrameStats {
         let received = self.received.load(Ordering::Relaxed);
         let dropped_bp = self.dropped_backpressure.load(Ordering::Relaxed);
         let dropped_idr = self.dropped_waiting_idr.load(Ordering::Relaxed);
+        let skipped_startup = self.skipped_startup_frames.load(Ordering::Relaxed);
         let submitted = self.submitted_to_decoder.load(Ordering::Relaxed);
         let decoded = self.decoded.load(Ordering::Relaxed);
         let rendered = self.rendered.load(Ordering::Relaxed);
         let errors = self.decode_errors.load(Ordering::Relaxed);
 
         tracing::info!(
-            "MoQ FrameStats [{}]: recv={}, drop_bp={}, drop_idr={}, submit={}, decoded={}, rendered={}, errors={}",
-            label, received, dropped_bp, dropped_idr, submitted, decoded, rendered, errors
+            "MoQ FrameStats [{}]: recv={}, drop_bp={}, drop_idr={}, skip_startup={}, submit={}, decoded={}, rendered={}, errors={}",
+            label, received, dropped_bp, dropped_idr, skipped_startup, submitted, decoded, rendered, errors
         );
     }
 
@@ -214,6 +230,7 @@ impl FrameStats {
             received: self.received.load(Ordering::Relaxed),
             dropped_backpressure: self.dropped_backpressure.load(Ordering::Relaxed),
             dropped_waiting_idr: self.dropped_waiting_idr.load(Ordering::Relaxed),
+            skipped_startup_frames: self.skipped_startup_frames.load(Ordering::Relaxed),
             submitted_to_decoder: self.submitted_to_decoder.load(Ordering::Relaxed),
             decoded: self.decoded.load(Ordering::Relaxed),
             rendered: self.rendered.load(Ordering::Relaxed),
@@ -228,6 +245,7 @@ pub struct MoqFrameStatsSnapshot {
     pub received: u64,
     pub dropped_backpressure: u64,
     pub dropped_waiting_idr: u64,
+    pub skipped_startup_frames: u64,
     pub submitted_to_decoder: u64,
     pub decoded: u64,
     pub rendered: u64,
@@ -249,6 +267,8 @@ pub struct MoqStatsSnapshot {
     pub transport_protocol: String,
     /// Current audio pipeline status.
     pub audio_status: MoqAudioStatus,
+    /// Count of LiveEdgeSender live-edge eviction events.
+    pub audio_live_edge_evictions: u64,
 }
 
 /// Handle to MoQ shared state for producing snapshots.
@@ -275,6 +295,11 @@ impl MoqStatsHandle {
             has_codec_description: self.shared.codec_description.lock().is_some(),
             transport_protocol: self.shared.transport_protocol.lock().clone(),
             audio_status: *self.shared.audio.audio_status.lock(),
+            audio_live_edge_evictions: self
+                .shared
+                .audio
+                .audio_live_edge_evictions
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -559,7 +584,7 @@ impl MoqDecoder {
 
     /// Returns all NAL types found in data, auto-detecting Annex B vs AVCC format.
     /// Uses a fixed-size stack buffer to avoid heap allocation on the per-frame path.
-    fn find_nal_types(
+    pub(crate) fn find_nal_types(
         nal_data: &[u8],
         nal_length_size: usize,
     ) -> ([u8; Self::MAX_NAL_TYPES], usize) {
@@ -571,7 +596,7 @@ impl MoqDecoder {
     }
 
     /// Check if data starts with Annex B start codes.
-    fn data_is_annex_b(data: &[u8]) -> bool {
+    pub(crate) fn data_is_annex_b(data: &[u8]) -> bool {
         matches!(data, [0, 0, 0, 1, ..] | [0, 0, 1, ..])
     }
 
@@ -820,7 +845,10 @@ impl MoqDecoder {
                 // next keyframe arrives (handled by init code at top of decode_frame).
                 self.waiting_for_idr_after_error = true;
                 self.vt_decoder = None;
-                tracing::warn!("MoQ: VT decode failed, destroyed session and entering IDR resync mode: {}", e);
+                tracing::warn!(
+                    "MoQ: VT decode failed, destroyed session and entering IDR resync mode: {}",
+                    e
+                );
                 Err(e)
             }
         }
@@ -883,8 +911,7 @@ impl MoqDecoder {
     /// - For each SPS: 2 bytes length (big endian) + SPS data
     /// - 1 byte: num_pps
     /// - For each PPS: 2 bytes length (big endian) + PPS data
-    #[cfg(target_os = "macos")]
-    fn parse_avcc_box(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>, usize), VideoError> {
+    pub(crate) fn parse_avcc_box(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>, usize), VideoError> {
         if data.len() < 7 {
             return Err(VideoError::DecodeFailed("avcC too short".to_string()));
         }
@@ -1105,6 +1132,13 @@ impl VideoDecoderBackend for MoqDecoder {
                 // Decode the frame
                 match self.decode_frame(&moq_frame) {
                     Ok(frame) => {
+                        // Signal audio that video decode has succeeded
+                        let _ = self.shared.audio.video_started.compare_exchange(
+                            false,
+                            true,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        );
                         // Track frame rendered
                         self.shared
                             .frame_stats
@@ -2836,6 +2870,13 @@ pub mod android {
 
             // Return next decoded frame if available
             if let Some(frame) = self.pending_frames.pop_front() {
+                // Signal audio that video decode has succeeded
+                let _ = self.shared.audio.video_started.compare_exchange(
+                    false,
+                    true,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
                 return Ok(Some(self.convert_to_video_frame(frame)));
             }
 
@@ -3711,7 +3752,17 @@ impl VideoDecoderBackend for MoqGStreamerDecoder {
         }
 
         // Pull decoded frame from appsink
-        self.pull_decoded_frame()
+        let result = self.pull_decoded_frame();
+        if let Ok(Some(_)) = &result {
+            // Signal audio that video decode has succeeded
+            let _ = self.shared.audio.video_started.compare_exchange(
+                false,
+                true,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+        result
     }
 
     fn seek(&mut self, _position: Duration) -> Result<(), VideoError> {

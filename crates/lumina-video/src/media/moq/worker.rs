@@ -22,15 +22,191 @@ use moq_native::ClientConfig;
 use crate::media::moq::MoqUrl;
 use crate::media::moq_audio::{
     select_preferred_audio_rendition, ChannelClosed, LiveEdgeSender, MoqAudioFrame, MoqAudioThread,
+    SendResult,
 };
 use crate::media::moq_decoder::{
-    MoqAudioStatus, MoqDecoderConfig, MoqDecoderState, MoqSharedState, MoqVideoFrame,
+    MoqAudioStatus, MoqDecoder, MoqDecoderConfig, MoqDecoderState, MoqSharedState, MoqVideoFrame,
+    MOQ_STARTUP_HARD_FAILSAFE_SECS,
 };
+
+/// Diagnostic hook: dumps raw frame data to .h264 + .csv for offline analysis.
+/// Enabled by LUMINA_MOQ_DUMP_PREFIX env var. Never affects streaming.
+struct FrameDumpHook {
+    h264_writer: std::io::BufWriter<std::fs::File>,
+    csv_writer: std::io::BufWriter<std::fs::File>,
+    sps: Vec<u8>,
+    pps: Vec<u8>,
+    nal_length_size: usize,
+    max_frames: u32,
+    frame_count: u32,
+}
+
+impl FrameDumpHook {
+    /// Try to create from env vars + catalog avcC. Returns None (not Err) on any failure.
+    fn try_init(codec_desc: &parking_lot::Mutex<Option<bytes::Bytes>>) -> Option<Self> {
+        use std::io::Write;
+
+        let prefix = std::env::var("LUMINA_MOQ_DUMP_PREFIX").ok()?;
+        let max_frames: u32 = std::env::var("LUMINA_MOQ_DUMP_MAX_FRAMES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300);
+
+        let avcc_data = codec_desc.lock().clone()?;
+
+        let (sps, pps, nal_length_size) = match MoqDecoder::parse_avcc_box(&avcc_data) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("FrameDumpHook: avcC parse failed ({}), dump DISABLED", e);
+                return None;
+            }
+        };
+
+        let h264_file = match std::fs::File::create(format!("{}.h264", prefix)) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!("FrameDumpHook: can't create .h264 ({}), dump DISABLED", e);
+                return None;
+            }
+        };
+        let csv_file = match std::fs::File::create(format!("{}.csv", prefix)) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!("FrameDumpHook: can't create .csv ({}), dump DISABLED", e);
+                return None;
+            }
+        };
+
+        let mut csv_writer = std::io::BufWriter::new(csv_file);
+        if writeln!(
+            csv_writer,
+            "frame,is_keyframe,size_bytes,timestamp_us,nal_types,heuristic_annexb,conversion_ok"
+        )
+        .is_err()
+        {
+            tracing::error!("FrameDumpHook: can't write CSV header, dump DISABLED");
+            return None;
+        }
+
+        tracing::info!(
+            "FrameDumpHook: enabled, prefix={}, max_frames={}, nal_length_size={}",
+            prefix,
+            max_frames,
+            nal_length_size
+        );
+        Some(Self {
+            h264_writer: std::io::BufWriter::new(h264_file),
+            csv_writer,
+            sps,
+            pps,
+            nal_length_size,
+            max_frames,
+            frame_count: 0,
+        })
+    }
+
+    /// Record one frame. Returns Ok(true) if still recording, Ok(false) if done.
+    /// On I/O error: logs warning, caller should disable hook.
+    fn record_frame(
+        &mut self,
+        data: &[u8],
+        is_keyframe: bool,
+        timestamp_us: u64,
+    ) -> Result<bool, std::io::Error> {
+        use std::io::Write;
+
+        if self.frame_count >= self.max_frames {
+            return Ok(false);
+        }
+
+        // Telemetry: heuristic result logged but NOT used for conversion decision
+        let heuristic_annexb = MoqDecoder::data_is_annex_b(data);
+
+        // SPS/PPS injection before every keyframe (first-in-group per hang semantics)
+        if is_keyframe {
+            self.h264_writer.write_all(&[0, 0, 0, 1])?;
+            self.h264_writer.write_all(&self.sps)?;
+            self.h264_writer.write_all(&[0, 0, 0, 1])?;
+            self.h264_writer.write_all(&self.pps)?;
+        }
+
+        // Always AVCC→Annex B conversion (catalog guarantees AVCC format)
+        let mut conversion_ok = true;
+        let mut offset = 0;
+        while offset + self.nal_length_size <= data.len() {
+            let nal_len = match self.nal_length_size {
+                1 => data[offset] as usize,
+                2 => u16::from_be_bytes([data[offset], data[offset + 1]]) as usize,
+                3 => u32::from_be_bytes([0, data[offset], data[offset + 1], data[offset + 2]])
+                    as usize,
+                4 => u32::from_be_bytes([
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ]) as usize,
+                _ => {
+                    conversion_ok = false;
+                    break;
+                }
+            };
+            offset += self.nal_length_size;
+            if offset + nal_len > data.len() || nal_len == 0 {
+                conversion_ok = false;
+                break;
+            }
+            self.h264_writer.write_all(&[0, 0, 0, 1])?;
+            self.h264_writer
+                .write_all(&data[offset..offset + nal_len])?;
+            offset += nal_len;
+        }
+        // Detect trailing bytes not consumed by AVCC parsing
+        if offset != data.len() {
+            conversion_ok = false;
+        }
+
+        // CSV: frame stats + format telemetry
+        let (nal_types_arr, nal_count) = MoqDecoder::find_nal_types(data, self.nal_length_size);
+        writeln!(
+            self.csv_writer,
+            "{},{},{},{},{:?},{},{}",
+            self.frame_count,
+            is_keyframe,
+            data.len(),
+            timestamp_us,
+            &nal_types_arr[..nal_count],
+            heuristic_annexb,
+            conversion_ok,
+        )?;
+
+        self.frame_count += 1;
+        if self.frame_count == self.max_frames {
+            self.h264_writer.flush()?;
+            self.csv_writer.flush()?;
+            tracing::info!(
+                "FrameDumpHook: captured {} frames, dump complete",
+                self.max_frames
+            );
+        }
+        Ok(true)
+    }
+}
 
 /// Shared async worker for MoQ connection, catalog fetch, and frame receipt.
 ///
 /// All three platform decoders (macOS, Android, Linux/GStreamer) delegate to
 /// this function. The `label` parameter is used for tracing prefixes.
+/// Result of catalog fetch and validation, avoiding positional tuple.
+struct CatalogResult {
+    video_track_name: String,
+    max_latency: Duration,
+    catalog: hang::catalog::Catalog,
+    /// Whether the selected video rendition is H.264.
+    selected_is_h264: bool,
+    /// Codec description (avcC/hvcC) from catalog, if present.
+    selected_video_description: Option<bytes::Bytes>,
+}
+
 pub(crate) async fn run_moq_worker(
     shared: Arc<MoqSharedState>,
     url: MoqUrl,
@@ -80,34 +256,76 @@ pub(crate) async fn run_moq_worker(
     // -- Phase 3: Fetch and validate catalog --
     let hang_consumer: hang::BroadcastConsumer = moq_broadcast.into();
 
-    let (video_track_name, max_latency, catalog) =
-        fetch_and_validate_catalog(&hang_consumer, &shared, &config, label).await?;
+    // Reset session state for audio coordination
+    shared.audio.video_started.store(false, Ordering::Relaxed);
+    shared
+        .audio
+        .audio_live_edge_evictions
+        .store(0, Ordering::Relaxed);
+
+    let cat = fetch_and_validate_catalog(&hang_consumer, &shared, &config, label).await?;
 
     // -- Phase 4: Subscribe to video track --
     let video_track = moq_lite::Track {
-        name: video_track_name.clone(),
+        name: cat.video_track_name.clone(),
         priority: 1,
     };
-    let mut video_consumer = hang_consumer.subscribe(&video_track, max_latency);
+    let mut video_consumer = hang_consumer.subscribe(&video_track, cat.max_latency);
 
     // -- Phase 5: Audio setup --
     let (mut audio_consumer_opt, audio_sender_opt, mut moq_audio_thread_opt) = setup_audio(
-        &catalog,
+        &cat.catalog,
         &hang_consumer,
-        max_latency,
+        cat.max_latency,
         &config,
         &shared,
         label,
     );
+
+    // -- Phase 5b: Frame dump hook (diagnostic, env-gated) --
+    let mut frame_dump = FrameDumpHook::try_init(&shared.codec_description);
+
+    // -- Phase 5c: Startup IDR gate (H.264 only) --
+    let avcc_parsed = if cat.selected_is_h264 {
+        cat.selected_video_description
+            .as_ref()
+            .and_then(|d| MoqDecoder::parse_avcc_box(d).ok())
+    } else {
+        None
+    };
+    let nal_length_size = avcc_parsed.as_ref().map(|(_, _, nls)| *nls).unwrap_or(4);
+    let idr_gate_enabled = cat.selected_is_h264 && avcc_parsed.is_some();
+
+    if cat.selected_is_h264 && !idr_gate_enabled {
+        tracing::warn!(
+            "MoQ {}: H.264 stream without parseable avcC; bypassing startup IDR gate",
+            label
+        );
+    }
+
+    let mut waiting_for_valid_idr = idr_gate_enabled;
+    let mut idr_gate_groups_seen: u8 = 0;
+    const IDR_GATE_MAX_GROUPS: u8 = 3;
+    const IDR_GATE_TIMEOUT: Duration = Duration::from_secs(5);
+    let idr_gate_hard_failsafe_timeout: Duration =
+        Duration::from_secs(MOQ_STARTUP_HARD_FAILSAFE_SECS);
+    let mut idr_gate_start: Option<std::time::Instant> = None;
+    let mut logged_groups_exhausted = false;
+
+    if !waiting_for_valid_idr {
+        // Non-H.264 or parse failure: bypass gate, audio can start immediately
+        shared.audio.video_started.store(true, Ordering::Relaxed);
+    }
 
     // -- Phase 6: Streaming --
     shared.set_state(MoqDecoderState::Streaming);
     shared.buffering_percent.store(100, Ordering::Relaxed);
 
     tracing::info!(
-        "MoQ {}: Streaming started, subscribed to video track '{}'",
+        "MoQ {}: Streaming started, subscribed to video track '{}' (idr_gate={})",
         label,
-        video_track_name,
+        cat.video_track_name,
+        idr_gate_enabled,
     );
 
     // Pre-allocate reusable buffers to avoid per-frame allocation
@@ -131,6 +349,93 @@ pub(crate) async fn run_moq_worker(
                         }
 
                         let data = assemble_payload(&frame.payload, &mut video_buf);
+
+                        // Frame dump: record then check if we should disable
+                        let mut disable_dump = false;
+                        if let Some(ref mut dump) = frame_dump {
+                            match dump.record_frame(&data, frame.keyframe, frame.timestamp.as_micros() as u64) {
+                                Ok(false) => disable_dump = true,
+                                Err(e) => {
+                                    tracing::warn!("FrameDumpHook: I/O error ({}), disabling dump", e);
+                                    disable_dump = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                        if disable_dump {
+                            frame_dump = None;
+                        }
+
+                        // -- IDR gate: skip frames until a real IDR at group boundary --
+                        if waiting_for_valid_idr {
+                            let start = *idr_gate_start.get_or_insert_with(std::time::Instant::now);
+                            if frame.keyframe {
+                                idr_gate_groups_seen = idr_gate_groups_seen.saturating_add(1);
+                            }
+                            let elapsed = start.elapsed();
+                            let timed_out = elapsed > IDR_GATE_TIMEOUT;
+                            let groups_exhausted = idr_gate_groups_seen >= IDR_GATE_MAX_GROUPS;
+
+                            let (nal_arr, nal_count) =
+                                MoqDecoder::find_nal_types(&data, nal_length_size);
+                            let has_idr = nal_arr[..nal_count].contains(&5);
+
+                            if frame.keyframe && has_idr {
+                                // Best case: real IDR at group boundary
+                                tracing::info!(
+                                    "MoQ {}: IDR gate cleared — real IDR at {}ms (groups_seen={})",
+                                    label,
+                                    elapsed.as_millis(),
+                                    idr_gate_groups_seen,
+                                );
+                                waiting_for_valid_idr = false;
+                            } else if frame.keyframe && timed_out {
+                                tracing::warn!(
+                                    "MoQ {}: startup IDR timeout at {}ms (groups_seen={}, groups_exhausted={}); accepting non-IDR keyframe",
+                                    label,
+                                    elapsed.as_millis(),
+                                    idr_gate_groups_seen,
+                                    groups_exhausted,
+                                );
+                                waiting_for_valid_idr = false;
+                            } else if frame.keyframe && groups_exhausted {
+                                // Advisory only — group count does NOT clear gate
+                                if !logged_groups_exhausted {
+                                    tracing::debug!(
+                                        "MoQ {}: saw {} keyframe groups before timeout; still waiting for IDR",
+                                        label,
+                                        idr_gate_groups_seen,
+                                    );
+                                    logged_groups_exhausted = true;
+                                }
+                                shared
+                                    .frame_stats
+                                    .skipped_startup_frames
+                                    .fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            } else if timed_out && !frame.keyframe && idr_gate_groups_seen > 0 {
+                                tracing::warn!(
+                                    "MoQ {}: startup IDR gate failsafe after {}ms with no usable keyframe; accepting raw frame",
+                                    label,
+                                    elapsed.as_millis(),
+                                );
+                                waiting_for_valid_idr = false;
+                            } else if elapsed > idr_gate_hard_failsafe_timeout {
+                                tracing::warn!(
+                                    "MoQ {}: startup IDR hard failsafe after {}ms with no keyframe boundaries; forcing decode start",
+                                    label,
+                                    elapsed.as_millis(),
+                                );
+                                waiting_for_valid_idr = false;
+                            } else {
+                                shared
+                                    .frame_stats
+                                    .skipped_startup_frames
+                                    .fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            // Gate cleared — video_started set by decoder on first successful decode
+                        }
 
                         let moq_frame = MoqVideoFrame {
                             timestamp_us: frame.timestamp.as_micros() as u64,
@@ -183,9 +488,18 @@ pub(crate) async fn run_moq_worker(
                                 timestamp_us: frame.timestamp.as_micros() as u64,
                                 data,
                             };
-                            if let Err(ChannelClosed) = audio_sender.send(moq_frame) {
-                                tracing::warn!("MoQ {}: Audio channel closed", label);
-                                audio_consumer_opt = None;
+                            match audio_sender.send(moq_frame) {
+                                Ok(SendResult::Dropped) => {
+                                    shared
+                                        .audio
+                                        .audio_live_edge_evictions
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(ChannelClosed) => {
+                                    tracing::warn!("MoQ {}: Audio channel closed", label);
+                                    audio_consumer_opt = None;
+                                }
+                                _ => {}
                             }
                         }
                         Ok(None) => {
@@ -467,7 +781,7 @@ async fn fetch_and_validate_catalog(
     shared: &Arc<MoqSharedState>,
     config: &MoqDecoderConfig,
     label: &str,
-) -> Result<(String, Duration, hang::catalog::Catalog), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<CatalogResult, Box<dyn std::error::Error + Send + Sync>> {
     let mut catalog_consumer = hang_consumer.catalog.clone();
     let catalog_timeout = Duration::from_secs(5);
     let catalog = match tokio::time::timeout(catalog_timeout, catalog_consumer.next()).await {
@@ -585,12 +899,22 @@ async fn fetch_and_validate_catalog(
     // fall back to config default (500ms) when the catalog has no jitter field.
     let max_latency = if let Some(jitter) = video_config.jitter {
         let jitter_ms = jitter.as_millis() as u64;
-        tracing::info!(
-            "MoQ {}: Using catalog jitter {}ms as latency buffer",
-            label,
-            jitter_ms,
-        );
-        Duration::from_millis(jitter_ms)
+        let effective_ms = if jitter_ms == 0 {
+            tracing::warn!(
+                "MoQ {}: catalog jitter=0ms (unset), using default {}ms",
+                label,
+                config.max_latency_ms,
+            );
+            config.max_latency_ms
+        } else {
+            tracing::info!(
+                "MoQ {}: Using catalog jitter {}ms as latency buffer",
+                label,
+                jitter_ms,
+            );
+            jitter_ms
+        };
+        Duration::from_millis(effective_ms)
     } else {
         tracing::info!(
             "MoQ {}: No jitter in catalog, using default {}ms",
@@ -600,7 +924,16 @@ async fn fetch_and_validate_catalog(
         Duration::from_millis(config.max_latency_ms)
     };
 
-    Ok((video_track_name.clone(), max_latency, catalog))
+    let selected_is_h264 = matches!(video_config.codec, hang::catalog::VideoCodec::H264(_));
+    let selected_video_description = video_config.description.clone();
+
+    Ok(CatalogResult {
+        video_track_name: video_track_name.clone(),
+        max_latency,
+        catalog,
+        selected_is_h264,
+        selected_video_description,
+    })
 }
 
 /// Set up audio track subscription and spawn decode/playback thread.
@@ -694,7 +1027,7 @@ async fn teardown_audio(
     drop(audio_sender);
     {
         let mut status = shared.audio.audio_status.lock();
-        if *status == MoqAudioStatus::Starting {
+        if *status == MoqAudioStatus::Starting || *status == MoqAudioStatus::Buffering {
             *status = MoqAudioStatus::Unavailable;
         }
     }
@@ -722,7 +1055,10 @@ async fn teardown_audio(
         *shared_for_teardown.audio.moq_audio_handle.lock() = None;
         {
             let mut status = shared_for_teardown.audio.audio_status.lock();
-            if *status == MoqAudioStatus::Running || *status == MoqAudioStatus::Starting {
+            if *status == MoqAudioStatus::Running
+                || *status == MoqAudioStatus::Starting
+                || *status == MoqAudioStatus::Buffering
+            {
                 *status = MoqAudioStatus::Unavailable;
             }
         }

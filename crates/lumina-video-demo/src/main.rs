@@ -471,7 +471,10 @@ impl eframe::App for DemoApp {
         // Top panel with controls
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading(format!("lumina-video Demo  [{}]", env!("LUMINA_BUILD_ID", "dev")));
+                ui.heading(format!(
+                    "lumina-video Demo  [{}]",
+                    option_env!("LUMINA_BUILD_ID").unwrap_or("dev")
+                ));
                 ui.separator();
 
                 // Source type selector
@@ -951,11 +954,27 @@ impl eframe::App for DemoApp {
                                         );
                                         ui.end_row();
                                     }
+                                    if fs.skipped_startup_frames > 0 {
+                                        ui.label("Skip (startup):");
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(255, 140, 0),
+                                            format!("{}", fs.skipped_startup_frames),
+                                        );
+                                        ui.end_row();
+                                    }
                                     if fs.decode_errors > 0 {
                                         ui.label("Decode errors:");
                                         ui.colored_label(
                                             egui::Color32::RED,
                                             format!("{}", fs.decode_errors),
+                                        );
+                                        ui.end_row();
+                                    }
+                                    if moq.audio_live_edge_evictions > 0 {
+                                        ui.label("Audio evictions:");
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(255, 140, 0),
+                                            format!("{}", moq.audio_live_edge_evictions),
                                         );
                                         ui.end_row();
                                     }
@@ -968,6 +987,9 @@ impl eframe::App for DemoApp {
                                         }
                                         lumina_video::media::MoqAudioStatus::Starting => {
                                             ("Starting...", egui::Color32::YELLOW)
+                                        }
+                                        lumina_video::media::MoqAudioStatus::Buffering => {
+                                            ("Buffering...", egui::Color32::YELLOW)
                                         }
                                         lumina_video::media::MoqAudioStatus::Running => {
                                             ("Running", egui::Color32::GREEN)
