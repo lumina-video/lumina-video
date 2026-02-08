@@ -282,6 +282,16 @@ pub(crate) async fn run_moq_worker(
         label,
     );
 
+    // Determine audio track for potential re-subscribe (when stream loops)
+    let audio_track_for_resub: Option<moq_lite::Track> = if audio_consumer_opt.is_some() {
+        select_preferred_audio_rendition(&cat.catalog).map(|(name, _)| moq_lite::Track {
+            name: name.to_string(),
+            priority: 2,
+        })
+    } else {
+        None
+    };
+
     // -- Phase 5b: Frame dump hook (diagnostic, env-gated) --
     let mut frame_dump = FrameDumpHook::try_init(&shared.codec_description);
 
@@ -333,6 +343,8 @@ pub(crate) async fn run_moq_worker(
     let mut audio_buf = BytesMut::with_capacity(4096);
 
     let mut stats_log_counter = 0u64;
+    let mut resubscribe_count: u32 = 0;
+    const MAX_RESUBSCRIBES: u32 = 5;
     loop {
         tokio::select! {
             // No biased — fair scheduling prevents audio starvation
@@ -459,11 +471,49 @@ pub(crate) async fn run_moq_worker(
                         }
                     }
                     Ok(None) => {
-                        tracing::info!("MoQ {}: Video track ended", label);
-                        shared.frame_stats.log_summary(label);
-                        shared.set_state(MoqDecoderState::Ended);
-                        shared.eof_reached.store(true, Ordering::Relaxed);
-                        break;
+                        resubscribe_count += 1;
+                        if resubscribe_count > MAX_RESUBSCRIBES {
+                            tracing::info!(
+                                "MoQ {}: Video track ended after {} re-subscribes",
+                                label,
+                                resubscribe_count - 1,
+                            );
+                            shared.frame_stats.log_summary(label);
+                            shared.set_state(MoqDecoderState::Ended);
+                            shared.eof_reached.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        tracing::warn!(
+                            "MoQ {}: Video track ended, re-subscribing ({}/{})",
+                            label,
+                            resubscribe_count,
+                            MAX_RESUBSCRIBES,
+                        );
+                        video_consumer =
+                            hang_consumer.subscribe(&video_track, cat.max_latency);
+                        // Re-subscribe audio if it also ended
+                        if audio_consumer_opt.is_none() {
+                            if let Some(ref at) = audio_track_for_resub {
+                                audio_consumer_opt =
+                                    Some(hang_consumer.subscribe(at, cat.max_latency));
+                                tracing::info!(
+                                    "MoQ {}: Audio track re-subscribed",
+                                    label,
+                                );
+                            }
+                        }
+                        // Reset IDR gate for the new subscription
+                        if idr_gate_enabled {
+                            waiting_for_valid_idr = true;
+                            idr_gate_groups_seen = 0;
+                            idr_gate_start = None;
+                            logged_groups_exhausted = false;
+                            shared
+                                .audio
+                                .video_started
+                                .store(false, Ordering::Relaxed);
+                        }
+                        continue;
                     }
                     Err(e) => {
                         tracing::error!("MoQ {}: Frame read error: {e}", label);

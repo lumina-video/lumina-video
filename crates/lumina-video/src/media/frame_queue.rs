@@ -1335,7 +1335,7 @@ impl FrameScheduler {
                 })
                 .unwrap_or(true); // No audio handle = treat as started
             let ahead_tolerance = if audio_started {
-                Duration::from_millis(2000) // Normal tolerance for seek recovery
+                Duration::from_millis(2500) // Must exceed group interval (BBB=2048ms at 2s groups)
             } else {
                 Duration::from_millis(500) // Match audio startup budget (sync_position holds for 500ms)
             };
