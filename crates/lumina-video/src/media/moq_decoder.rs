@@ -171,7 +171,7 @@ impl Default for MoqDecoderConfig {
             max_latency_ms: 500, // 500ms max latency for live streaming
             enable_audio: true,
             initial_volume: 1.0,
-            audio_buffer_capacity: 60,
+            audio_buffer_capacity: 180, // ~3.8s at 48kHz; absorbs group-boundary burst delivery
         }
     }
 }
@@ -415,6 +415,10 @@ pub struct MoqDecoder {
     /// True after a decode error; decoder must wait for next IDR to resync.
     #[cfg(target_os = "macos")]
     waiting_for_idr_after_error: bool,
+    /// Consecutive decode error count; skip-and-continue for isolated errors,
+    /// only destroy VT session + IDR resync after 3+ consecutive failures.
+    #[cfg(target_os = "macos")]
+    consecutive_decode_errors: u32,
 }
 
 impl MoqDecoder {
@@ -504,6 +508,8 @@ impl MoqDecoder {
             h264_nal_length_size: 4,
             #[cfg(target_os = "macos")]
             waiting_for_idr_after_error: false,
+            #[cfg(target_os = "macos")]
+            consecutive_decode_errors: 0,
         })
     }
 
@@ -689,6 +695,7 @@ impl MoqDecoder {
                             &pps,
                             metadata.width,
                             metadata.height,
+                            true, // catalog avcC = AVCC format
                         )?;
                         self.vt_decoder = Some(decoder);
                         self.h264_nal_length_size = nal_length_size;
@@ -717,10 +724,13 @@ impl MoqDecoder {
                             &pps,
                             metadata.width,
                             metadata.height,
+                            false, // keyframe extraction = Annex B format
                         )?;
                         self.vt_decoder = Some(decoder);
                         self.h264_nal_length_size = 4; // Default for Annex B extraction
-                        tracing::info!("MoQ: initialized VTDecoder from keyframe SPS/PPS");
+                        tracing::info!(
+                            "MoQ: initialized VTDecoder from keyframe SPS/PPS (Annex B)"
+                        );
                     }
                     Err(e) => {
                         tracing::warn!("MoQ: failed to extract H.264 params: {}", e);
@@ -823,6 +833,9 @@ impl MoqDecoder {
                     .fetch_add(1, Ordering::Relaxed)
                     + 1;
 
+                // Reset consecutive error counter on success
+                self.consecutive_decode_errors = 0;
+
                 // Log first few successful decodes
                 if decoded_count <= 5 {
                     tracing::info!(
@@ -837,19 +850,35 @@ impl MoqDecoder {
                 "VTDecoder: no frame decoded (async?)".to_string(),
             )),
             Err(e) => {
-                // Decode error - destroy VT session and enter IDR resync mode.
-                // Simply clearing the queue (prepare_for_idr_resync) is insufficient:
-                // VT's internal decoder state is corrupted after -12909 and subsequent
-                // keyframes will also fail. Destroying the session forces a fresh
-                // VTDecompressionSession to be created from catalog SPS/PPS when the
-                // next keyframe arrives (handled by init code at top of decode_frame).
-                self.waiting_for_idr_after_error = true;
-                self.vt_decoder = None;
-                tracing::warn!(
-                    "MoQ: VT decode failed, destroyed session and entering IDR resync mode: {}",
-                    e
-                );
-                Err(e)
+                self.consecutive_decode_errors += 1;
+
+                if self.consecutive_decode_errors < 3 {
+                    // Isolated error: skip this frame but keep the VT session alive.
+                    // -12909 (kVTVideoDecoderBadDataErr) means the frame data is bad,
+                    // NOT that the session is corrupted. The session's DPB and reference
+                    // frames are still valid — destroying would lose ~48 frames during
+                    // IDR resync.
+                    if let Some(ref mut decoder) = self.vt_decoder {
+                        decoder.prepare_for_idr_resync(); // clears error flag
+                    }
+                    tracing::warn!(
+                        "MoQ: VT decode error #{}, skipping frame (session kept): {}",
+                        self.consecutive_decode_errors,
+                        e
+                    );
+                    Err(e)
+                } else {
+                    // 3+ consecutive errors: session may be truly corrupted.
+                    // Destroy and wait for IDR to create a fresh session.
+                    self.waiting_for_idr_after_error = true;
+                    self.vt_decoder = None;
+                    self.consecutive_decode_errors = 0;
+                    tracing::warn!(
+                        "MoQ: 3+ consecutive VT errors, destroyed session for IDR resync: {}",
+                        e
+                    );
+                    Err(e)
+                }
             }
         }
     }
@@ -1521,6 +1550,10 @@ mod macos_vt {
         /// Codec type (H.264 or H.265, reserved for H.265 support)
         #[allow(dead_code)]
         codec: VTCodec,
+        /// True if NAL data is AVCC format (length-prefixed), false for Annex B (start codes).
+        /// Set from catalog info to avoid heuristic detection that misclassifies
+        /// AVCC frames with 256-511 byte NALs (length prefix [0,0,1,X] looks like Annex B).
+        is_avcc: bool,
     }
 
     // SAFETY: VTDecompressionSession is designed for multi-threaded use.
@@ -1552,20 +1585,22 @@ mod macos_vt {
             pps: &[u8],
             width: u32,
             height: u32,
+            is_avcc: bool,
         ) -> Result<Self, VideoError> {
             tracing::info!(
-                "VTDecoder: Creating H.264 decoder {}x{} (SPS: {} bytes, PPS: {} bytes)",
+                "VTDecoder: Creating H.264 decoder {}x{} (SPS: {} bytes, PPS: {} bytes, avcc={})",
                 width,
                 height,
                 sps.len(),
-                pps.len()
+                pps.len(),
+                is_avcc,
             );
 
             // Create CMFormatDescription from SPS/PPS
             let format_desc = Self::create_h264_format_description(sps, pps)?;
 
             // Create decoder with format description
-            Self::create_decoder(format_desc, width, height, VTCodec::H264)
+            Self::create_decoder(format_desc, width, height, VTCodec::H264, is_avcc)
         }
 
         /// Creates a new VTDecoder for H.265 with the given VPS/SPS/PPS NAL units.
@@ -1583,21 +1618,23 @@ mod macos_vt {
             pps: &[u8],
             width: u32,
             height: u32,
+            is_avcc: bool,
         ) -> Result<Self, VideoError> {
             tracing::info!(
-                "VTDecoder: Creating H.265 decoder {}x{} (VPS: {} bytes, SPS: {} bytes, PPS: {} bytes)",
+                "VTDecoder: Creating H.265 decoder {}x{} (VPS: {} bytes, SPS: {} bytes, PPS: {} bytes, avcc={})",
                 width,
                 height,
                 vps.len(),
                 sps.len(),
-                pps.len()
+                pps.len(),
+                is_avcc,
             );
 
             // Create CMFormatDescription from VPS/SPS/PPS
             let format_desc = Self::create_h265_format_description(vps, sps, pps)?;
 
             // Create decoder with format description
-            Self::create_decoder(format_desc, width, height, VTCodec::H265)
+            Self::create_decoder(format_desc, width, height, VTCodec::H265, is_avcc)
         }
 
         /// Creates CMVideoFormatDescription for H.264 from SPS/PPS.
@@ -1681,6 +1718,7 @@ mod macos_vt {
             width: u32,
             height: u32,
             codec: VTCodec,
+            is_avcc: bool,
         ) -> Result<Self, VideoError> {
             // Create output pixel buffer attributes for IOSurface + Metal compatibility
             let destination_attributes = Self::create_output_attributes()?;
@@ -1693,8 +1731,9 @@ mod macos_vt {
                 Self::create_session(format_desc, &destination_attributes, &callback_state)?;
 
             tracing::info!(
-                "VTDecoder: Created {:?} session with IOSurface+Metal output",
-                codec
+                "VTDecoder: Created {:?} session with IOSurface+Metal output (avcc={})",
+                codec,
+                is_avcc,
             );
 
             Ok(Self {
@@ -1704,6 +1743,7 @@ mod macos_vt {
                 width,
                 height,
                 codec,
+                is_avcc,
             })
         }
 
@@ -1831,10 +1871,10 @@ mod macos_vt {
                 preview
             );
 
-            // Check if data is in AVCC format (length-prefixed) or Annex B (start codes)
-            // AVCC: first 4 bytes are NAL length (big-endian)
-            // Annex B: starts with 0x00 0x00 0x00 0x01 or 0x00 0x00 0x01
-            let is_avcc = Self::is_avcc_format(nal_data);
+            // Use known format from catalog/init context instead of heuristic detection.
+            // The heuristic is_avcc_format() misclassifies AVCC frames with 256-511 byte
+            // NAL lengths: the prefix [0x00,0x00,0x01,X] looks like an Annex B start code.
+            let is_avcc = self.is_avcc;
             tracing::debug!(
                 "VTDecoder: detected format: {}",
                 if is_avcc { "AVCC" } else { "Annex B" }
@@ -2072,6 +2112,11 @@ mod macos_vt {
         ///
         /// AVCC format: first 4 bytes are NAL length (big-endian), followed by NAL data
         /// Annex B format: starts with 0x00 0x00 0x00 0x01 or 0x00 0x00 0x01
+        ///
+        /// NOTE: This heuristic has known false negatives for AVCC frames with 256-511 byte
+        /// NALs (length prefix [0,0,1,X] looks like Annex B). Prefer using VTDecoder::is_avcc
+        /// field which is set from catalog info.
+        #[allow(dead_code)]
         fn is_avcc_format(data: &[u8]) -> bool {
             if data.len() < 5 {
                 return false;
