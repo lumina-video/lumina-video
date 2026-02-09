@@ -3,35 +3,35 @@
 > Exported from bead `web-egui-vid-duf` on 2026-02-09 (56 comments)
 > Bug: "MoQ: video broken (pixelated/frozen/artifacts) — audio works after 4s startup"
 > Status: in_progress | Priority: P1 | Type: bug
-> Created: 2026-02-06 07:46 | Updated: 2026-02-09 14:00
+> Created: 2026-02-06 07:46 | Updated: 2026-02-09 20:25
 
 ## Description
 
 MoQ video pixelation on BBB stream + choppy audio.
 
-### Current Status (2026-02-08 Session 5)
+### Current Status (2026-02-09 Session 11)
 
-#### VT -12909 ROOT CAUSE: is_avcc_format() heuristic bug
-- `is_avcc_format()` misclassifies AVCC frames with 256-511 byte NAL lengths
-- Length prefix [0,0,1,X] looks like Annex B 3-byte start code -> Annex B conversion on AVCC data -> garbage -> -12909
-- FIX: `is_avcc` field on VTDecoder set from catalog context, bypasses heuristic
-- Expected: eliminates ALL decode errors + ~59 frame drops per error
-
-#### Audio choppy ROOT CAUSE: buffer capacity vs group-boundary burst delivery
-- `audio_buffer_capacity=60` (~1.3s) can't absorb 2s group bursts (~94 audio frames)
-- 324 evictions in 35s = ~20% audio frame loss
-- FIX: capacity increased to 180 (~3.8s)
-
-#### Previously fixed (committed):
+#### All committed fixes (chronological):
 - PTS tolerance: 2000ms->2500ms for 2s group boundaries (674d0c70)
 - Track re-subscribe on end: 5 bounded retries + IDR gate reset (674d0c70)
 - Startup IDR gate: skips non-IDR startup frames, H.264-only (83c0983f)
 - Audio pre-buffer: 8 frames gated on video_started (83c0983f)
 - VT session recreation on error (8324a640)
 - 3s metadata stall + PTS rejection fix (bfefb532)
+- `is_avcc` field from catalog context, bypasses heuristic (ab08be20)
+- Audio buffer 60->180 for group-boundary bursts (ab08be20)
+- Graduated error handling + IDR-only resync (11827644)
+- VT session quiesce barrier (27b9eaf7)
+- Unified worker/decoder IDR gates via ResubscribeReason enum (359bd910)
+- Ignore VT info_flags=0x4 when frame decoded successfully (e886a8dc)
 
-#### Needs runtime test
-- VT format fix + audio buffer increase (uncommitted, compiles clean)
+#### Awaiting runtime validation (r28)
+- info_flags=0x4 fix + ResubscribeReason unification — see test plan at bottom
+
+#### Known open issues
+- Silent VT corruption: pixelation with 0 decode errors (see comment #37)
+- Intermittent VT -12909 errors (run-dependent, 0-2 per session)
+- Degenerate first-group IDR (6KB vs 92KB) may cause initial pixelation
 
 ### Notes
 Next validation plan (determinism check): rerun the same BBB scenario with LUMINA_MOQ_ERROR_FORENSICS=1 and compare failing frame hash64 values against prior run. Prior failing triplet: d8b88f02b47590e4, af827e33672d222a, 970741a3001f2163 (with preceding IDR hash ad78eefdd683534e). Decision rule: if same hashes fail again at similar relative position, classify as deterministic content-triggered (specific AU/bitstream incompatibility). If hashes differ run-to-run, classify as nondeterministic runtime/lifecycle/timing issue and prioritize VT/session scheduling investigation.
@@ -327,7 +327,7 @@ Frame dump hook captured 400 frames to /tmp/bbb_frames.{h264,csv}. ffplay reprod
 - Frames 72-74: Annex B fragments in AVCC stream (format mixing at group boundary)
 - Frame 74: phantom IDR (NAL type 5, 361 bytes, heuristic_annexb=true) — too small, wrong format
 
-**Fix**: Detect degenerate first group (is_keyframe=true but NAL type != 5) and skip to next group's real IDR. Adds ~2s join latency, eliminates pixelation.
+**Fix**: Detect degenerate first group (is_keyframe=true but NAL type != 5) and skip to next group's real IDR. Adds ~2s join latency. *(Phase-local conclusion: reduced pixelation from this source, but later sessions revealed additional pixelation causes — see comments #37, #50, #56.)*
 
 #### Choppy Audio Root Cause: LiveEdgeSender drops + no jitter buffer
 Audio uses LiveEdgeSender (bounded channel, capacity 60) with live-edge drop policy. Combined with fair tokio::select! and same PTS gaps. No smoothing jitter buffer.
@@ -605,5 +605,5 @@ Session 11 (r27): Runtime test revealed root cause of low FPS + freezes. VT call
 
 ### Known remaining issues (not addressed by this fix)
 - Silent VT corruption: pixelation with 0 decode errors (open hypothesis — see comment #37)
-- 1-2 real VT -12909 errors per session (non-format-related, run-dependent)
+- Intermittent VT -12909 errors (run-dependent, 0-2 per session — some runs have zero)
 - Pixelation from degenerate first-group IDR (6KB vs 92KB)
