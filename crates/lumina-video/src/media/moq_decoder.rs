@@ -926,16 +926,37 @@ impl MoqDecoder {
     }
 
     #[cfg(target_os = "macos")]
-    fn note_idr_wait_progress(&mut self, nal_type: u8, frame_len: usize) {
-        // BBB groups are ~2s. If we keep dropping non-IDR frames for longer than
-        // a group, force a re-subscribe so we can rejoin on a fresh boundary.
-        const IDR_WAIT_MAX: Duration = Duration::from_millis(2500);
-        const IDR_WAIT_MAX_DROPS: u32 = 96;
+    fn note_idr_wait_progress(&mut self, nal_type: u8, frame_len: usize, is_keyframe: bool) {
+        // Keep recovery bounded: if a real IDR doesn't arrive quickly, force
+        // re-subscribe so we can rejoin on a fresh group boundary.
+        const IDR_WAIT_MAX: Duration = Duration::from_millis(1000);
+        const IDR_WAIT_MAX_DROPS: u32 = 24;
 
         let start = self
             .idr_wait_started_at
             .get_or_insert_with(std::time::Instant::now);
         self.idr_wait_dropped_frames = self.idr_wait_dropped_frames.saturating_add(1);
+
+        // If metadata says "keyframe" but first NAL is still non-IDR, this is
+        // likely a degenerate boundary group; re-subscribe immediately.
+        let broken_keyframe_boundary = is_keyframe && nal_type != 5;
+        if broken_keyframe_boundary {
+            if self
+                .shared
+                .request_video_resubscribe
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                tracing::warn!(
+                    "MoQ: keyframe boundary without IDR (nal_type={}, {} bytes) — requesting immediate video re-subscribe",
+                    nal_type,
+                    frame_len
+                );
+            }
+            self.idr_wait_started_at = Some(std::time::Instant::now());
+            self.idr_wait_dropped_frames = 0;
+            return;
+        }
 
         let elapsed = start.elapsed();
         if elapsed < IDR_WAIT_MAX && self.idr_wait_dropped_frames < IDR_WAIT_MAX_DROPS {
@@ -1049,7 +1070,7 @@ impl MoqDecoder {
                 self.is_avcc,
             );
             let nal_type = if c > 0 { t[0] } else { 0 };
-            self.note_idr_wait_progress(nal_type, moq_frame.data.len());
+            self.note_idr_wait_progress(nal_type, moq_frame.data.len(), moq_frame.is_keyframe);
             tracing::debug!(
                 "MoQ: waiting for IDR resync after decode error (got NAL type {}, is_keyframe={}, {} bytes)",
                 nal_type, moq_frame.is_keyframe, moq_frame.data.len()
@@ -1213,7 +1234,6 @@ impl MoqDecoder {
             )),
             Err(e) => {
                 self.consecutive_decode_errors += 1;
-                self.waiting_for_idr_after_error = true;
                 let total_errors = self
                     .shared
                     .frame_stats
@@ -1262,6 +1282,7 @@ impl MoqDecoder {
                     // prepare_for_idr_resync() only clears the output queue — VT's
                     // internal DPB retains stale reference frames. Full session
                     // recreation from catalog SPS/PPS is needed for clean recovery.
+                    self.waiting_for_idr_after_error = true;
                     self.vt_decoder = None; // Drop: WaitForAsync → Invalidate → CFRelease
                     self.quiesce_until =
                         Some(std::time::Instant::now() + std::time::Duration::from_millis(50));
@@ -1271,9 +1292,12 @@ impl MoqDecoder {
                     );
                 } else {
                     // Isolated error: skip this frame, keep session alive.
-                    // VT can recover from transient errors on the next frame.
+                    // VT can often recover from transient errors on the next frame.
+                    // Do NOT enter IDR wait mode here, or we can drop an entire GOP
+                    // for each one-off error.
+                    self.waiting_for_idr_after_error = false;
                     tracing::warn!(
-                        "MoQ: VT decode error #{} (consecutive={}), skipping frame: {}",
+                        "MoQ: VT decode error #{} (consecutive={}), skipping frame without IDR gate: {}",
                         total_errors,
                         self.consecutive_decode_errors,
                         e
