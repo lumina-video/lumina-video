@@ -431,6 +431,13 @@ pub struct MoqDecoder {
     /// True until the one-shot VT session recreation has fired.
     #[cfg(target_os = "macos")]
     needs_session_recreation: bool,
+    /// Set after session destruction; cleared after quiesce delay applied.
+    /// Ensures hardware decoder fully quiesces before new session creation.
+    #[cfg(target_os = "macos")]
+    needs_quiesce_delay: bool,
+    /// Counts VT session creations for lifecycle diagnostics.
+    #[cfg(target_os = "macos")]
+    vt_session_count: u32,
 }
 
 impl MoqDecoder {
@@ -526,6 +533,10 @@ impl MoqDecoder {
             consecutive_decode_errors: 0,
             #[cfg(target_os = "macos")]
             needs_session_recreation: true,
+            #[cfg(target_os = "macos")]
+            needs_quiesce_delay: false,
+            #[cfg(target_os = "macos")]
+            vt_session_count: 0,
         })
     }
 
@@ -727,6 +738,13 @@ impl MoqDecoder {
     fn decode_frame(&mut self, moq_frame: &MoqVideoFrame) -> Result<VideoFrame, VideoError> {
         // Initialize VTDecoder lazily
         if self.vt_decoder.is_none() {
+            // If a previous session was just destroyed, apply quiesce delay
+            // to let the hardware decoder fully release before creating a new one.
+            if self.needs_quiesce_delay {
+                self.needs_quiesce_delay = false;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                tracing::info!("MoQ: VT quiesce delay complete (50ms after error-path destroy)");
+            }
             let metadata = self.shared.metadata.lock().clone();
 
             // First, try to use codec description from catalog (avcC/hvcC box)
@@ -743,7 +761,8 @@ impl MoqDecoder {
                         self.vt_decoder = Some(decoder);
                         self.h264_nal_length_size = nal_length_size;
                         self.is_avcc = true;
-                        tracing::info!("MoQ: initialized VTDecoder from catalog avcC ({} bytes SPS, {} bytes PPS, NAL len size {})", sps.len(), pps.len(), nal_length_size);
+                        self.vt_session_count += 1;
+                        tracing::info!("MoQ: initialized VTDecoder session #{} from catalog avcC ({} bytes SPS, {} bytes PPS, NAL len size {})", self.vt_session_count, sps.len(), pps.len(), nal_length_size);
                     }
                     Err(e) => {
                         tracing::warn!("MoQ: failed to parse avcC from catalog: {}", e);
@@ -772,8 +791,9 @@ impl MoqDecoder {
                         )?;
                         self.vt_decoder = Some(decoder);
                         self.h264_nal_length_size = 4; // Default for Annex B extraction
+                        self.vt_session_count += 1;
                         tracing::info!(
-                            "MoQ: initialized VTDecoder from keyframe SPS/PPS (Annex B)"
+                            "MoQ: initialized VTDecoder session #{} from keyframe SPS/PPS (Annex B)", self.vt_session_count
                         );
                     }
                     Err(e) => {
@@ -818,8 +838,13 @@ impl MoqDecoder {
                 // to give VT hardware time to fully initialize.
                 if prev_count >= 48 {
                     self.needs_session_recreation = false;
+                    // Drop triggers: WaitForAsync → Invalidate → CFRelease
                     self.vt_decoder = None;
-                    // Immediately recreate from catalog SPS/PPS so this IDR gets decoded
+                    // Allow hardware decoder to fully quiesce before creating new session.
+                    // Without this delay, the new session may inherit poisoned hardware state.
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    tracing::info!("MoQ: VT quiesce complete (50ms), creating new session");
+                    // Recreate from catalog SPS/PPS so this IDR gets decoded
                     if let Some(ref desc) = *self.shared.codec_description.lock() {
                         if let Ok((sps, pps, nal_length_size)) = Self::parse_avcc_box(desc) {
                             let metadata = self.shared.metadata.lock().clone();
@@ -828,9 +853,10 @@ impl MoqDecoder {
                             ) {
                                 self.vt_decoder = Some(new_decoder);
                                 self.h264_nal_length_size = nal_length_size;
+                                self.vt_session_count += 1;
                                 tracing::info!(
-                                    "MoQ: one-shot VT session recreation at IDR ({} bytes, {} frames on previous session)",
-                                    moq_frame.data.len(), prev_count
+                                    "MoQ: one-shot VT session #{} recreation at IDR ({} bytes, {} frames on previous session)",
+                                    self.vt_session_count, moq_frame.data.len(), prev_count
                                 );
                             }
                         }
@@ -940,7 +966,8 @@ impl MoqDecoder {
                     // internal DPB retains stale reference frames. Full session
                     // recreation from catalog SPS/PPS is needed for clean recovery.
                     self.waiting_for_idr_after_error = true;
-                    self.vt_decoder = None;
+                    self.vt_decoder = None; // Drop: WaitForAsync → Invalidate → CFRelease
+                    self.needs_quiesce_delay = true;
                     tracing::warn!(
                         "MoQ: VT decode error #{} (consecutive={}), destroyed session for IDR resync: {}",
                         total_errors, self.consecutive_decode_errors, e
@@ -2370,11 +2397,21 @@ mod macos_vt {
     impl Drop for VTDecoder {
         fn drop(&mut self) {
             let frame_count = self.callback_state.frame_count.load(Ordering::Relaxed);
-            tracing::info!("VTDecoder: dropped after decoding {} frames", frame_count);
+            tracing::info!("VTDecoder: dropping after decoding {} frames", frame_count);
 
-            // Invalidate and release the session
             if !self.session.is_null() {
                 unsafe {
+                    // Drain any in-flight async decode callbacks before invalidating.
+                    // Without this, Invalidate can fire while a callback is still writing
+                    // to callback_state, and the hardware decoder may not fully quiesce.
+                    let wait_status =
+                        VTDecompressionSessionWaitForAsynchronousFrames(self.session);
+                    if wait_status != 0 {
+                        tracing::warn!(
+                            "VTDecoder: WaitForAsyncFrames in drop returned OSStatus {}",
+                            wait_status
+                        );
+                    }
                     VTDecompressionSessionInvalidate(self.session);
                     CFRelease(self.session);
                 }
@@ -2384,6 +2421,7 @@ mod macos_vt {
             if !self.format_desc.is_null() {
                 unsafe { CFRelease(self.format_desc) };
             }
+            tracing::info!("VTDecoder: dropped (session invalidated + released)");
         }
     }
 
