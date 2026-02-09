@@ -1140,7 +1140,7 @@ impl MoqDecoder {
         // only triggers on real IDR (type 5), not I-frames (type 1).
         // A/B test: set to false to skip one-shot recreation and isolate
         // whether mid-session errors are content-dependent or lifecycle-dependent.
-        const ENABLE_ONESHOT_RECREATION: bool = true;
+        const ENABLE_ONESHOT_RECREATION: bool = false;
         if ENABLE_ONESHOT_RECREATION
             && self.needs_session_recreation
             && !self.waiting_for_idr_after_error
@@ -1281,11 +1281,28 @@ impl MoqDecoder {
                     + 1;
                 let error_text = e.to_string();
                 let hard_vt_callback_failure = error_text.contains("VT decode callback error:");
+                let required_drop_storm = error_text.contains("VT required-frame-drop storm");
                 if hard_vt_callback_failure {
                     // Callback OSStatus failures (e.g. -12909) are not transient in our runs:
                     // keeping session alive for 1-2 extra failures extends visible corruption.
                     // Escalate immediately to the existing hard-reset + IDR resync path.
                     self.consecutive_decode_errors = 3;
+                    if self.request_video_resubscribe_with_cooldown() {
+                        tracing::warn!(
+                            "MoQ: VT callback failure detected — requesting immediate video re-subscribe"
+                        );
+                    }
+                } else if required_drop_storm {
+                    // Persistent RequiredFrameDropped callbacks correlate with prolonged
+                    // visible corruption, but hard session-destroy on every storm creates
+                    // reset loops and prolonged low-FPS windows. Use soft recovery:
+                    // skip this frame locally without forcing IDR wait or immediate
+                    // re-subscribe churn.
+                    self.consecutive_decode_errors = 0;
+                    self.waiting_for_idr_after_error = false;
+                    tracing::warn!(
+                        "MoQ: required-frame-drop storm detected — skipping frame without re-subscribe"
+                    );
                 }
                 self.log_forensic_error_window();
 
@@ -2029,7 +2046,13 @@ mod macos_vt {
         /// Set from catalog info to avoid heuristic detection that misclassifies
         /// AVCC frames with 256-511 byte NALs (length prefix [0,0,1,X] looks like Annex B).
         is_avcc: bool,
+        /// Consecutive callbacks flagged with RequiredFrameDropped.
+        required_drop_streak: u32,
     }
+
+    /// If this many consecutive decoded callbacks require frame drops, treat as
+    /// a corruption storm and force session recovery.
+    const VT_REQUIRED_DROP_STORM_THRESHOLD: u32 = 36;
 
     // SAFETY: VTDecompressionSession is designed for multi-threaded use.
     // The session pointer is only accessed through synchronized methods.
@@ -2219,6 +2242,7 @@ mod macos_vt {
                 height,
                 codec,
                 is_avcc,
+                required_drop_streak: 0,
             })
         }
 
@@ -2579,9 +2603,27 @@ mod macos_vt {
             match decoded {
                 Some(frame) => {
                     if frame.required_frame_dropped {
+                        self.required_drop_streak = self.required_drop_streak.saturating_add(1);
                         tracing::debug!(
-                            "VTDecoder: callback flagged RequiredFrameDropped on decoded frame"
+                            "VTDecoder: callback flagged RequiredFrameDropped on decoded frame (streak={})",
+                            self.required_drop_streak
                         );
+                        if self.required_drop_streak >= VT_REQUIRED_DROP_STORM_THRESHOLD {
+                            let storm_streak = self.required_drop_streak;
+                            // Reset so we don't immediately retrigger every frame if
+                            // callback flags remain noisy for a short window.
+                            self.required_drop_streak = 0;
+                            return Err(VideoError::DecodeFailed(format!(
+                                "VT required-frame-drop storm (streak={})",
+                                storm_streak
+                            )));
+                        }
+                    } else if self.required_drop_streak > 0 {
+                        tracing::debug!(
+                            "VTDecoder: required-frame-drop streak cleared at {}",
+                            self.required_drop_streak
+                        );
+                        self.required_drop_streak = 0;
                     }
 
                     tracing::debug!("VTDecoder: got frame from queue, calling create_gpu_frame");

@@ -405,8 +405,11 @@ pub(crate) async fn run_moq_worker(
 
     let mut waiting_for_valid_idr = idr_gate_enabled;
     let mut idr_gate_groups_seen: u8 = 0;
+    let mut idr_gate_broken_keyframes: u8 = 0;
     const IDR_GATE_MAX_GROUPS: u8 = 3;
     const IDR_GATE_TIMEOUT: Duration = Duration::from_secs(5);
+    const IDR_GATE_BROKEN_KEYFRAME_THRESHOLD: u8 = 2;
+    const IDR_GATE_BROKEN_KEYFRAME_MIN_ELAPSED: Duration = Duration::from_millis(800);
     let idr_gate_hard_failsafe_timeout: Duration =
         Duration::from_secs(MOQ_STARTUP_HARD_FAILSAFE_SECS);
     let mut idr_gate_start: Option<std::time::Instant> = None;
@@ -446,6 +449,7 @@ pub(crate) async fn run_moq_worker(
                             .request_video_resubscribe
                             .swap(false, Ordering::AcqRel)
                         {
+                            idr_gate_broken_keyframes = 0;
                             if !resubscribe_video_track(
                                 &shared,
                                 &hang_consumer,
@@ -545,23 +549,38 @@ pub(crate) async fn run_moq_worker(
                                     idr_gate_groups_seen,
                                 );
                                 waiting_for_valid_idr = false;
+                                idr_gate_broken_keyframes = 0;
                             } else {
                                 if frame.keyframe && !has_idr {
+                                    idr_gate_broken_keyframes =
+                                        idr_gate_broken_keyframes.saturating_add(1);
                                     tracing::warn!(
-                                        "MoQ {}: startup keyframe metadata mismatch (group_keyframe=true, NAL types={:?}, {} bytes)",
+                                        "MoQ {}: startup keyframe metadata mismatch (count={}, group_keyframe=true, NAL types={:?}, {} bytes)",
                                         label,
+                                        idr_gate_broken_keyframes,
                                         &nal_arr[..nal_count],
                                         data.len(),
                                     );
                                 }
 
-                                if timed_out || groups_exhausted || elapsed > idr_gate_hard_failsafe_timeout {
+                                let broken_keyframe_storm = idr_gate_broken_keyframes
+                                    >= IDR_GATE_BROKEN_KEYFRAME_THRESHOLD
+                                    && elapsed >= IDR_GATE_BROKEN_KEYFRAME_MIN_ELAPSED;
+
+                                if timed_out
+                                    || groups_exhausted
+                                    || elapsed > idr_gate_hard_failsafe_timeout
+                                    || broken_keyframe_storm
+                                {
                                     let reason = format!(
-                                        "startup IDR gate timeout (elapsed={}ms, groups_seen={}, groups_exhausted={})",
+                                        "startup IDR gate timeout (elapsed={}ms, groups_seen={}, broken_keyframes={}, groups_exhausted={}, broken_keyframe_storm={})",
                                         elapsed.as_millis(),
                                         idr_gate_groups_seen,
+                                        idr_gate_broken_keyframes,
                                         groups_exhausted,
+                                        broken_keyframe_storm,
                                     );
+                                    idr_gate_broken_keyframes = 0;
                                     if !resubscribe_video_track(
                                         &shared,
                                         &hang_consumer,
@@ -621,6 +640,7 @@ pub(crate) async fn run_moq_worker(
                         }
                     }
                     Ok(None) => {
+                        idr_gate_broken_keyframes = 0;
                         if !resubscribe_video_track(
                             &shared,
                             &hang_consumer,
