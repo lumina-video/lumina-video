@@ -48,6 +48,8 @@
 //! - `seek()` returns an error (live streams don't support seeking)
 //! - `is_eof()` returns true only when the stream actually ends
 
+#[cfg(target_os = "macos")]
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -327,6 +329,9 @@ pub(crate) struct MoqSharedState {
     /// Audio-specific shared state, passed to MoqAudioThread on desktop.
     /// Present on all platforms (non-desktop stays Unavailable).
     pub(crate) audio: Arc<MoqAudioShared>,
+    /// Decoder sets this when it is starved waiting for an IDR after decode errors.
+    /// Worker handles it by re-subscribing the video track.
+    pub(crate) request_video_resubscribe: AtomicBool,
 }
 
 impl MoqSharedState {
@@ -350,6 +355,7 @@ impl MoqSharedState {
             frame_stats: FrameStats::default(),
             transport_protocol: Mutex::new("unknown".to_string()),
             audio: Arc::new(MoqAudioShared::new()),
+            request_video_resubscribe: AtomicBool::new(false),
         }
     }
 
@@ -418,8 +424,8 @@ pub struct MoqDecoder {
     #[cfg(target_os = "macos")]
     is_avcc: bool,
     /// True after 3+ consecutive decode errors; decoder must wait for next IDR
-    /// to resync. Set when `consecutive_decode_errors >= 3`, cleared when an IDR
-    /// or keyframe arrives. The VT session is destroyed when this is set.
+    /// to resync. Cleared only when a real IDR (NAL type 5) arrives.
+    /// The VT session is destroyed on sustained decode failures.
     #[cfg(target_os = "macos")]
     waiting_for_idr_after_error: bool,
     /// Consecutive decode error count. Isolated errors (1-2) skip the frame but
@@ -431,13 +437,57 @@ pub struct MoqDecoder {
     /// True until the one-shot VT session recreation has fired.
     #[cfg(target_os = "macos")]
     needs_session_recreation: bool,
-    /// Set after session destruction; cleared after quiesce delay applied.
-    /// Ensures hardware decoder fully quiesces before new session creation.
+    /// If set, defer VT session (re)creation until this instant.
+    /// This avoids blocking sleeps on decode paths while still enforcing
+    /// a quiesce window after session destruction.
     #[cfg(target_os = "macos")]
-    needs_quiesce_delay: bool,
+    quiesce_until: Option<std::time::Instant>,
     /// Counts VT session creations for lifecycle diagnostics.
     #[cfg(target_os = "macos")]
     vt_session_count: u32,
+    /// Opt-in diagnostics for frame-level forensic logging around decode errors.
+    #[cfg(target_os = "macos")]
+    forensic_enabled: bool,
+    /// Rolling window of most-recent submitted frames (for N-3 context on failure).
+    #[cfg(target_os = "macos")]
+    forensic_recent: VecDeque<ForensicFrameSample>,
+    /// Active post-error capture window (+3 frames after failing frame).
+    #[cfg(target_os = "macos")]
+    forensic_post_error: Option<PostErrorCapture>,
+    /// Monotonic frame sequence number for forensic logs.
+    #[cfg(target_os = "macos")]
+    forensic_seq: u64,
+    /// Approximate group index, incremented on keyframe boundaries.
+    #[cfg(target_os = "macos")]
+    forensic_group_index: u64,
+    /// Start of current "waiting for IDR" starvation window.
+    #[cfg(target_os = "macos")]
+    idr_wait_started_at: Option<std::time::Instant>,
+    /// Number of frames dropped in current IDR starvation window.
+    #[cfg(target_os = "macos")]
+    idr_wait_dropped_frames: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+struct ForensicFrameSample {
+    seq: u64,
+    group_idx: u64,
+    pts_us: u64,
+    size: usize,
+    is_keyframe: bool,
+    hash64: u64,
+    first16: [u8; 16],
+    first16_len: usize,
+    nal_types: [u8; MoqDecoder::MAX_NAL_TYPES],
+    nal_count: usize,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+struct PostErrorCapture {
+    trigger_seq: u64,
+    remaining_after: u8,
 }
 
 impl MoqDecoder {
@@ -497,6 +547,10 @@ impl MoqDecoder {
         });
 
         let initial_volume = config.initial_volume;
+        #[cfg(target_os = "macos")]
+        let forensic_enabled = std::env::var("LUMINA_MOQ_ERROR_FORENSICS")
+            .map(|v| v != "0")
+            .unwrap_or(false);
         Ok(Self {
             url: moq_url,
             config,
@@ -534,9 +588,23 @@ impl MoqDecoder {
             #[cfg(target_os = "macos")]
             needs_session_recreation: true,
             #[cfg(target_os = "macos")]
-            needs_quiesce_delay: false,
+            quiesce_until: None,
             #[cfg(target_os = "macos")]
             vt_session_count: 0,
+            #[cfg(target_os = "macos")]
+            forensic_enabled,
+            #[cfg(target_os = "macos")]
+            forensic_recent: VecDeque::with_capacity(8),
+            #[cfg(target_os = "macos")]
+            forensic_post_error: None,
+            #[cfg(target_os = "macos")]
+            forensic_seq: 0,
+            #[cfg(target_os = "macos")]
+            forensic_group_index: 0,
+            #[cfg(target_os = "macos")]
+            idr_wait_started_at: None,
+            #[cfg(target_os = "macos")]
+            idr_wait_dropped_frames: 0,
         })
     }
 
@@ -724,10 +792,170 @@ impl MoqDecoder {
         if !self.waiting_for_idr_after_error {
             return false;
         }
-        let (types, count) =
-            Self::find_nal_types_for_format(&moq_frame.data, self.h264_nal_length_size, self.is_avcc);
+        let (types, count) = Self::find_nal_types_for_format(
+            &moq_frame.data,
+            self.h264_nal_length_size,
+            self.is_avcc,
+        );
         let is_idr = types[..count].contains(&5);
         !is_idr // only real IDR can clear the resync gate
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fnv1a64(data: &[u8]) -> u64 {
+        // Deterministic lightweight fingerprint for cross-run frame matching.
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for &b in data {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+
+    #[cfg(target_os = "macos")]
+    fn record_forensic_sample(&mut self, moq_frame: &MoqVideoFrame, nal_types: &[u8]) {
+        if !self.forensic_enabled {
+            return;
+        }
+
+        if moq_frame.is_keyframe {
+            self.forensic_group_index = self.forensic_group_index.saturating_add(1);
+        }
+        self.forensic_seq = self.forensic_seq.saturating_add(1);
+
+        let mut first16 = [0u8; 16];
+        let first16_len = moq_frame.data.len().min(16);
+        first16[..first16_len].copy_from_slice(&moq_frame.data[..first16_len]);
+
+        let mut nal_arr = [0u8; Self::MAX_NAL_TYPES];
+        let nal_count = nal_types.len().min(Self::MAX_NAL_TYPES);
+        nal_arr[..nal_count].copy_from_slice(&nal_types[..nal_count]);
+
+        let sample = ForensicFrameSample {
+            seq: self.forensic_seq,
+            group_idx: self.forensic_group_index,
+            pts_us: moq_frame.timestamp_us,
+            size: moq_frame.data.len(),
+            is_keyframe: moq_frame.is_keyframe,
+            hash64: Self::fnv1a64(&moq_frame.data),
+            first16,
+            first16_len,
+            nal_types: nal_arr,
+            nal_count,
+        };
+
+        if self.forensic_recent.len() == 8 {
+            let _ = self.forensic_recent.pop_front();
+        }
+        self.forensic_recent.push_back(sample);
+
+        if let Some(mut post) = self.forensic_post_error {
+            if sample.seq > post.trigger_seq && post.remaining_after > 0 {
+                tracing::warn!(
+                    "MoQ forensic post-error +{}: seq={}, group≈{}, pts={}us, size={}, keyframe={}, hash64={:016x}, nal_types={:?}, first16={:02x?}",
+                    (4 - post.remaining_after) as usize,
+                    sample.seq,
+                    sample.group_idx,
+                    sample.pts_us,
+                    sample.size,
+                    sample.is_keyframe,
+                    sample.hash64,
+                    &sample.nal_types[..sample.nal_count],
+                    &sample.first16[..sample.first16_len]
+                );
+                post.remaining_after -= 1;
+                if post.remaining_after == 0 {
+                    tracing::warn!("MoQ forensic: post-error window capture complete");
+                    self.forensic_post_error = None;
+                } else {
+                    self.forensic_post_error = Some(post);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn log_forensic_error_window(&mut self) {
+        if !self.forensic_enabled {
+            return;
+        }
+        let Some(failing) = self.forensic_recent.back().copied() else {
+            return;
+        };
+
+        tracing::warn!(
+            "MoQ forensic trigger: seq={}, group≈{}, pts={}us, size={}, keyframe={}, hash64={:016x}, nal_types={:?}, first16={:02x?}",
+            failing.seq,
+            failing.group_idx,
+            failing.pts_us,
+            failing.size,
+            failing.is_keyframe,
+            failing.hash64,
+            &failing.nal_types[..failing.nal_count],
+            &failing.first16[..failing.first16_len]
+        );
+
+        for sample in self.forensic_recent.iter().rev().skip(1).take(3).rev() {
+            tracing::warn!(
+                "MoQ forensic pre-error: seq={}, group≈{}, pts={}us, size={}, keyframe={}, hash64={:016x}, nal_types={:?}, first16={:02x?}",
+                sample.seq,
+                sample.group_idx,
+                sample.pts_us,
+                sample.size,
+                sample.is_keyframe,
+                sample.hash64,
+                &sample.nal_types[..sample.nal_count],
+                &sample.first16[..sample.first16_len]
+            );
+        }
+
+        self.forensic_post_error = Some(PostErrorCapture {
+            trigger_seq: failing.seq,
+            remaining_after: 3,
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reset_idr_wait_tracking(&mut self) {
+        self.idr_wait_started_at = None;
+        self.idr_wait_dropped_frames = 0;
+    }
+
+    #[cfg(target_os = "macos")]
+    fn note_idr_wait_progress(&mut self, nal_type: u8, frame_len: usize) {
+        // BBB groups are ~2s. If we keep dropping non-IDR frames for longer than
+        // a group, force a re-subscribe so we can rejoin on a fresh boundary.
+        const IDR_WAIT_MAX: Duration = Duration::from_millis(2500);
+        const IDR_WAIT_MAX_DROPS: u32 = 96;
+
+        let start = self
+            .idr_wait_started_at
+            .get_or_insert_with(std::time::Instant::now);
+        self.idr_wait_dropped_frames = self.idr_wait_dropped_frames.saturating_add(1);
+
+        let elapsed = start.elapsed();
+        if elapsed < IDR_WAIT_MAX && self.idr_wait_dropped_frames < IDR_WAIT_MAX_DROPS {
+            return;
+        }
+
+        if self
+            .shared
+            .request_video_resubscribe
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            tracing::warn!(
+                "MoQ: IDR starvation ({}ms, {} dropped, last_nal_type={}, {} bytes) — requesting video re-subscribe",
+                elapsed.as_millis(),
+                self.idr_wait_dropped_frames,
+                nal_type,
+                frame_len
+            );
+        }
+
+        // Keep reporting at a bounded cadence if starvation persists.
+        self.idr_wait_started_at = Some(std::time::Instant::now());
+        self.idr_wait_dropped_frames = 0;
     }
 
     /// Decodes an encoded frame.
@@ -738,12 +966,17 @@ impl MoqDecoder {
     fn decode_frame(&mut self, moq_frame: &MoqVideoFrame) -> Result<VideoFrame, VideoError> {
         // Initialize VTDecoder lazily
         if self.vt_decoder.is_none() {
-            // If a previous session was just destroyed, apply quiesce delay
-            // to let the hardware decoder fully release before creating a new one.
-            if self.needs_quiesce_delay {
-                self.needs_quiesce_delay = false;
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                tracing::info!("MoQ: VT quiesce delay complete (50ms after error-path destroy)");
+            // If a previous session was just destroyed, enforce a non-blocking
+            // quiesce window before creating a new session.
+            if let Some(quiesce_until) = self.quiesce_until {
+                let now = std::time::Instant::now();
+                if now < quiesce_until {
+                    return Err(VideoError::DecodeFailed(
+                        "Waiting for VT quiesce".to_string(),
+                    ));
+                }
+                self.quiesce_until = None;
+                tracing::info!("MoQ: VT quiesce window complete, creating new session");
             }
             let metadata = self.shared.metadata.lock().clone();
 
@@ -806,8 +1039,13 @@ impl MoqDecoder {
 
         // Check if we're waiting for IDR resync after a decode error
         if self.should_wait_for_idr(moq_frame) {
-            let (t, c) = Self::find_nal_types_for_format(&moq_frame.data, self.h264_nal_length_size, self.is_avcc);
+            let (t, c) = Self::find_nal_types_for_format(
+                &moq_frame.data,
+                self.h264_nal_length_size,
+                self.is_avcc,
+            );
             let nal_type = if c > 0 { t[0] } else { 0 };
+            self.note_idr_wait_progress(nal_type, moq_frame.data.len());
             tracing::debug!(
                 "MoQ: waiting for IDR resync after decode error (got NAL type {}, is_keyframe={}, {} bytes)",
                 nal_type, moq_frame.is_keyframe, moq_frame.data.len()
@@ -817,13 +1055,18 @@ impl MoqDecoder {
                 nal_type
             )));
         }
+        self.reset_idr_wait_tracking();
 
         // Check NAL types for diagnostics and keyframe validation.
         // Use format-aware parsing (self.is_avcc) to avoid data_is_annex_b() heuristic bug.
-        let (nal_types_arr, nal_count) =
-            Self::find_nal_types_for_format(&moq_frame.data, self.h264_nal_length_size, self.is_avcc);
+        let (nal_types_arr, nal_count) = Self::find_nal_types_for_format(
+            &moq_frame.data,
+            self.h264_nal_length_size,
+            self.is_avcc,
+        );
         let nal_types = &nal_types_arr[..nal_count];
         let is_idr = nal_types.contains(&5);
+        self.record_forensic_sample(moq_frame, nal_types);
 
         // One-shot VT session recreation at the second IDR after startup.
         // The initial VT session can produce silently corrupted output (VT
@@ -831,7 +1074,14 @@ impl MoqDecoder {
         // boundary clears the corruption. Requires at least 48 frames decoded
         // (one full group at 24fps) to ensure VT hardware has flushed, and
         // only triggers on real IDR (type 5), not I-frames (type 1).
-        if self.needs_session_recreation && !self.waiting_for_idr_after_error && is_idr {
+        // A/B test: set to false to skip one-shot recreation and isolate
+        // whether mid-session errors are content-dependent or lifecycle-dependent.
+        const ENABLE_ONESHOT_RECREATION: bool = true;
+        if ENABLE_ONESHOT_RECREATION
+            && self.needs_session_recreation
+            && !self.waiting_for_idr_after_error
+            && is_idr
+        {
             if let Some(ref decoder) = self.vt_decoder {
                 let prev_count = decoder.frame_count();
                 // Only trigger after at least one full group (48 frames)
@@ -840,27 +1090,16 @@ impl MoqDecoder {
                     self.needs_session_recreation = false;
                     // Drop triggers: WaitForAsync → Invalidate → CFRelease
                     self.vt_decoder = None;
-                    // Allow hardware decoder to fully quiesce before creating new session.
-                    // Without this delay, the new session may inherit poisoned hardware state.
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    tracing::info!("MoQ: VT quiesce complete (50ms), creating new session");
-                    // Recreate from catalog SPS/PPS so this IDR gets decoded
-                    if let Some(ref desc) = *self.shared.codec_description.lock() {
-                        if let Ok((sps, pps, nal_length_size)) = Self::parse_avcc_box(desc) {
-                            let metadata = self.shared.metadata.lock().clone();
-                            if let Ok(new_decoder) = macos_vt::VTDecoder::new_h264(
-                                &sps, &pps, metadata.width, metadata.height, true,
-                            ) {
-                                self.vt_decoder = Some(new_decoder);
-                                self.h264_nal_length_size = nal_length_size;
-                                self.vt_session_count += 1;
-                                tracing::info!(
-                                    "MoQ: one-shot VT session #{} recreation at IDR ({} bytes, {} frames on previous session)",
-                                    self.vt_session_count, moq_frame.data.len(), prev_count
-                                );
-                            }
-                        }
-                    }
+                    self.quiesce_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(50));
+                    tracing::info!(
+                        "MoQ: one-shot VT recreation scheduled after quiesce window ({} bytes, {} frames on previous session)",
+                        moq_frame.data.len(),
+                        prev_count
+                    );
+                    return Err(VideoError::DecodeFailed(
+                        "Waiting for VT quiesce".to_string(),
+                    ));
                 }
             }
         }
@@ -885,12 +1124,15 @@ impl MoqDecoder {
                 );
             }
 
-            // First frame: accept if IDR (NAL 5) OR if hang marks it as keyframe (NAL 1 I-frame).
-            // moq-lite guarantees group-boundary joins with keyframes, so is_keyframe=true
-            // from hang is trustworthy — the frame is an intra-coded I-frame even if not IDR.
-            if frame_count == 0 && !is_idr && !moq_frame.is_keyframe {
+            // First submitted frame must be a real IDR. Trusting metadata-only keyframe
+            // flags (with non-IDR NAL 1 payloads) can poison VT reference state.
+            if frame_count == 0 && !is_idr {
+                // New VT sessions must begin on an IDR access unit.
+                // Enter the normal IDR-wait path so this is treated as non-fatal,
+                // counted as dropped-waiting-IDR, and eligible for bounded re-subscribe.
+                self.waiting_for_idr_after_error = true;
                 tracing::warn!(
-                    "MoQ: dropping frame #{} — not a keyframe (NAL types={:?}, is_keyframe={}, {} bytes, format={})",
+                    "MoQ: dropping frame #{} — first frame is not IDR (NAL types={:?}, is_keyframe={}, {} bytes, format={})",
                     frame_count,
                     nal_types,
                     moq_frame.is_keyframe,
@@ -898,7 +1140,7 @@ impl MoqDecoder {
                     if self.is_avcc { "AVCC" } else { "AnnexB" },
                 );
                 return Err(VideoError::DecodeFailed(format!(
-                    "Waiting for keyframe (got NAL types {:?})",
+                    "Waiting for IDR frame (got NAL types {:?})",
                     nal_types
                 )));
             }
@@ -910,20 +1152,29 @@ impl MoqDecoder {
             if self.waiting_for_idr_after_error && is_idr {
                 self.waiting_for_idr_after_error = false;
                 self.consecutive_decode_errors = 0;
+                self.reset_idr_wait_tracking();
                 tracing::info!(
                     "MoQ: received real IDR after error, will recreate VT session (session={})",
-                    if self.vt_decoder.is_some() { "exists" } else { "None" }
+                    if self.vt_decoder.is_some() {
+                        "exists"
+                    } else {
+                        "None"
+                    }
                 );
             }
         }
 
         // Decode the frame using VTDecoder
+        let vt_is_keyframe = is_idr;
+        if moq_frame.is_keyframe && !is_idr {
+            tracing::warn!(
+                "MoQ: keyframe metadata mismatch (is_keyframe=true but NAL types={:?}); submitting as non-keyframe",
+                nal_types
+            );
+        }
+
         let decode_result = if let Some(ref mut decoder) = self.vt_decoder {
-            decoder.decode_frame(
-                &moq_frame.data,
-                moq_frame.timestamp_us,
-                moq_frame.is_keyframe,
-            )
+            decoder.decode_frame(&moq_frame.data, moq_frame.timestamp_us, vt_is_keyframe)
         } else {
             return Err(VideoError::DecodeFailed(
                 "VTDecoder not initialized".to_string(),
@@ -958,16 +1209,58 @@ impl MoqDecoder {
             )),
             Err(e) => {
                 self.consecutive_decode_errors += 1;
-                let total_errors = self.shared.frame_stats.decode_errors.load(std::sync::atomic::Ordering::Relaxed) + 1;
+                self.waiting_for_idr_after_error = true;
+                let total_errors = self
+                    .shared
+                    .frame_stats
+                    .decode_errors
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                self.log_forensic_error_window();
+
+                // Log NAL header bytes for forensic analysis of failing frames
+                let data = &moq_frame.data;
+                let nal_header_hex = if data.len() >= 16 {
+                    format!("{:02x?}", &data[..16])
+                } else {
+                    format!("{:02x?}", data)
+                };
+                // Parse first NAL type from AVCC (4-byte length prefix)
+                let first_nal_type = if self.is_avcc {
+                    match data.get(self.h264_nal_length_size) {
+                        Some(&nal_byte) => {
+                            format!(
+                                "nal_type={} ({})",
+                                nal_byte & 0x1f,
+                                match nal_byte & 0x1f {
+                                    1 => "non-IDR slice",
+                                    5 => "IDR slice",
+                                    6 => "SEI",
+                                    7 => "SPS",
+                                    8 => "PPS",
+                                    _ => "other",
+                                }
+                            )
+                        }
+                        None => "unknown".to_string(),
+                    }
+                } else {
+                    "unknown".to_string()
+                };
+                tracing::warn!(
+                    "MoQ: failing frame forensics: size={}, is_keyframe={}, pts={}us, {}, header={}",
+                    data.len(), moq_frame.is_keyframe, moq_frame.timestamp_us,
+                    first_nal_type, nal_header_hex
+                );
 
                 if self.consecutive_decode_errors >= 3 {
                     // 3+ consecutive errors: destroy VT session and wait for IDR resync.
                     // prepare_for_idr_resync() only clears the output queue — VT's
                     // internal DPB retains stale reference frames. Full session
                     // recreation from catalog SPS/PPS is needed for clean recovery.
-                    self.waiting_for_idr_after_error = true;
                     self.vt_decoder = None; // Drop: WaitForAsync → Invalidate → CFRelease
-                    self.needs_quiesce_delay = true;
+                    self.quiesce_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(50));
                     tracing::warn!(
                         "MoQ: VT decode error #{} (consecutive={}), destroyed session for IDR resync: {}",
                         total_errors, self.consecutive_decode_errors, e
@@ -977,7 +1270,9 @@ impl MoqDecoder {
                     // VT can recover from transient errors on the next frame.
                     tracing::warn!(
                         "MoQ: VT decode error #{} (consecutive={}), skipping frame: {}",
-                        total_errors, self.consecutive_decode_errors, e
+                        total_errors,
+                        self.consecutive_decode_errors,
+                        e
                     );
                 }
                 Err(e)
@@ -1280,6 +1575,7 @@ impl VideoDecoderBackend for MoqDecoder {
                     Err(VideoError::DecodeFailed(msg))
                         if msg.contains("Waiting for keyframe")
                             || msg.contains("Waiting for IDR frame")
+                            || msg.contains("Waiting for VT quiesce")
                             || msg.contains("no frame decoded") =>
                     {
                         // Track frames dropped waiting for IDR
@@ -1344,10 +1640,7 @@ impl VideoDecoderBackend for MoqDecoder {
     }
 
     fn handles_audio_internally(&self) -> bool {
-        self.shared
-            .audio
-            .internal_audio_ready
-            .load(Ordering::Relaxed)
+        self.shared.audio.moq_audio_handle.lock().is_some()
     }
 
     fn audio_handle(&self) -> Option<super::audio::AudioHandle> {
@@ -1387,7 +1680,7 @@ mod macos_vt {
     use std::collections::VecDeque;
     use std::ffi::c_void;
     use std::ptr;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
     // ==========================================================================
     // Raw FFI declarations for VideoToolbox and CoreMedia
@@ -1618,6 +1911,8 @@ mod macos_vt {
         decoded_frames: ParkingMutex<VecDeque<DecodedVTFrame>>,
         /// Error flag set by callback on decode failure
         decode_error: AtomicBool,
+        /// OSStatus from last callback error (0 = no error)
+        decode_error_status: AtomicI32,
         /// Frame counter for debugging
         frame_count: AtomicU32,
     }
@@ -1627,6 +1922,7 @@ mod macos_vt {
             Self {
                 decoded_frames: ParkingMutex::new(VecDeque::with_capacity(8)),
                 decode_error: AtomicBool::new(false),
+                decode_error_status: AtomicI32::new(0),
                 frame_count: AtomicU32::new(0),
             }
         }
@@ -2183,10 +2479,19 @@ mod macos_vt {
             }
 
             // Check for decode errors from callback
-            if self.callback_state.decode_error.load(Ordering::Acquire) {
-                return Err(VideoError::DecodeFailed(
-                    "VT decode callback reported error".to_string(),
-                ));
+            if self
+                .callback_state
+                .decode_error
+                .swap(false, Ordering::AcqRel)
+            {
+                let cb_status = self
+                    .callback_state
+                    .decode_error_status
+                    .swap(0, Ordering::Relaxed);
+                return Err(VideoError::DecodeFailed(format!(
+                    "VT decode callback error: OSStatus {}",
+                    cb_status
+                )));
             }
 
             // Pop decoded frame from callback queue
@@ -2404,8 +2709,7 @@ mod macos_vt {
                     // Drain any in-flight async decode callbacks before invalidating.
                     // Without this, Invalidate can fire while a callback is still writing
                     // to callback_state, and the hardware decoder may not fully quiesce.
-                    let wait_status =
-                        VTDecompressionSessionWaitForAsynchronousFrames(self.session);
+                    let wait_status = VTDecompressionSessionWaitForAsynchronousFrames(self.session);
                     if wait_status != 0 {
                         tracing::warn!(
                             "VTDecoder: WaitForAsyncFrames in drop returned OSStatus {}",
@@ -2450,6 +2754,9 @@ mod macos_vt {
 
         if status != 0 {
             tracing::error!("VT decode callback error: OSStatus {}", status);
+            callback_state
+                .decode_error_status
+                .store(status, Ordering::Release);
             callback_state.decode_error.store(true, Ordering::Release);
             return;
         }
@@ -3068,10 +3375,7 @@ pub mod android {
         }
 
         fn handles_audio_internally(&self) -> bool {
-            self.shared
-                .audio
-                .internal_audio_ready
-                .load(Ordering::Relaxed)
+            self.shared.audio.moq_audio_handle.lock().is_some()
         }
 
         fn audio_handle(&self) -> Option<super::audio::AudioHandle> {
@@ -3952,10 +4256,7 @@ impl VideoDecoderBackend for MoqGStreamerDecoder {
     }
 
     fn handles_audio_internally(&self) -> bool {
-        self.shared
-            .audio
-            .internal_audio_ready
-            .load(Ordering::Relaxed)
+        self.shared.audio.moq_audio_handle.lock().is_some()
     }
 
     fn audio_handle(&self) -> Option<super::audio::AudioHandle> {

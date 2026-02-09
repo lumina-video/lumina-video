@@ -207,6 +207,73 @@ struct CatalogResult {
     selected_video_description: Option<bytes::Bytes>,
 }
 
+/// Re-subscribe video (and audio, if still active) after stream end or decoder-requested recovery.
+fn resubscribe_video_track(
+    shared: &Arc<MoqSharedState>,
+    hang_consumer: &hang::BroadcastConsumer,
+    video_track: &moq_lite::Track,
+    max_latency: Duration,
+    audio_track_for_resub: &Option<moq_lite::Track>,
+    audio_consumer_opt: &mut Option<hang::TrackConsumer>,
+    moq_audio_thread_opt: &Option<MoqAudioThread>,
+    video_consumer: &mut hang::TrackConsumer,
+    idr_gate_enabled: bool,
+    waiting_for_valid_idr: &mut bool,
+    idr_gate_groups_seen: &mut u8,
+    idr_gate_start: &mut Option<std::time::Instant>,
+    resubscribe_count: &mut u32,
+    max_resubscribes: u32,
+    label: &str,
+    reason: &str,
+) -> bool {
+    *resubscribe_count += 1;
+    if *resubscribe_count > max_resubscribes {
+        tracing::info!(
+            "MoQ {}: Video stream ending after {} re-subscribes (reason={})",
+            label,
+            *resubscribe_count - 1,
+            reason,
+        );
+        shared.frame_stats.log_summary(label);
+        shared.set_state(MoqDecoderState::Ended);
+        shared.eof_reached.store(true, Ordering::Relaxed);
+        return false;
+    }
+
+    tracing::warn!(
+        "MoQ {}: Re-subscribing video ({}/{}) — {}",
+        label,
+        *resubscribe_count,
+        max_resubscribes,
+        reason,
+    );
+
+    *video_consumer = hang_consumer.subscribe(video_track, max_latency);
+
+    // Re-subscribe audio only if the audio thread is still alive.
+    if audio_consumer_opt.is_none() && moq_audio_thread_opt.is_some() {
+        if let Some(at) = audio_track_for_resub.as_ref() {
+            *audio_consumer_opt = Some(hang_consumer.subscribe(at, max_latency));
+            tracing::info!("MoQ {}: Audio track re-subscribed", label);
+        }
+    } else if audio_consumer_opt.is_none() {
+        tracing::warn!(
+            "MoQ {}: Audio thread not alive, skipping audio re-subscribe",
+            label,
+        );
+    }
+
+    // Reset startup gate and A/V startup sync after any video re-subscribe.
+    if idr_gate_enabled {
+        *waiting_for_valid_idr = true;
+        *idr_gate_groups_seen = 0;
+        *idr_gate_start = None;
+        shared.audio.video_started.store(false, Ordering::Relaxed);
+    }
+
+    true
+}
+
 pub(crate) async fn run_moq_worker(
     shared: Arc<MoqSharedState>,
     url: MoqUrl,
@@ -320,7 +387,6 @@ pub(crate) async fn run_moq_worker(
     let idr_gate_hard_failsafe_timeout: Duration =
         Duration::from_secs(MOQ_STARTUP_HARD_FAILSAFE_SECS);
     let mut idr_gate_start: Option<std::time::Instant> = None;
-    let mut logged_groups_exhausted = false;
 
     // Note: video_started is set by the decoder on first successful decode,
     // NOT here. This ensures audio only starts after a confirmed good frame.
@@ -343,12 +409,40 @@ pub(crate) async fn run_moq_worker(
     let mut stats_log_counter = 0u64;
     let mut resubscribe_count: u32 = 0;
     const MAX_RESUBSCRIBES: u32 = 5;
+
     loop {
         tokio::select! {
             // No biased — fair scheduling prevents audio starvation
             video_result = video_consumer.read_frame() => {
                 match video_result {
                     Ok(Some(frame)) => {
+                        if shared
+                            .request_video_resubscribe
+                            .swap(false, Ordering::AcqRel)
+                        {
+                            if !resubscribe_video_track(
+                                &shared,
+                                &hang_consumer,
+                                &video_track,
+                                cat.max_latency,
+                                &audio_track_for_resub,
+                                &mut audio_consumer_opt,
+                                &moq_audio_thread_opt,
+                                &mut video_consumer,
+                                idr_gate_enabled,
+                                &mut waiting_for_valid_idr,
+                                &mut idr_gate_groups_seen,
+                                &mut idr_gate_start,
+                                &mut resubscribe_count,
+                                MAX_RESUBSCRIBES,
+                                label,
+                                "decoder requested IDR starvation recovery",
+                            ) {
+                                break;
+                            }
+                            continue;
+                        }
+
                         let recv_count =
                             shared.frame_stats.received.fetch_add(1, Ordering::Relaxed) + 1;
 
@@ -412,7 +506,7 @@ pub(crate) async fn run_moq_worker(
                             let has_idr = nal_arr[..nal_count].contains(&5);
 
                             if frame.keyframe && has_idr {
-                                // Best case: real IDR at group boundary
+                                // Best case: real IDR at group boundary.
                                 tracing::info!(
                                     "MoQ {}: IDR gate cleared — real IDR at {}ms (groups_seen={})",
                                     label,
@@ -420,41 +514,46 @@ pub(crate) async fn run_moq_worker(
                                     idr_gate_groups_seen,
                                 );
                                 waiting_for_valid_idr = false;
-                            } else if frame.keyframe && timed_out {
-                                tracing::warn!(
-                                    "MoQ {}: startup IDR timeout at {}ms (groups_seen={}, groups_exhausted={}); accepting non-IDR keyframe",
-                                    label,
-                                    elapsed.as_millis(),
-                                    idr_gate_groups_seen,
-                                    groups_exhausted,
-                                );
-                                waiting_for_valid_idr = false;
-                            } else if frame.keyframe && groups_exhausted {
-                                // Seen enough groups without IDR — accept this keyframe
-                                // to avoid indefinite stall. The decoder can handle
-                                // non-IDR keyframes (I-frames) for initial decode.
-                                tracing::warn!(
-                                    "MoQ {}: IDR gate cleared — groups exhausted ({} groups, {}ms); accepting non-IDR keyframe",
-                                    label,
-                                    idr_gate_groups_seen,
-                                    elapsed.as_millis(),
-                                );
-                                waiting_for_valid_idr = false;
-                            } else if timed_out && !frame.keyframe && idr_gate_groups_seen > 0 {
-                                tracing::warn!(
-                                    "MoQ {}: startup IDR gate failsafe after {}ms with no usable keyframe; accepting raw frame",
-                                    label,
-                                    elapsed.as_millis(),
-                                );
-                                waiting_for_valid_idr = false;
-                            } else if elapsed > idr_gate_hard_failsafe_timeout {
-                                tracing::warn!(
-                                    "MoQ {}: startup IDR hard failsafe after {}ms with no keyframe boundaries; forcing decode start",
-                                    label,
-                                    elapsed.as_millis(),
-                                );
-                                waiting_for_valid_idr = false;
                             } else {
+                                if frame.keyframe && !has_idr {
+                                    tracing::warn!(
+                                        "MoQ {}: startup keyframe metadata mismatch (group_keyframe=true, NAL types={:?}, {} bytes)",
+                                        label,
+                                        &nal_arr[..nal_count],
+                                        data.len(),
+                                    );
+                                }
+
+                                if timed_out || groups_exhausted || elapsed > idr_gate_hard_failsafe_timeout {
+                                    let reason = format!(
+                                        "startup IDR gate timeout (elapsed={}ms, groups_seen={}, groups_exhausted={})",
+                                        elapsed.as_millis(),
+                                        idr_gate_groups_seen,
+                                        groups_exhausted,
+                                    );
+                                    if !resubscribe_video_track(
+                                        &shared,
+                                        &hang_consumer,
+                                        &video_track,
+                                        cat.max_latency,
+                                        &audio_track_for_resub,
+                                        &mut audio_consumer_opt,
+                                        &moq_audio_thread_opt,
+                                        &mut video_consumer,
+                                        idr_gate_enabled,
+                                        &mut waiting_for_valid_idr,
+                                        &mut idr_gate_groups_seen,
+                                        &mut idr_gate_start,
+                                        &mut resubscribe_count,
+                                        MAX_RESUBSCRIBES,
+                                        label,
+                                        &reason,
+                                    ) {
+                                        break;
+                                    }
+                                    continue;
+                                }
+
                                 shared
                                     .frame_stats
                                     .skipped_startup_frames
@@ -486,54 +585,25 @@ pub(crate) async fn run_moq_worker(
                         }
                     }
                     Ok(None) => {
-                        resubscribe_count += 1;
-                        if resubscribe_count > MAX_RESUBSCRIBES {
-                            tracing::info!(
-                                "MoQ {}: Video track ended after {} re-subscribes",
-                                label,
-                                resubscribe_count - 1,
-                            );
-                            shared.frame_stats.log_summary(label);
-                            shared.set_state(MoqDecoderState::Ended);
-                            shared.eof_reached.store(true, Ordering::Relaxed);
-                            break;
-                        }
-                        tracing::warn!(
-                            "MoQ {}: Video track ended, re-subscribing ({}/{})",
-                            label,
-                            resubscribe_count,
+                        if !resubscribe_video_track(
+                            &shared,
+                            &hang_consumer,
+                            &video_track,
+                            cat.max_latency,
+                            &audio_track_for_resub,
+                            &mut audio_consumer_opt,
+                            &moq_audio_thread_opt,
+                            &mut video_consumer,
+                            idr_gate_enabled,
+                            &mut waiting_for_valid_idr,
+                            &mut idr_gate_groups_seen,
+                            &mut idr_gate_start,
+                            &mut resubscribe_count,
                             MAX_RESUBSCRIBES,
-                        );
-                        video_consumer =
-                            hang_consumer.subscribe(&video_track, cat.max_latency);
-                        // Re-subscribe audio only if the audio thread is still alive.
-                        // If the thread exited (sender dropped), resubscribing would
-                        // fill a dead channel.
-                        if audio_consumer_opt.is_none() && moq_audio_thread_opt.is_some() {
-                            if let Some(ref at) = audio_track_for_resub {
-                                audio_consumer_opt =
-                                    Some(hang_consumer.subscribe(at, cat.max_latency));
-                                tracing::info!(
-                                    "MoQ {}: Audio track re-subscribed",
-                                    label,
-                                );
-                            }
-                        } else if audio_consumer_opt.is_none() {
-                            tracing::warn!(
-                                "MoQ {}: Audio thread not alive, skipping audio re-subscribe",
-                                label,
-                            );
-                        }
-                        // Reset IDR gate for the new subscription
-                        if idr_gate_enabled {
-                            waiting_for_valid_idr = true;
-                            idr_gate_groups_seen = 0;
-                            idr_gate_start = None;
-                            logged_groups_exhausted = false;
-                            shared
-                                .audio
-                                .video_started
-                                .store(false, Ordering::Relaxed);
+                            label,
+                            "video track ended",
+                        ) {
+                            break;
                         }
                         continue;
                     }
