@@ -210,7 +210,12 @@ impl Drop for MoqAudioThread {
             *status = MoqAudioStatus::Unavailable;
         }
         drop(status);
-        *self.audio_shared.moq_audio_handle.lock() = None;
+        if let Some(handle) = self.audio_shared.moq_audio_handle.lock().as_ref() {
+            handle.set_available(false);
+            handle.clear_playback_epoch();
+            handle.reset_samples_played();
+            handle.clear_audio_base_pts();
+        }
     }
 }
 
@@ -249,7 +254,7 @@ fn moq_audio_thread_main(
             audio_shared
                 .internal_audio_ready
                 .store(false, Ordering::Relaxed);
-            *audio_shared.moq_audio_handle.lock() = None;
+            audio_handle.set_available(false);
             return;
         }
     };
@@ -263,7 +268,7 @@ fn moq_audio_thread_main(
                 audio_shared
                     .internal_audio_ready
                     .store(false, Ordering::Relaxed);
-                *audio_shared.moq_audio_handle.lock() = None;
+                audio_handle.set_available(false);
                 return;
             }
         };
@@ -329,6 +334,9 @@ fn moq_audio_thread_main(
             player.queue_samples(samples);
         }
 
+        // Advertise audio availability once playback is actually starting.
+        // This avoids exposing a "present but silent" clock during pre-buffer.
+        audio_handle.set_available(true);
         audio_shared
             .internal_audio_ready
             .store(true, Ordering::Relaxed);
@@ -388,7 +396,10 @@ fn moq_audio_thread_main(
     audio_shared
         .internal_audio_ready
         .store(false, Ordering::Relaxed);
-    *audio_shared.moq_audio_handle.lock() = None;
+    audio_handle.set_available(false);
+    audio_handle.clear_playback_epoch();
+    audio_handle.reset_samples_played();
+    audio_handle.clear_audio_base_pts();
 
     let mut status = audio_shared.audio_status.lock();
     if *status != MoqAudioStatus::Error {

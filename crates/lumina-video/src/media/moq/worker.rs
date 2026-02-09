@@ -1118,8 +1118,22 @@ fn setup_audio(
     let (tx, rx) = crossbeam_channel::bounded(config.audio_buffer_capacity);
     let live_sender = LiveEdgeSender::new(tx, rx.clone());
 
-    let audio_handle = crate::media::audio::AudioHandle::new();
-    *shared.audio.moq_audio_handle.lock() = Some(audio_handle.clone());
+    // Reuse a stable shared handle so scheduler and audio thread observe the same clock state.
+    let audio_handle = {
+        let mut slot = shared.audio.moq_audio_handle.lock();
+        if let Some(existing) = slot.clone() {
+            existing
+        } else {
+            let handle = crate::media::audio::AudioHandle::new();
+            *slot = Some(handle.clone());
+            handle
+        }
+    };
+    audio_handle.set_available(false);
+    audio_handle.clear_playback_epoch();
+    audio_handle.reset_samples_played();
+    audio_handle.clear_audio_base_pts();
+    audio_handle.clear_stream_pts_offset();
 
     match MoqAudioThread::spawn(
         rx,
@@ -1142,7 +1156,7 @@ fn setup_audio(
         Err(e) => {
             tracing::warn!("MoQ {}: Failed to start audio thread: {e}", label);
             *shared.audio.audio_status.lock() = MoqAudioStatus::Error;
-            *shared.audio.moq_audio_handle.lock() = None;
+            audio_handle.set_available(false);
             (None, None, None)
         }
     }
@@ -1197,7 +1211,12 @@ async fn teardown_audio(
             .audio
             .internal_audio_ready
             .store(false, Ordering::Relaxed);
-        *shared_for_teardown.audio.moq_audio_handle.lock() = None;
+        if let Some(handle) = shared_for_teardown.audio.moq_audio_handle.lock().as_ref() {
+            handle.set_available(false);
+            handle.clear_playback_epoch();
+            handle.reset_samples_played();
+            handle.clear_audio_base_pts();
+        }
         {
             let mut status = shared_for_teardown.audio.audio_status.lock();
             if *status == MoqAudioStatus::Running

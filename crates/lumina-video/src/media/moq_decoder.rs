@@ -335,7 +335,11 @@ pub(crate) struct MoqSharedState {
 }
 
 impl MoqSharedState {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(enable_audio: bool) -> Self {
+        let audio = Arc::new(MoqAudioShared::new());
+        if enable_audio {
+            *audio.moq_audio_handle.lock() = Some(super::audio::AudioHandle::new());
+        }
         Self {
             state: Mutex::new(MoqDecoderState::Disconnected),
             error_message: Mutex::new(None),
@@ -354,7 +358,7 @@ impl MoqSharedState {
             codec_description: Mutex::new(None),
             frame_stats: FrameStats::default(),
             transport_protocol: Mutex::new("unknown".to_string()),
-            audio: Arc::new(MoqAudioShared::new()),
+            audio,
             request_video_resubscribe: AtomicBool::new(false),
         }
     }
@@ -525,7 +529,7 @@ impl MoqDecoder {
         };
 
         // Create shared state
-        let shared = Arc::new(MoqSharedState::new());
+        let shared = Arc::new(MoqSharedState::new(config.enable_audio));
 
         // Create channel for frames (bounded to limit memory usage)
         let (frame_tx, frame_rx) = async_channel::bounded(30);
@@ -2962,7 +2966,7 @@ pub mod android {
                 }
             };
 
-            let shared = Arc::new(MoqSharedState::new());
+            let shared = Arc::new(MoqSharedState::new(config.enable_audio));
             let (nal_tx, nal_rx) = async_channel::bounded(60); // Larger buffer for NAL units
 
             // Generate unique player ID for frame queue isolation
@@ -3578,7 +3582,7 @@ impl MoqGStreamerDecoder {
         };
 
         // Create shared state
-        let shared = Arc::new(MoqSharedState::new());
+        let shared = Arc::new(MoqSharedState::new(config.enable_audio));
 
         // Create channel for NAL units (bounded to limit memory usage)
         let (nal_tx, nal_rx) = async_channel::bounded(60);
@@ -4302,7 +4306,7 @@ mod tests {
 
     #[test]
     fn test_shared_state() {
-        let shared = MoqSharedState::new();
+        let shared = MoqSharedState::new(false);
         assert_eq!(*shared.state.lock(), MoqDecoderState::Disconnected);
         assert!(!shared.eof_reached.load(Ordering::Relaxed));
 

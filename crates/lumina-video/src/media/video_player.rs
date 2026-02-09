@@ -580,6 +580,12 @@ impl VideoPlayer {
                 // Check at RUNTIME if decoder handles audio internally
                 // This allows FFmpeg fallback on macOS/Linux to still get FFmpeg audio
                 let uses_native_audio = decoder.handles_audio_internally();
+                #[cfg(target_os = "macos")]
+                #[cfg(feature = "moq")]
+                let is_moq = super::moq_decoder::MoqDecoder::is_moq_url(&self.url);
+                #[cfg(target_os = "macos")]
+                #[cfg(not(feature = "moq"))]
+                let is_moq = false;
 
                 // Extract Android player ID for per-player frame queue routing
                 #[cfg(target_os = "android")]
@@ -596,6 +602,11 @@ impl VideoPlayer {
                     if let Some(ref ah) = decoder_audio_handle {
                         self.audio_handle = ah.clone();
                     }
+                    #[cfg(target_os = "macos")]
+                    if !is_moq {
+                        self.audio_handle.set_available(true);
+                    }
+                    #[cfg(not(target_os = "macos"))]
                     self.audio_handle.set_available(true);
                     self.scheduler.set_audio_handle(self.audio_handle.clone());
                     tracing::info!("Native audio enabled (decoder handles audio internally)");
@@ -626,11 +637,6 @@ impl VideoPlayer {
                 // AND this is not a MoQ URL (MoQ handles audio via its own pipeline).
                 #[cfg(target_os = "macos")]
                 {
-                    #[cfg(feature = "moq")]
-                    let is_moq = super::moq_decoder::MoqDecoder::is_moq_url(&self.url);
-                    #[cfg(not(feature = "moq"))]
-                    let is_moq = false;
-
                     if !uses_native_audio && !is_moq {
                         if let Some(audio_thread) = AudioThread::new(&self.url, metadata.start_time)
                         {

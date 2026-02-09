@@ -991,6 +991,10 @@ const REJECT_BURST_WINDOW: Duration = Duration::from_millis(140);
 const REJECT_BURST_THRESHOLD: u32 = 8;
 /// Duration to keep elevated tolerance during a detected burst.
 const REJECT_BURST_TOLERANCE_HOLD: Duration = Duration::from_secs(2);
+/// How long to wait for audio clock movement before treating timing as "started".
+const AUDIO_CLOCK_START_GRACE: Duration = Duration::from_secs(2);
+/// Minimum interval between repeated audio-clock-zero diagnostics.
+const AUDIO_ZERO_DIAG_COOLDOWN: Duration = Duration::from_secs(2);
 /// Larger gaps are treated as stale and dropped.
 const STALE_GAP_THRESHOLD: Duration = Duration::from_secs(10);
 /// If repeated forced-resync attempts fail in one reject window, drop one head frame.
@@ -1039,6 +1043,8 @@ pub struct FrameScheduler {
     reject_burst_count: u32,
     /// Elevated tolerance window to break repeated reject thrash.
     burst_tolerance_until: Option<std::time::Instant>,
+    /// Last time we logged detailed "audio clock still zero" diagnostics.
+    last_audio_zero_diag: Option<std::time::Instant>,
 }
 
 impl FrameScheduler {
@@ -1065,6 +1071,7 @@ impl FrameScheduler {
             last_reject_window_start: None,
             reject_burst_count: 0,
             burst_tolerance_until: None,
+            last_audio_zero_diag: None,
         }
     }
 
@@ -1095,12 +1102,14 @@ impl FrameScheduler {
             last_reject_window_start: None,
             reject_burst_count: 0,
             burst_tolerance_until: None,
+            last_audio_zero_diag: None,
         }
     }
 
     /// Sets the audio handle for sync tracking.
     pub fn set_audio_handle(&mut self, audio_handle: AudioHandle) {
         self.audio_handle = Some(audio_handle);
+        self.last_audio_zero_diag = None;
         self.sync_metrics.set_using_audio_clock(true);
     }
 
@@ -1313,9 +1322,55 @@ impl FrameScheduler {
                 if !h.is_available() {
                     return true;
                 }
-                h.position_for_sync() > Duration::ZERO
+                if h.position_for_sync() > Duration::ZERO {
+                    return true;
+                }
+                self.playback_start_time
+                    .map(|t| t.elapsed() >= AUDIO_CLOCK_START_GRACE)
+                    .unwrap_or(false)
             })
             .unwrap_or(true)
+    }
+
+    fn maybe_log_audio_zero_diag(
+        &mut self,
+        now: std::time::Instant,
+        current_pos: Duration,
+        next_pts: Duration,
+        gap: Duration,
+        ahead_tolerance: Duration,
+    ) {
+        let Some(audio) = self.audio_handle.clone() else {
+            return;
+        };
+        let sync_pos = audio.position_for_sync();
+        if sync_pos > Duration::ZERO {
+            return;
+        }
+        if self
+            .last_audio_zero_diag
+            .map(|last| now.duration_since(last) < AUDIO_ZERO_DIAG_COOLDOWN)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        self.last_audio_zero_diag = Some(now);
+        let raw_pos = audio.position();
+        let samples_played = audio.samples_played();
+        tracing::warn!(
+            "get_next_frame: audio clock still zero during reject window (current_pos={:?}, next_pts={:?}, gap={}ms, tolerance={}ms, audio_available={}, epoch_set={}, raw_audio_pos={:?}, sync_audio_pos={:?}, samples_played={}, samples_ms={}, offset_us={})",
+            current_pos,
+            next_pts,
+            gap.as_millis(),
+            ahead_tolerance.as_millis(),
+            audio.is_available(),
+            audio.playback_epoch().is_some(),
+            raw_pos,
+            sync_pos,
+            samples_played,
+            audio.samples_played_duration().as_millis(),
+            audio.stream_pts_offset_us()
+        );
     }
 
     fn compute_ahead_tolerance(
@@ -1475,6 +1530,15 @@ impl FrameScheduler {
                         audio_pos,
                         self.seek_generation
                     );
+                    if audio_pos == Duration::ZERO {
+                        self.maybe_log_audio_zero_diag(
+                            now,
+                            current_pos,
+                            next_pts,
+                            gap,
+                            ahead_tolerance,
+                        );
+                    }
                 }
 
                 let near_boundary = audio_started
