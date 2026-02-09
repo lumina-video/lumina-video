@@ -1168,7 +1168,7 @@ impl MoqDecoder {
         // only triggers on real IDR (type 5), not I-frames (type 1).
         // A/B test: set to false to skip one-shot recreation and isolate
         // whether mid-session errors are content-dependent or lifecycle-dependent.
-        const ENABLE_ONESHOT_RECREATION: bool = false;
+        const ENABLE_ONESHOT_RECREATION: bool = true;
         if ENABLE_ONESHOT_RECREATION
             && self.needs_session_recreation
             && !self.waiting_for_idr_after_error

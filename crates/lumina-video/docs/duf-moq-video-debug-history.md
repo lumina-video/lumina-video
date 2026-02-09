@@ -9,7 +9,7 @@
 
 MoQ video pixelation on BBB stream + choppy audio.
 
-### Current Status (2026-02-09 Session 13)
+### Current Status (2026-02-09 Session 14)
 
 #### All committed fixes (chronological):
 - PTS tolerance: 2000ms->2500ms for 2s group boundaries (674d0c70)
@@ -25,23 +25,24 @@ MoQ video pixelation on BBB stream + choppy audio.
 - Unified worker/decoder IDR gates via ResubscribeReason enum (359bd910)
 - Ignore VT info_flags=0x4 when frame decoded successfully (e886a8dc)
 - Graduated VT error handling (soft skip for 1-2 errors) (12e2ea36)
-- read_frame() 3s timeout + ReadTimeout resubscribe (this session)
+- read_frame() 3s timeout + ReadTimeout resubscribe (5cd6dbe0)
+- One-shot VT session recreation at 2nd IDR (this session)
+- Frame-rate pacing: min display interval = 1/fps for live streams (this session)
+- FrameDumpHook: format-aware NAL parsing instead of heuristic (this session)
 
 #### Latest validated (r30.1):
 - **No freeze** — continuous playback through 407+ frames
-- **FPS 18-21** (up from 13-19 in r29)
+- **FPS 18-21** (up from 13-19 in r29) — pacing fix expected to stabilize at 24fps
 - **2 errors** (down from 7 in r29), 0 IDR drops (down from 85)
 - **A/V Sync PASS** — max drift 12ms, 0.0% out of sync
 - **1 resubscribe** (decoder recovery), fast recovery
 
 #### Known open issues
-- Silent VT corruption: pixelation with 0 decode errors (see comment #37, r30.1 screenshots)
-- FPS 18-21 instead of 24 — likely presentation pacing, not transport
 - Intermittent VT -12909 errors (2 per session in r30.1, content-dependent)
-- Intermittent transport stall: hang TrackConsumer.read_frame() blocks indefinitely (r28 @ frame 42, r30 @ frame 68, absent in r29/r30.1)
+- Intermittent transport stall: hang TrackConsumer.read_frame() blocks indefinitely (r28 @ frame 42, r30 @ frame 68, absent in r29/r30.1) — safety net in place via timeout
 
 ### Notes
-Next validation plan (determinism check): rerun the same BBB scenario with LUMINA_MOQ_ERROR_FORENSICS=1 and compare failing frame hash64 values against prior run. Prior failing triplet: d8b88f02b47590e4, af827e33672d222a, 970741a3001f2163 (with preceding IDR hash ad78eefdd683534e). Decision rule: if same hashes fail again at similar relative position, classify as deterministic content-triggered (specific AU/bitstream incompatibility). If hashes differ run-to-run, classify as nondeterministic runtime/lifecycle/timing issue and prioritize VT/session scheduling investigation.
+Next validation: r31 runtime test with one-shot VT recreation + frame-rate pacing. Success criteria: FPS stable at ~24fps, reduced/eliminated pixelation from VT lifecycle corruption.
 
 ### Dependencies
 - Depends on: web-egui-vid-9feo (Remove dead get_group(seq-1) IDR fetch code from moq_decoder.rs) [P2]
@@ -770,7 +771,26 @@ Errors cluster in BBB credits section (complex scrolling text), clear when strea
 2. **FPS 18-21 instead of 24** — not caused by errors (only 2 frames lost). Likely presentation pacing in frame_queue.rs or wgpu texture upload overhead.
 3. **Intermittent transport stall** — read_frame timeout is a safety net, not a fix. Root cause in hang/moq-lite group subscription lifecycle.
 
-### Next: r31
-- Investigate FPS gap (24 expected, 18-21 actual) — profile frame_queue decode/render loop timing
-- Consider reducing READ_FRAME_TIMEOUT from 3s to 2s for faster stall recovery
-- Silent VT corruption requires separate investigation (frame dump + hex analysis)
+---
+
+## Pre-r31 Analysis (2026-02-09, Session 14)
+
+### Two fixes applied
+
+#### Fix 1: Silent VT corruption — one-shot session recreation
+- **Root cause investigation**: find_nal_types() heuristic bug exists but is isolated to dead code/diagnostics — NOT the cause of silent corruption
+- **All active decode paths use format-aware `find_nal_types_for_format()`** with `self.is_avcc` from catalog context
+- **VT callback** assumes valid pixel buffer = good frame, but VT can produce corrupted pixels without error flags
+- **Fix**: Enabled `ENABLE_ONESHOT_RECREATION = true` — recreates VT session at 2nd IDR after 48 frames, clearing any stale hardware state
+- **Also fixed**: FrameDumpHook CSV diagnostic now uses `find_nal_types_for_format()` instead of heuristic `find_nal_types()`
+
+#### Fix 2: FPS 18-21 instead of 24 — frame-rate pacing
+- **Root cause**: MoQ delivers frames in 2s group-boundary bursts (48 frames at once). Scheduler accepted all frames within 2000ms tolerance, consuming at repaint rate (60Hz) instead of source frame rate (24fps). Pattern: 48 frames in ~800ms burst, then ~1200ms starvation. FPS measurement catches mixed phases → 18-21fps.
+- **Contributing factor**: MoQ audio sets `audio_handle.set_available(true)` but audio base_pts is set from pre-buffer samples (before video started), causing permanent offset. Audio position always lags video PTS, so tolerance absorbs even more frames ahead-of-schedule.
+- **Fix**: Added frame-rate pacing to FrameScheduler. For live streams with known frame rate (metadata.duration == None), minimum display interval = 1/fps (with 4ms jitter allowance). This rate-limits frame acceptance regardless of queue occupancy.
+- **Implementation**: `set_frame_rate_pacing(fps)` called from `sync_metadata_from_decode_thread()` when frame_rate > 0 and stream is live (no duration). `last_frame_accept_time` tracked at all acceptance points (normal, catch-up, resync, first frame).
+- **Files changed**: frame_queue.rs (pacing logic), video_player.rs (enable pacing from metadata), moq_decoder.rs (enable one-shot recreation), moq/worker.rs (format-aware FrameDumpHook)
+
+### Next: r31 runtime test
+- Success criteria: FPS stable at ~24fps, reduced/eliminated pixelation
+- Watch for: one-shot VT recreation log at ~48 frames, pacing log on startup

@@ -38,6 +38,8 @@ struct FrameDumpHook {
     sps: Vec<u8>,
     pps: Vec<u8>,
     nal_length_size: usize,
+    /// True when catalog has avcC description (AVCC format), false for Annex B.
+    is_avcc: bool,
     max_frames: u32,
     frame_count: u32,
 }
@@ -101,6 +103,7 @@ impl FrameDumpHook {
             sps,
             pps,
             nal_length_size,
+            is_avcc: true, // catalog has avcC → AVCC format
             max_frames,
             frame_count: 0,
         })
@@ -166,8 +169,9 @@ impl FrameDumpHook {
             conversion_ok = false;
         }
 
-        // CSV: frame stats + format telemetry
-        let (nal_types_arr, nal_count) = MoqDecoder::find_nal_types(data, self.nal_length_size);
+        // CSV: frame stats + format telemetry (use format-aware parsing, not heuristic)
+        let (nal_types_arr, nal_count) =
+            MoqDecoder::find_nal_types_for_format(data, self.nal_length_size, self.is_avcc);
         writeln!(
             self.csv_writer,
             "{},{},{},{},{:?},{},{}",

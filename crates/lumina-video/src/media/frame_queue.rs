@@ -1080,6 +1080,12 @@ pub struct FrameScheduler {
     stable_reject_lead_samples: u32,
     /// Scheduler-only bias to account for persistent video PTS lead over audio.
     video_pts_bias: Duration,
+    /// Wall-clock time when the last frame was accepted for display.
+    /// Used for frame-rate pacing to prevent burst consumption of queued frames.
+    last_frame_accept_time: Option<std::time::Instant>,
+    /// Minimum interval between frame acceptances (1/fps), derived from metadata.
+    /// Zero disables pacing (e.g., for VOD or unknown frame rate).
+    frame_pacing_interval: Duration,
 }
 
 impl FrameScheduler {
@@ -1113,6 +1119,8 @@ impl FrameScheduler {
             last_reject_lead: None,
             stable_reject_lead_samples: 0,
             video_pts_bias: Duration::ZERO,
+            last_frame_accept_time: None,
+            frame_pacing_interval: Duration::ZERO,
         }
     }
 
@@ -1150,6 +1158,8 @@ impl FrameScheduler {
             last_reject_lead: None,
             stable_reject_lead_samples: 0,
             video_pts_bias: Duration::ZERO,
+            last_frame_accept_time: None,
+            frame_pacing_interval: Duration::ZERO,
         }
     }
 
@@ -1158,6 +1168,19 @@ impl FrameScheduler {
         self.audio_handle = Some(audio_handle);
         self.last_audio_zero_diag = None;
         self.sync_metrics.set_using_audio_clock(true);
+    }
+
+    /// Sets frame-rate pacing for live streams. When fps > 0, the scheduler
+    /// won't accept a new frame sooner than 1/fps after the last acceptance.
+    /// This prevents burst consumption of group-boundary deliveries.
+    /// No-op if pacing is already set (idempotent).
+    pub fn set_frame_rate_pacing(&mut self, fps: f32) {
+        if !self.frame_pacing_interval.is_zero() {
+            return; // Already configured
+        }
+        if fps > 0.0 {
+            self.frame_pacing_interval = Duration::from_secs_f64(1.0 / fps as f64);
+        }
     }
 
     /// Returns the sync metrics tracker.
@@ -1584,9 +1607,25 @@ impl FrameScheduler {
             self.on_frame_received(frame.pts);
             self.current_frame = Some(frame.clone());
             self.stalled = false;
+            self.last_frame_accept_time = Some(std::time::Instant::now());
             // Record sync metrics for first frame
             self.record_sync(frame.pts);
             return Some(frame);
+        }
+
+        // Frame-rate pacing: prevent burst consumption of group-boundary deliveries.
+        // For live streams with known frame rate, don't advance to the next frame
+        // sooner than 1/fps since the last acceptance. This keeps display smooth
+        // even when the transport delivers entire groups at once.
+        // Allow 4ms of jitter to avoid missing frames at boundary.
+        if !self.frame_pacing_interval.is_zero() {
+            if let Some(last) = self.last_frame_accept_time {
+                let since_last = last.elapsed();
+                if since_last < self.frame_pacing_interval.saturating_sub(Duration::from_millis(4))
+                {
+                    return self.current_frame.clone();
+                }
+            }
         }
 
         // Use AUDIO POSITION as master clock when available.
@@ -1719,6 +1758,7 @@ impl FrameScheduler {
                             self.current_frame = Some(frame.clone());
                             self.playback_start_time = Some(std::time::Instant::now());
                             self.playback_start_position = frame.pts;
+                            self.last_frame_accept_time = Some(std::time::Instant::now());
                             self.record_sync(frame.pts);
                             self.track_recovery_frame();
                             return Some(frame);
@@ -1744,6 +1784,7 @@ impl FrameScheduler {
                             self.current_frame = Some(frame.clone());
                             self.playback_start_time = Some(std::time::Instant::now());
                             self.playback_start_position = frame.pts;
+                            self.last_frame_accept_time = Some(std::time::Instant::now());
                             return Some(frame);
                         }
                     } else if self.reject_state == RejectHandlingState::Resync {
@@ -1808,6 +1849,7 @@ impl FrameScheduler {
 
             self.current_position = frame.pts;
             self.current_frame = Some(frame.clone());
+            self.last_frame_accept_time = Some(std::time::Instant::now());
 
             // NOTE: We previously tried setting native_position from frame.pts for macOS,
             // but this creates a circular dependency: sync_position() reads audio.position

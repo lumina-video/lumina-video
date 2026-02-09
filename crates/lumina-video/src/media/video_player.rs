@@ -987,10 +987,21 @@ impl VideoPlayer {
             }
         }
 
-        // Update frame rate
+        // Update frame rate and enable pacing for live streams
         if let Some(fps) = thread.frame_rate() {
             if fps > 0.0 {
                 metadata.frame_rate = fps;
+                // Enable frame-rate pacing for live/MoQ streams where transport
+                // delivers in group bursts. Only set once (pacing_interval stays 0
+                // for VOD where frame timing is implicit in PTS spacing).
+                if metadata.duration.is_none() {
+                    self.scheduler.set_frame_rate_pacing(fps);
+                    tracing::info!(
+                        "Frame-rate pacing enabled: {:.1} fps ({:.1}ms interval)",
+                        fps,
+                        1000.0 / fps as f64,
+                    );
+                }
             }
         }
     }
