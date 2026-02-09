@@ -470,6 +470,14 @@ pub struct MoqDecoder {
     /// Number of frames dropped in current IDR starvation window.
     #[cfg(target_os = "macos")]
     idr_wait_dropped_frames: u32,
+    /// Number of keyframe boundaries seen that still lacked a real IDR while
+    /// waiting for IDR recovery.
+    #[cfg(target_os = "macos")]
+    idr_wait_broken_keyframe_boundaries: u8,
+    /// Last time a decoder-side video re-subscribe request was emitted.
+    /// Used to prevent rapid request churn when stream metadata is unstable.
+    #[cfg(target_os = "macos")]
+    idr_last_resubscribe_request_at: Option<std::time::Instant>,
 }
 
 #[cfg(target_os = "macos")]
@@ -609,6 +617,10 @@ impl MoqDecoder {
             idr_wait_started_at: None,
             #[cfg(target_os = "macos")]
             idr_wait_dropped_frames: 0,
+            #[cfg(target_os = "macos")]
+            idr_wait_broken_keyframe_boundaries: 0,
+            #[cfg(target_os = "macos")]
+            idr_last_resubscribe_request_at: None,
         })
     }
 
@@ -923,6 +935,28 @@ impl MoqDecoder {
     fn reset_idr_wait_tracking(&mut self) {
         self.idr_wait_started_at = None;
         self.idr_wait_dropped_frames = 0;
+        self.idr_wait_broken_keyframe_boundaries = 0;
+    }
+
+    #[cfg(target_os = "macos")]
+    fn request_video_resubscribe_with_cooldown(&mut self) -> bool {
+        const RESUBSCRIBE_REQUEST_COOLDOWN: Duration = Duration::from_millis(800);
+        let now = std::time::Instant::now();
+        if let Some(last) = self.idr_last_resubscribe_request_at {
+            if now.saturating_duration_since(last) < RESUBSCRIBE_REQUEST_COOLDOWN {
+                return false;
+            }
+        }
+        if self
+            .shared
+            .request_video_resubscribe
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.idr_last_resubscribe_request_at = Some(now);
+            return true;
+        }
+        false
     }
 
     #[cfg(target_os = "macos")]
@@ -931,31 +965,39 @@ impl MoqDecoder {
         // re-subscribe so we can rejoin on a fresh group boundary.
         const IDR_WAIT_MAX: Duration = Duration::from_millis(1000);
         const IDR_WAIT_MAX_DROPS: u32 = 24;
+        const BROKEN_KEYFRAME_BOUNDARY_THRESHOLD: u8 = 3;
 
-        let start = self
-            .idr_wait_started_at
-            .get_or_insert_with(std::time::Instant::now);
+        let start = match self.idr_wait_started_at {
+            Some(start) => start,
+            None => {
+                let now = std::time::Instant::now();
+                self.idr_wait_started_at = Some(now);
+                now
+            }
+        };
         self.idr_wait_dropped_frames = self.idr_wait_dropped_frames.saturating_add(1);
 
-        // If metadata says "keyframe" but first NAL is still non-IDR, this is
-        // likely a degenerate boundary group; re-subscribe immediately.
+        // Metadata keyframe without a real IDR is common in degenerate groups.
+        // Do not immediately re-subscribe on a single boundary; require a
+        // short sequence of broken boundaries to avoid churn.
         let broken_keyframe_boundary = is_keyframe && nal_type != 5;
         if broken_keyframe_boundary {
-            if self
-                .shared
-                .request_video_resubscribe
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+            self.idr_wait_broken_keyframe_boundaries =
+                self.idr_wait_broken_keyframe_boundaries.saturating_add(1);
+            if self.idr_wait_broken_keyframe_boundaries >= BROKEN_KEYFRAME_BOUNDARY_THRESHOLD
+                && self.request_video_resubscribe_with_cooldown()
             {
                 tracing::warn!(
-                    "MoQ: keyframe boundary without IDR (nal_type={}, {} bytes) — requesting immediate video re-subscribe",
+                    "MoQ: repeated keyframe boundaries without IDR (count={}, nal_type={}, {} bytes) — requesting video re-subscribe",
+                    self.idr_wait_broken_keyframe_boundaries,
                     nal_type,
                     frame_len
                 );
+                self.idr_wait_started_at = Some(std::time::Instant::now());
+                self.idr_wait_dropped_frames = 0;
+                self.idr_wait_broken_keyframe_boundaries = 0;
+                return;
             }
-            self.idr_wait_started_at = Some(std::time::Instant::now());
-            self.idr_wait_dropped_frames = 0;
-            return;
         }
 
         let elapsed = start.elapsed();
@@ -963,16 +1005,12 @@ impl MoqDecoder {
             return;
         }
 
-        if self
-            .shared
-            .request_video_resubscribe
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
+        if self.request_video_resubscribe_with_cooldown() {
             tracing::warn!(
-                "MoQ: IDR starvation ({}ms, {} dropped, last_nal_type={}, {} bytes) — requesting video re-subscribe",
+                "MoQ: IDR starvation ({}ms, {} dropped, broken_keyframes={}, last_nal_type={}, {} bytes) — requesting video re-subscribe",
                 elapsed.as_millis(),
                 self.idr_wait_dropped_frames,
+                self.idr_wait_broken_keyframe_boundaries,
                 nal_type,
                 frame_len
             );
@@ -981,6 +1019,7 @@ impl MoqDecoder {
         // Keep reporting at a bounded cadence if starvation persists.
         self.idr_wait_started_at = Some(std::time::Instant::now());
         self.idr_wait_dropped_frames = 0;
+        self.idr_wait_broken_keyframe_boundaries = 0;
     }
 
     /// Decodes an encoded frame.
@@ -1240,6 +1279,14 @@ impl MoqDecoder {
                     .decode_errors
                     .load(std::sync::atomic::Ordering::Relaxed)
                     + 1;
+                let error_text = e.to_string();
+                let hard_vt_callback_failure = error_text.contains("VT decode callback error:");
+                if hard_vt_callback_failure {
+                    // Callback OSStatus failures (e.g. -12909) are not transient in our runs:
+                    // keeping session alive for 1-2 extra failures extends visible corruption.
+                    // Escalate immediately to the existing hard-reset + IDR resync path.
+                    self.consecutive_decode_errors = 3;
+                }
                 self.log_forensic_error_window();
 
                 // Log NAL header bytes for forensic analysis of failing frames
@@ -1947,10 +1994,6 @@ mod macos_vt {
         frame_count: AtomicU32,
     }
 
-    /// If we see this many consecutive callbacks with RequiredFrameDropped,
-    /// force a decode error to trigger VT session recreation.
-    const VT_REQUIRED_DROP_STREAK_THRESHOLD: u32 = 12;
-
     impl VTCallbackState {
         fn new() -> Self {
             Self {
@@ -1986,8 +2029,6 @@ mod macos_vt {
         /// Set from catalog info to avoid heuristic detection that misclassifies
         /// AVCC frames with 256-511 byte NALs (length prefix [0,0,1,X] looks like Annex B).
         is_avcc: bool,
-        /// Consecutive callbacks flagged with RequiredFrameDropped.
-        required_drop_streak: u32,
     }
 
     // SAFETY: VTDecompressionSession is designed for multi-threaded use.
@@ -2178,7 +2219,6 @@ mod macos_vt {
                 height,
                 codec,
                 is_avcc,
-                required_drop_streak: 0,
             })
         }
 
@@ -2539,23 +2579,9 @@ mod macos_vt {
             match decoded {
                 Some(frame) => {
                     if frame.required_frame_dropped {
-                        self.required_drop_streak = self.required_drop_streak.saturating_add(1);
-                        if self.required_drop_streak >= VT_REQUIRED_DROP_STREAK_THRESHOLD {
-                            tracing::warn!(
-                                "VTDecoder: required-frame-drop storm (streak={}), forcing session recovery",
-                                self.required_drop_streak
-                            );
-                            return Err(VideoError::DecodeFailed(format!(
-                                "VT required-frame-drop storm (streak={})",
-                                self.required_drop_streak
-                            )));
-                        }
-                    } else if self.required_drop_streak > 0 {
                         tracing::debug!(
-                            "VTDecoder: required-frame-drop streak cleared at {}",
-                            self.required_drop_streak
+                            "VTDecoder: callback flagged RequiredFrameDropped on decoded frame"
                         );
-                        self.required_drop_streak = 0;
                     }
 
                     tracing::debug!("VTDecoder: got frame from queue, calling create_gpu_frame");

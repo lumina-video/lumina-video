@@ -10,9 +10,10 @@
 //!
 //! Each platform decoder delegates to this function with a thin wrapper.
 
+use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_channel::Sender;
 use bytes::{Buf, BytesMut};
@@ -208,7 +209,7 @@ struct CatalogResult {
 }
 
 /// Re-subscribe video (and audio, if still active) after stream end or decoder-requested recovery.
-fn resubscribe_video_track(
+async fn resubscribe_video_track(
     shared: &Arc<MoqSharedState>,
     hang_consumer: &hang::BroadcastConsumer,
     video_track: &moq_lite::Track,
@@ -222,29 +223,51 @@ fn resubscribe_video_track(
     idr_gate_groups_seen: &mut u8,
     idr_gate_start: &mut Option<std::time::Instant>,
     resubscribe_count: &mut u32,
-    max_resubscribes: u32,
+    recent_resubscribes: &mut VecDeque<Instant>,
+    max_resubscribes_in_window: usize,
+    resubscribe_window: Duration,
+    resubscribe_cooldown: Duration,
     label: &str,
     reason: &str,
 ) -> bool {
-    *resubscribe_count += 1;
-    if *resubscribe_count > max_resubscribes {
-        tracing::info!(
-            "MoQ {}: Video stream ending after {} re-subscribes (reason={})",
-            label,
-            *resubscribe_count - 1,
-            reason,
-        );
-        shared.frame_stats.log_summary(label);
-        shared.set_state(MoqDecoderState::Ended);
-        shared.eof_reached.store(true, Ordering::Relaxed);
-        return false;
+    let now = Instant::now();
+    while let Some(front) = recent_resubscribes.front() {
+        if now.saturating_duration_since(*front) <= resubscribe_window {
+            break;
+        }
+        recent_resubscribes.pop_front();
     }
 
+    if recent_resubscribes.len() >= max_resubscribes_in_window {
+        tracing::warn!(
+            "MoQ {}: Re-subscribe storm detected ({} within {:?}); throttling for {:?}",
+            label,
+            recent_resubscribes.len(),
+            resubscribe_window,
+            resubscribe_cooldown,
+        );
+        tokio::time::sleep(resubscribe_cooldown).await;
+
+        let now = Instant::now();
+        while let Some(front) = recent_resubscribes.front() {
+            if now.saturating_duration_since(*front) <= resubscribe_window {
+                break;
+            }
+            recent_resubscribes.pop_front();
+        }
+        if recent_resubscribes.len() >= max_resubscribes_in_window {
+            recent_resubscribes.pop_front();
+        }
+    }
+
+    *resubscribe_count += 1;
+    recent_resubscribes.push_back(Instant::now());
     tracing::warn!(
-        "MoQ {}: Re-subscribing video ({}/{}) — {}",
+        "MoQ {}: Re-subscribing video (attempt #{}, recent={} within {:?}) — {}",
         label,
         *resubscribe_count,
-        max_resubscribes,
+        recent_resubscribes.len(),
+        resubscribe_window,
         reason,
     );
 
@@ -408,7 +431,10 @@ pub(crate) async fn run_moq_worker(
 
     let mut stats_log_counter = 0u64;
     let mut resubscribe_count: u32 = 0;
-    const MAX_RESUBSCRIBES: u32 = 5;
+    let mut recent_resubscribes: VecDeque<Instant> = VecDeque::with_capacity(8);
+    const MAX_RESUBSCRIBES_IN_WINDOW: usize = 5;
+    const RESUBSCRIBE_WINDOW: Duration = Duration::from_secs(8);
+    const RESUBSCRIBE_COOLDOWN: Duration = Duration::from_millis(750);
 
     loop {
         tokio::select! {
@@ -434,10 +460,15 @@ pub(crate) async fn run_moq_worker(
                                 &mut idr_gate_groups_seen,
                                 &mut idr_gate_start,
                                 &mut resubscribe_count,
-                                MAX_RESUBSCRIBES,
+                                &mut recent_resubscribes,
+                                MAX_RESUBSCRIBES_IN_WINDOW,
+                                RESUBSCRIBE_WINDOW,
+                                RESUBSCRIBE_COOLDOWN,
                                 label,
                                 "decoder requested IDR starvation recovery",
-                            ) {
+                            )
+                            .await
+                            {
                                 break;
                             }
                             continue;
@@ -545,10 +576,15 @@ pub(crate) async fn run_moq_worker(
                                         &mut idr_gate_groups_seen,
                                         &mut idr_gate_start,
                                         &mut resubscribe_count,
-                                        MAX_RESUBSCRIBES,
+                                        &mut recent_resubscribes,
+                                        MAX_RESUBSCRIBES_IN_WINDOW,
+                                        RESUBSCRIBE_WINDOW,
+                                        RESUBSCRIBE_COOLDOWN,
                                         label,
                                         &reason,
-                                    ) {
+                                    )
+                                    .await
+                                    {
                                         break;
                                     }
                                     continue;
@@ -599,10 +635,15 @@ pub(crate) async fn run_moq_worker(
                             &mut idr_gate_groups_seen,
                             &mut idr_gate_start,
                             &mut resubscribe_count,
-                            MAX_RESUBSCRIBES,
+                            &mut recent_resubscribes,
+                            MAX_RESUBSCRIBES_IN_WINDOW,
+                            RESUBSCRIBE_WINDOW,
+                            RESUBSCRIBE_COOLDOWN,
                             label,
                             "video track ended",
-                        ) {
+                        )
+                        .await
+                        {
                             break;
                         }
                         continue;
