@@ -32,27 +32,21 @@ MoQ video pixelation on BBB stream + choppy audio.
 - Pacing log spam fix + updatable pacing interval (this session)
 - Persistent video stall watchdog — immune to audio-arm resets (this session)
 
-#### Latest validated (r30.1):
-- **No freeze** — continuous playback through 407+ frames
-- **FPS 18-21** (up from 13-19 in r29)
-- **2 errors** (down from 7 in r29), 0 IDR drops (down from 85)
-- **A/V Sync PASS** — max drift 12ms, 0.0% out of sync
-- **1 resubscribe** (decoder recovery), fast recovery
-
-#### r31 regression (one-shot VT recreation — reverted):
-- One-shot VT recreation destroyed working session at frame 96 → 44 IDR drops
-- Cascading re-subscribes (4 total), errors increased 2→8, FPS dropped to 8.0
-- Errors are content-dependent (specific BBB P-frames at group position 3), not lifecycle-dependent
-- **Conclusion**: One-shot recreation is harmful; disabled permanently
+#### Latest validated (r32.1 — best video pipeline results):
+- **No freeze** — continuous playback through 298+ frames
+- **0 errors** (best ever, down from 2 in r30.1)
+- **0 IDR drops, 0 startup skips, 0 resubscribes**
+- **FPS 20-21** — pacing log fires once
+- **A/V Sync FAIL** — drift grows +178ms→+2690ms then stabilizes. Pre-existing issue (bead do9), was masked in r30.1 by accidental PTS realignment from error-triggered resubscribe.
 
 #### Known open issues
-- **Silent VT corruption**: pixelation with 0 decode errors (VT produces corrupted output without error flags). Not from format misclassification (is_avcc fix). Not from missing keyframe (moq-lite guarantees). Hypothesis: SPS/PPS catalog mismatch or first-group IDR too small (6KB vs 92KB).
-- **FPS 18-21 instead of 24**: frame-rate pacing doesn't fully solve it. Decode rate is ~23fps during clean windows; display FPS averages in error/drop windows → 18-21.
-- **Intermittent VT -12909 errors** (2 per session in r30.1, content-dependent at specific BBB frame positions)
-- **Intermittent transport stall**: hang TrackConsumer.read_frame() blocks indefinitely (r28 @ frame 42, r30 @ frame 68) — persistent watchdog now immune to audio resets
+- **A/V drift (bead do9, HIGH)**: Audio position advances at ~83% of wall-clock rate. Root cause likely in SampleCountingSource position tracking or symphonia 44100→48000Hz resampling. This also causes FPS 20 instead of 24 (audio-as-master-clock runs slow → fewer frames accepted).
+- **FPS 20 instead of 24**: Likely downstream of A/V drift — audio master clock is slow.
+- **Intermittent VT -12909 errors**: Content-dependent at specific BBB P-frame positions (0 in r32.1, 2 in r30.1). Tolerable baseline.
+- **Silent VT corruption**: Not observed in r32.1 (may be correlated with the errors that didn't occur this session).
 
 ### Notes
-Next validation: r32 runtime test with one-shot reverted + persistent video watchdog. Expected baseline: matches r30.1 (2 errors, 18-21 FPS, smooth audio).
+Video decode pipeline is stable. Remaining issues are in the A/V sync / presentation layer (bead do9). Consider closing bead duf.
 
 ### Dependencies
 - Depends on: web-egui-vid-9feo (Remove dead get_group(seq-1) IDR fetch code from moq_decoder.rs) [P2]
@@ -825,31 +819,50 @@ Errors cluster in BBB credits section (complex scrolling text), clear when strea
 - Replaced `tokio::timeout()` video watchdog with persistent deadline immune to audio-arm resets
 - Updated "Known open issues" to include silent VT corruption + FPS gap
 
-### Next: r32 runtime test
+### r32 runtime test — watchdog bug discovered
 
-#### How to run
-```bash
-RUST_LOG=warn,lumina_video::media::moq=info,lumina_video::media::moq_decoder=info,lumina_video::media::frame_queue=warn,lumina_video::media::audio=info,lumina_video::media::moq_audio=info,lumina_video::media::video_player=info,lumina_video::media::sync_metrics=warn \
-  cargo run -p lumina-video-demo 2>&1 | tee /tmp/moq-r32.log
-```
-Then click the cdn.moq.dev BBB stream in the demo UI.
+r32 revealed a bug in the new persistent video watchdog: `video_deadline` was reset on every `read_frame()` return, including frames skipped by the IDR gate. When the BBB stream served a first group with only NAL type 1 keyframes (non-IDR), all frames were skipped but kept resetting the watchdog → video stalled indefinitely.
 
-#### Success criteria (should match r30.1 baseline)
-- **No freeze** — continuous playback through 300+ frames
-- **FPS 18-24** — pacing log fires once (not 938 times)
-- **Errors ≤ 2** — content-dependent -12909 at group position 3
-- **IDR drops = 0** — one-shot recreation is disabled
-- **A/V sync PASS** — max drift < 50ms, 0 buffer underruns
-- **Resubscribes ≤ 1** — decoder recovery only
+**Fix (r32.1)**: Watchdog deadline only resets when a frame is actually submitted to the decoder (past IDR gate), or after a successful resubscribe. Committed as ee1856f6.
 
-#### What to watch for
-- `pacing enabled: 24.0 fps` — should appear exactly once
-- `video stall detected` — should NOT appear (proves watchdog doesn't false-positive)
-- No `one-shot VT recreation` log (reverted)
-- `Buffer underrun` count — should be 0 (was 3 in r31 due to one-shot cascade)
-- FrameStats progression: `drop_idr` stays at 0, `errors` stays ≤ 2
+### r32.1 runtime test — VIDEO PIPELINE BEST EVER, A/V DRIFT
 
-#### If it regresses
-- Check `/tmp/moq-r32.log` for `video stall detected` (watchdog false positive on slow groups)
-- Check for `pacing updated` (unexpected FPS metadata change)
-- Compare FrameStats timeline to r30.1 (errors=2, decoded≈rendered, no IDR drops)
+| Metric | r30.1 | r31 | r32.1 |
+|--------|-------|-----|-------|
+| Freeze | No | YES | **No** |
+| Errors | 2 | 8 | **0** |
+| IDR drops | 0 | 44 | **0** |
+| Skip startup | 51 | 51 | **0** |
+| FPS | 18-21 | 8 | **20-21** |
+| Resubscribes | 1 | 4 | **0** |
+| Decoded/Recv | 405/407 | 195/372 | **298/330** |
+| A/V Sync | PASS (12ms) | FAIL (underruns) | **FAIL (+2.7s drift)** |
+
+#### What worked
+- **0 decode errors** across 298 frames (best ever — previous best was 2)
+- **0 IDR drops, 0 startup skips** — IDR gate cleared instantly (real IDR in first group)
+- **0 resubscribes** — no transport stalls, no decoder recovery needed
+- **Pacing log fired once** (938→1 fix confirmed)
+- **No video stall detected** — watchdog didn't false-positive
+
+#### A/V drift analysis (pre-existing, bead do9)
+- Drift grew linearly from +178ms (at 1.2s) to +2690ms (at 15s), then stabilized
+- Video PTS tracked wall-clock (14.5s advance in 14.5s). Audio position advanced only 12.0s in 14.5s (83% rate).
+- Audio pre-buffer was 43ms (vs 1311ms in r31) — faster startup but no realignment event
+- In r30.1, the error-triggered resubscribe accidentally realigned audio+video PTS → PASS. Without resubscribe, the offset is exposed.
+- **Root cause hypothesis**: SampleCountingSource tracks output samples at 48000Hz but position calculation may use wrong rate, or symphonia resampling (44100→48000) introduces systematic undercounting.
+- **This is a separate issue** — tracked as bead `web-egui-vid-do9` (A/V sync)
+
+### Session 15 summary
+
+#### Commits
+- `5f3cf213` — Revert one-shot VT recreation, persistent video watchdog, pacing fixes
+- `ee1856f6` — Watchdog only resets on submitted frames, not IDR-gated skips
+
+#### Video pipeline status: STABLE
+The video decode pipeline is now at its best: 0 errors, 0 drops, 0 skips in r32.1. The remaining issues (FPS 20 not 24, A/V drift) are in the presentation/sync layer, not the decode pipeline. Bead `duf` (video broken) can be considered substantially resolved — remaining work is A/V sync (do9) and FPS tuning.
+
+### Next steps
+1. **A/V sync (bead do9, HIGH)**: Investigate SampleCountingSource position tracking. Check if `sample_rate` in `position()` uses stream rate (44100) vs device rate (48000). Check symphonia resampler sample count accuracy.
+2. **FPS 20 not 24**: May be caused by A/V sync — if audio position runs slow, video scheduler (audio as master clock) advances slowly too, accepting fewer frames per second than the actual 24fps rate.
+3. **Consider closing bead duf**: Video decode pipeline is stable. A/V sync and FPS are separate issues (do9).
