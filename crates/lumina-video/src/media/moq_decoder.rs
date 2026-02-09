@@ -1931,6 +1931,8 @@ mod macos_vt {
         pts_us: u64,
         /// The decoded CVPixelBuffer (retained)
         pixel_buffer: PixelBufferWrapper,
+        /// True when callback had kVTDecodeInfo_RequiredFrameDropped.
+        required_frame_dropped: bool,
     }
 
     /// Shared state for decoder callback to push decoded frames.
@@ -1944,6 +1946,10 @@ mod macos_vt {
         /// Frame counter for debugging
         frame_count: AtomicU32,
     }
+
+    /// If we see this many consecutive callbacks with RequiredFrameDropped,
+    /// force a decode error to trigger VT session recreation.
+    const VT_REQUIRED_DROP_STREAK_THRESHOLD: u32 = 12;
 
     impl VTCallbackState {
         fn new() -> Self {
@@ -1980,6 +1986,8 @@ mod macos_vt {
         /// Set from catalog info to avoid heuristic detection that misclassifies
         /// AVCC frames with 256-511 byte NALs (length prefix [0,0,1,X] looks like Annex B).
         is_avcc: bool,
+        /// Consecutive callbacks flagged with RequiredFrameDropped.
+        required_drop_streak: u32,
     }
 
     // SAFETY: VTDecompressionSession is designed for multi-threaded use.
@@ -2170,6 +2178,7 @@ mod macos_vt {
                 height,
                 codec,
                 is_avcc,
+                required_drop_streak: 0,
             })
         }
 
@@ -2529,6 +2538,26 @@ mod macos_vt {
 
             match decoded {
                 Some(frame) => {
+                    if frame.required_frame_dropped {
+                        self.required_drop_streak = self.required_drop_streak.saturating_add(1);
+                        if self.required_drop_streak >= VT_REQUIRED_DROP_STREAK_THRESHOLD {
+                            tracing::warn!(
+                                "VTDecoder: required-frame-drop storm (streak={}), forcing session recovery",
+                                self.required_drop_streak
+                            );
+                            return Err(VideoError::DecodeFailed(format!(
+                                "VT required-frame-drop storm (streak={})",
+                                self.required_drop_streak
+                            )));
+                        }
+                    } else if self.required_drop_streak > 0 {
+                        tracing::debug!(
+                            "VTDecoder: required-frame-drop streak cleared at {}",
+                            self.required_drop_streak
+                        );
+                        self.required_drop_streak = 0;
+                    }
+
                     tracing::debug!("VTDecoder: got frame from queue, calling create_gpu_frame");
                     // Create MacOSGpuSurface from CVPixelBuffer
                     let video_frame = self.create_gpu_frame(frame)?;
@@ -2836,6 +2865,7 @@ mod macos_vt {
         let frame = DecodedVTFrame {
             pts_us,
             pixel_buffer,
+            required_frame_dropped: (info_flags & 0x4) != 0,
         };
         tracing::debug!("VT decode callback: acquiring lock on decoded_frames queue");
         let mut queue = callback_state.decoded_frames.lock();
