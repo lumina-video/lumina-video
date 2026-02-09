@@ -508,8 +508,9 @@ pub(crate) async fn run_moq_worker(
         tokio::select! {
             // No biased — fair scheduling prevents audio starvation
             video_result = video_consumer.read_frame() => {
-                // Video produced a frame (or error/EOF) — reset the stall deadline
-                video_deadline = tokio::time::Instant::now() + READ_FRAME_TIMEOUT;
+                // NOTE: video_deadline is only reset when a frame is actually
+                // submitted to the decoder (past IDR gate). Frames that arrive
+                // but get skipped at the IDR gate do NOT reset the watchdog.
                 match video_result {
                     Ok(Some(frame)) => {
                         if shared
@@ -543,6 +544,7 @@ pub(crate) async fn run_moq_worker(
                             {
                                 break;
                             }
+                            video_deadline = tokio::time::Instant::now() + READ_FRAME_TIMEOUT;
                             continue;
                         }
 
@@ -703,6 +705,9 @@ pub(crate) async fn run_moq_worker(
                             );
                         }
 
+                        // Frame passed IDR gate — reset video stall watchdog
+                        video_deadline = tokio::time::Instant::now() + READ_FRAME_TIMEOUT;
+
                         tracing::info!("MoQ {}: sending frame #{} to channel ({} bytes, kf={})", label, recv_count, moq_frame.data.len(), moq_frame.is_keyframe);
                         if frame_tx.send(moq_frame).await.is_err() {
                             tracing::warn!("MoQ {}: Frame channel closed, stopping worker", label);
@@ -738,6 +743,7 @@ pub(crate) async fn run_moq_worker(
                         {
                             break;
                         }
+                        video_deadline = tokio::time::Instant::now() + READ_FRAME_TIMEOUT;
                         continue;
                     }
                     Err(e) => {
