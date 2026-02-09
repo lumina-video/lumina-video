@@ -417,13 +417,20 @@ pub struct MoqDecoder {
     /// heuristic which misclassifies 256-511 byte NALs.
     #[cfg(target_os = "macos")]
     is_avcc: bool,
-    /// True after a decode error; decoder must wait for next IDR to resync.
+    /// True after 3+ consecutive decode errors; decoder must wait for next IDR
+    /// to resync. Set when `consecutive_decode_errors >= 3`, cleared when an IDR
+    /// or keyframe arrives. The VT session is destroyed when this is set.
     #[cfg(target_os = "macos")]
     waiting_for_idr_after_error: bool,
-    /// Consecutive decode error count; skip-and-continue for isolated errors,
-    /// only destroy VT session + IDR resync after 3+ consecutive failures.
+    /// Consecutive decode error count. Isolated errors (1-2) skip the frame but
+    /// keep the VT session alive. At 3+ consecutive errors, the session is
+    /// destroyed and `waiting_for_idr_after_error` is set. Reset to 0 on
+    /// successful decode or IDR resync.
     #[cfg(target_os = "macos")]
     consecutive_decode_errors: u32,
+    /// True until the one-shot VT session recreation has fired.
+    #[cfg(target_os = "macos")]
+    needs_session_recreation: bool,
 }
 
 impl MoqDecoder {
@@ -517,6 +524,8 @@ impl MoqDecoder {
             waiting_for_idr_after_error: false,
             #[cfg(target_os = "macos")]
             consecutive_decode_errors: 0,
+            #[cfg(target_os = "macos")]
+            needs_session_recreation: true,
         })
     }
 
@@ -696,19 +705,18 @@ impl MoqDecoder {
     }
 
     /// Returns true if frame should be skipped while waiting for an IDR resync.
-    /// Accepts both IDR frames (NAL type 5) and hang-flagged keyframes (NAL type 1 I-frames)
-    /// as valid resync points, since moq-lite guarantees group-boundary keyframes.
+    /// Only accepts real IDR (NAL type 5) as valid resync point. I-frames (NAL type 1
+    /// with is_keyframe=true) cannot initialize a fresh VT session because they need
+    /// existing DPB reference frames.
     #[cfg(target_os = "macos")]
     fn should_wait_for_idr(&self, moq_frame: &MoqVideoFrame) -> bool {
         if !self.waiting_for_idr_after_error {
             return false;
         }
-        // Accept IDR (NAL 5) or hang's is_keyframe flag as resync point.
-        // Use format-aware parsing to avoid data_is_annex_b() heuristic bug.
         let (types, count) =
             Self::find_nal_types_for_format(&moq_frame.data, self.h264_nal_length_size, self.is_avcc);
         let is_idr = types[..count].contains(&5);
-        !is_idr && !moq_frame.is_keyframe
+        !is_idr // only real IDR can clear the resync gate
     }
 
     /// Decodes an encoded frame.
@@ -797,17 +805,38 @@ impl MoqDecoder {
         let nal_types = &nal_types_arr[..nal_count];
         let is_idr = nal_types.contains(&5);
 
-        // Recreate VT session at every group-boundary keyframe.
-        // The publisher may use I-frames (NAL type 1) instead of IDR (type 5) for
-        // some group boundaries. I-frames don't reset VT's DPB, so corruption from
-        // a bad initial IDR propagates indefinitely. Recreating the session forces a
-        // clean DPB. The 15ms cost per 2s group is negligible vs visible corruption.
-        if moq_frame.is_keyframe && self.vt_decoder.is_some() {
-            tracing::info!(
-                "MoQ: recreating VT session at keyframe boundary (NAL types={:?}, {} bytes)",
-                nal_types, moq_frame.data.len()
-            );
-            self.vt_decoder = None;
+        // One-shot VT session recreation at the second IDR after startup.
+        // The initial VT session can produce silently corrupted output (VT
+        // status=0 but visibly pixelated). Recreating once at the next IDR
+        // boundary clears the corruption. Requires at least 48 frames decoded
+        // (one full group at 24fps) to ensure VT hardware has flushed, and
+        // only triggers on real IDR (type 5), not I-frames (type 1).
+        if self.needs_session_recreation && !self.waiting_for_idr_after_error && is_idr {
+            if let Some(ref decoder) = self.vt_decoder {
+                let prev_count = decoder.frame_count();
+                // Only trigger after at least one full group (48 frames)
+                // to give VT hardware time to fully initialize.
+                if prev_count >= 48 {
+                    self.needs_session_recreation = false;
+                    self.vt_decoder = None;
+                    // Immediately recreate from catalog SPS/PPS so this IDR gets decoded
+                    if let Some(ref desc) = *self.shared.codec_description.lock() {
+                        if let Ok((sps, pps, nal_length_size)) = Self::parse_avcc_box(desc) {
+                            let metadata = self.shared.metadata.lock().clone();
+                            if let Ok(new_decoder) = macos_vt::VTDecoder::new_h264(
+                                &sps, &pps, metadata.width, metadata.height, true,
+                            ) {
+                                self.vt_decoder = Some(new_decoder);
+                                self.h264_nal_length_size = nal_length_size;
+                                tracing::info!(
+                                    "MoQ: one-shot VT session recreation at IDR ({} bytes, {} frames on previous session)",
+                                    moq_frame.data.len(), prev_count
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         if let Some(ref decoder) = self.vt_decoder {
@@ -848,13 +877,15 @@ impl MoqDecoder {
                 )));
             }
 
-            // If we were waiting for IDR and got a keyframe, clear error state.
-            // VT session was destroyed on error — lazy init will recreate it
-            // from catalog SPS/PPS on the next decode_frame() call below.
-            if self.waiting_for_idr_after_error && (is_idr || moq_frame.is_keyframe) {
+            // Only clear IDR resync on a real IDR (NAL type 5). I-frames (NAL type 1
+            // with is_keyframe=true) cannot initialize a fresh VT session — they need
+            // existing reference frames in the DPB. Accepting I-frames here causes a
+            // cascade: fresh session → decode fail → destroy → repeat.
+            if self.waiting_for_idr_after_error && is_idr {
                 self.waiting_for_idr_after_error = false;
+                self.consecutive_decode_errors = 0;
                 tracing::info!(
-                    "MoQ: received IDR after error, will recreate VT session (session={})",
+                    "MoQ: received real IDR after error, will recreate VT session (session={})",
                     if self.vt_decoder.is_some() { "exists" } else { "None" }
                 );
             }
@@ -901,23 +932,27 @@ impl MoqDecoder {
             )),
             Err(e) => {
                 self.consecutive_decode_errors += 1;
+                let total_errors = self.shared.frame_stats.decode_errors.load(std::sync::atomic::Ordering::Relaxed) + 1;
 
-                // Always destroy the VT session on ANY decode error.
-                // prepare_for_idr_resync() only clears the output queue — VT's
-                // internal DPB retains stale reference frames. The next IDR
-                // SHOULD reset the DPB, but in practice VT can produce silently
-                // corrupted output for multiple groups after an error unless the
-                // session is fully recreated. The 15ms recreation cost is
-                // negligible compared to seconds of visible pixelation.
-                self.waiting_for_idr_after_error = true;
-                self.vt_decoder = None;
-                tracing::warn!(
-                    "MoQ: VT decode error #{} (consecutive={}), destroyed session for IDR resync: {}",
-                    self.shared.frame_stats.decode_errors.load(std::sync::atomic::Ordering::Relaxed) + 1,
-                    self.consecutive_decode_errors,
-                    e
-                );
-                self.consecutive_decode_errors = 0;
+                if self.consecutive_decode_errors >= 3 {
+                    // 3+ consecutive errors: destroy VT session and wait for IDR resync.
+                    // prepare_for_idr_resync() only clears the output queue — VT's
+                    // internal DPB retains stale reference frames. Full session
+                    // recreation from catalog SPS/PPS is needed for clean recovery.
+                    self.waiting_for_idr_after_error = true;
+                    self.vt_decoder = None;
+                    tracing::warn!(
+                        "MoQ: VT decode error #{} (consecutive={}), destroyed session for IDR resync: {}",
+                        total_errors, self.consecutive_decode_errors, e
+                    );
+                } else {
+                    // Isolated error: skip this frame, keep session alive.
+                    // VT can recover from transient errors on the next frame.
+                    tracing::warn!(
+                        "MoQ: VT decode error #{} (consecutive={}), skipping frame: {}",
+                        total_errors, self.consecutive_decode_errors, e
+                    );
+                }
                 Err(e)
             }
         }

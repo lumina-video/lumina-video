@@ -322,10 +322,8 @@ pub(crate) async fn run_moq_worker(
     let mut idr_gate_start: Option<std::time::Instant> = None;
     let mut logged_groups_exhausted = false;
 
-    if !waiting_for_valid_idr {
-        // Non-H.264 or parse failure: bypass gate, audio can start immediately
-        shared.audio.video_started.store(true, Ordering::Relaxed);
-    }
+    // Note: video_started is set by the decoder on first successful decode,
+    // NOT here. This ensures audio only starts after a confirmed good frame.
 
     // -- Phase 6: Streaming --
     shared.set_state(MoqDecoderState::Streaming);
@@ -432,20 +430,16 @@ pub(crate) async fn run_moq_worker(
                                 );
                                 waiting_for_valid_idr = false;
                             } else if frame.keyframe && groups_exhausted {
-                                // Advisory only — group count does NOT clear gate
-                                if !logged_groups_exhausted {
-                                    tracing::debug!(
-                                        "MoQ {}: saw {} keyframe groups before timeout; still waiting for IDR",
-                                        label,
-                                        idr_gate_groups_seen,
-                                    );
-                                    logged_groups_exhausted = true;
-                                }
-                                shared
-                                    .frame_stats
-                                    .skipped_startup_frames
-                                    .fetch_add(1, Ordering::Relaxed);
-                                continue;
+                                // Seen enough groups without IDR — accept this keyframe
+                                // to avoid indefinite stall. The decoder can handle
+                                // non-IDR keyframes (I-frames) for initial decode.
+                                tracing::warn!(
+                                    "MoQ {}: IDR gate cleared — groups exhausted ({} groups, {}ms); accepting non-IDR keyframe",
+                                    label,
+                                    idr_gate_groups_seen,
+                                    elapsed.as_millis(),
+                                );
+                                waiting_for_valid_idr = false;
                             } else if timed_out && !frame.keyframe && idr_gate_groups_seen > 0 {
                                 tracing::warn!(
                                     "MoQ {}: startup IDR gate failsafe after {}ms with no usable keyframe; accepting raw frame",
@@ -512,8 +506,10 @@ pub(crate) async fn run_moq_worker(
                         );
                         video_consumer =
                             hang_consumer.subscribe(&video_track, cat.max_latency);
-                        // Re-subscribe audio if it also ended
-                        if audio_consumer_opt.is_none() {
+                        // Re-subscribe audio only if the audio thread is still alive.
+                        // If the thread exited (sender dropped), resubscribing would
+                        // fill a dead channel.
+                        if audio_consumer_opt.is_none() && moq_audio_thread_opt.is_some() {
                             if let Some(ref at) = audio_track_for_resub {
                                 audio_consumer_opt =
                                     Some(hang_consumer.subscribe(at, cat.max_latency));
@@ -522,6 +518,11 @@ pub(crate) async fn run_moq_worker(
                                     label,
                                 );
                             }
+                        } else if audio_consumer_opt.is_none() {
+                            tracing::warn!(
+                                "MoQ {}: Audio thread not alive, skipping audio re-subscribe",
+                                label,
+                            );
                         }
                         // Reset IDR gate for the new subscription
                         if idr_gate_enabled {
