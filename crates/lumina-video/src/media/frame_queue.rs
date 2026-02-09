@@ -980,11 +980,13 @@ const AUDIO_STARTUP_AHEAD_TOLERANCE: Duration = Duration::from_millis(500);
 /// Base live tolerance once audio is running.
 const LIVE_BASE_AHEAD_TOLERANCE: Duration = Duration::from_millis(2000);
 /// Maximum adaptive live tolerance to avoid unbounded A/V divergence.
-const LIVE_MAX_AHEAD_TOLERANCE: Duration = Duration::from_millis(4200);
+const LIVE_MAX_AHEAD_TOLERANCE: Duration = Duration::from_millis(4600);
 /// Margin added when adapting to near-boundary gaps.
 const LIVE_AHEAD_MARGIN: Duration = Duration::from_millis(180);
 /// Only treat this much extra gap beyond base as near-boundary.
-const LIVE_NEAR_BOUNDARY_RANGE: Duration = Duration::from_millis(1700);
+const LIVE_NEAR_BOUNDARY_RANGE: Duration = Duration::from_millis(2600);
+/// Small jitter allowance to avoid thrashing exactly at tolerance boundaries.
+const LIVE_ACCEPT_JITTER_TOLERANCE: Duration = Duration::from_millis(90);
 /// Reject windows starting this frequently indicate a scheduler thrash burst.
 const REJECT_BURST_WINDOW: Duration = Duration::from_millis(140);
 /// Number of rapid reject-window starts before enabling burst tolerance.
@@ -999,6 +1001,27 @@ const AUDIO_ZERO_DIAG_COOLDOWN: Duration = Duration::from_secs(2);
 const STALE_GAP_THRESHOLD: Duration = Duration::from_secs(10);
 /// If repeated forced-resync attempts fail in one reject window, drop one head frame.
 const MAX_FORCED_RESYNCS_PER_WINDOW: u32 = 2;
+/// Lead target after a discontinuity rebase.
+const OFFSET_REBASE_TARGET_LEAD: Duration = Duration::from_millis(150);
+/// Minimum stable lead required before applying a one-shot rebase.
+const OFFSET_REBASE_MIN_LEAD: Duration = Duration::from_millis(2500);
+/// Consecutive stable reject samples required before rebasing.
+const OFFSET_REBASE_MIN_STABLE_SAMPLES: u32 = 6;
+/// Maximum per-sample lead wobble still considered stable.
+const OFFSET_REBASE_STABILITY_TOLERANCE: Duration = Duration::from_millis(220);
+/// Clamp to avoid unbounded scheduler bias.
+const MAX_VIDEO_PTS_BIAS: Duration = Duration::from_secs(8);
+/// Max number of aggressive catch-up frame admissions before escalating.
+const CATCH_UP_MAX_FRAMES: u32 = 10;
+/// If catch-up does not recover quickly, escalate to forced resync.
+const CATCH_UP_MAX_DURATION: Duration = Duration::from_millis(1300);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RejectHandlingState {
+    Normal,
+    CatchUp,
+    Resync,
+}
 
 /// The scheduler only advances position when frames are actually being delivered,
 /// preventing the scroll bar from advancing during buffering.
@@ -1045,6 +1068,18 @@ pub struct FrameScheduler {
     burst_tolerance_until: Option<std::time::Instant>,
     /// Last time we logged detailed "audio clock still zero" diagnostics.
     last_audio_zero_diag: Option<std::time::Instant>,
+    /// Current reject-handling phase.
+    reject_state: RejectHandlingState,
+    /// Number of frames aggressively accepted while in catch-up.
+    catch_up_frames_in_window: u32,
+    /// One-shot guard: only apply one offset rebase per reject window.
+    offset_rebased_in_window: bool,
+    /// Last lead seen during the current reject window.
+    last_reject_lead: Option<Duration>,
+    /// Number of consecutive stable lead samples in the reject window.
+    stable_reject_lead_samples: u32,
+    /// Scheduler-only bias to account for persistent video PTS lead over audio.
+    video_pts_bias: Duration,
 }
 
 impl FrameScheduler {
@@ -1072,6 +1107,12 @@ impl FrameScheduler {
             reject_burst_count: 0,
             burst_tolerance_until: None,
             last_audio_zero_diag: None,
+            reject_state: RejectHandlingState::Normal,
+            catch_up_frames_in_window: 0,
+            offset_rebased_in_window: false,
+            last_reject_lead: None,
+            stable_reject_lead_samples: 0,
+            video_pts_bias: Duration::ZERO,
         }
     }
 
@@ -1103,6 +1144,12 @@ impl FrameScheduler {
             reject_burst_count: 0,
             burst_tolerance_until: None,
             last_audio_zero_diag: None,
+            reject_state: RejectHandlingState::Normal,
+            catch_up_frames_in_window: 0,
+            offset_rebased_in_window: false,
+            last_reject_lead: None,
+            stable_reject_lead_samples: 0,
+            video_pts_bias: Duration::ZERO,
         }
     }
 
@@ -1232,6 +1279,7 @@ impl FrameScheduler {
         self.stalled = false;
         self.reset_rejection_tracking();
         self.seek_generation = self.seek_generation.wrapping_add(1);
+        self.video_pts_bias = Duration::ZERO;
 
         // Reset sync metrics on seek to clear max_drift from transient spikes
         self.sync_metrics.reset();
@@ -1417,6 +1465,11 @@ impl FrameScheduler {
         self.rejection_count = 0;
         self.rejection_peak_gap = Duration::ZERO;
         self.forced_resyncs_in_window = 0;
+        self.reject_state = RejectHandlingState::Normal;
+        self.catch_up_frames_in_window = 0;
+        self.offset_rebased_in_window = false;
+        self.last_reject_lead = None;
+        self.stable_reject_lead_samples = 0;
     }
 
     fn record_reject_window_start(&mut self, now: std::time::Instant) {
@@ -1446,6 +1499,57 @@ impl FrameScheduler {
                 );
             }
         }
+    }
+
+    fn maybe_rebase_offset_for_stable_lead(
+        &mut self,
+        current_pos: Duration,
+        next_pts: Duration,
+        lead: Duration,
+    ) -> bool {
+        let stable = match self.last_reject_lead {
+            Some(prev_lead) => lead.abs_diff(prev_lead) <= OFFSET_REBASE_STABILITY_TOLERANCE,
+            None => false,
+        };
+
+        self.last_reject_lead = Some(lead);
+        if stable {
+            self.stable_reject_lead_samples = self.stable_reject_lead_samples.saturating_add(1);
+        } else {
+            self.stable_reject_lead_samples = 1;
+        }
+
+        if self.offset_rebased_in_window
+            || lead < OFFSET_REBASE_MIN_LEAD
+            || self.stable_reject_lead_samples < OFFSET_REBASE_MIN_STABLE_SAMPLES
+        {
+            return false;
+        }
+
+        let bias_delta = lead.saturating_sub(OFFSET_REBASE_TARGET_LEAD);
+        if bias_delta.is_zero() {
+            return false;
+        }
+
+        let previous_bias = self.video_pts_bias;
+        self.video_pts_bias = std::cmp::min(
+            self.video_pts_bias.saturating_add(bias_delta),
+            MAX_VIDEO_PTS_BIAS,
+        );
+        self.offset_rebased_in_window = true;
+        self.reject_state = RejectHandlingState::CatchUp;
+
+        tracing::warn!(
+            "get_next_frame: applied one-shot offset rebase (lead={}ms, stable_samples={}, current_pos={:?}, next_pts={:?}, bias {}ms -> {}ms)",
+            lead.as_millis(),
+            self.stable_reject_lead_samples,
+            current_pos,
+            next_pts,
+            previous_bias.as_millis(),
+            self.video_pts_bias.as_millis()
+        );
+
+        true
     }
 
     /// Gets the next frame to display from the queue.
@@ -1488,8 +1592,6 @@ impl FrameScheduler {
         // Use AUDIO POSITION as master clock when available.
         // This is the key to A/V sync: video presentation follows audio playback.
         // Wall-clock is only used as fallback when audio is not available.
-        let current_pos = self.sync_position();
-
         // Keep popping frames until we find one that should be displayed now
         loop {
             let Some(next_pts) = queue.peek_pts() else {
@@ -1500,6 +1602,8 @@ impl FrameScheduler {
 
             // We have frames - clear stall state and resync clock if needed
             self.clear_stall_if_needed();
+            let raw_sync_pos = self.sync_position();
+            let current_pos = raw_sync_pos.saturating_add(self.video_pts_bias);
 
             let now = std::time::Instant::now();
             // Accept frame if:
@@ -1509,24 +1613,30 @@ impl FrameScheduler {
             let audio_started = self.audio_started_for_timing();
             let gap = next_pts.abs_diff(current_pos);
             let ahead_tolerance = self.compute_ahead_tolerance(audio_started, gap, now);
+            let accept_tolerance = ahead_tolerance.saturating_add(LIVE_ACCEPT_JITTER_TOLERANCE);
             let should_accept =
-                next_pts <= current_pos + ahead_tolerance || self.current_frame.is_none();
+                next_pts <= current_pos + accept_tolerance || self.current_frame.is_none();
 
             if !should_accept {
                 let rejection_start = *self.rejection_start_time.get_or_insert(now);
                 let stuck_duration = now.duration_since(rejection_start);
                 self.rejection_count = self.rejection_count.saturating_add(1);
                 self.rejection_peak_gap = self.rejection_peak_gap.max(gap);
+                let lead = next_pts.saturating_sub(current_pos);
                 let audio_pos = self.audio_position();
 
                 if self.rejection_count == 1 {
                     self.record_reject_window_start(now);
                     tracing::warn!(
-                        "get_next_frame: reject window start current_pos={:?}, next_pts={:?}, gap={}ms, tolerance={}ms, audio_pos={:?}, seek_gen={}",
+                        "get_next_frame: reject window start sync_pos={:?}, effective_pos={:?}, next_pts={:?}, gap={}ms, lead={}ms, tolerance={}ms, bias={}ms, state={:?}, audio_pos={:?}, seek_gen={}",
+                        raw_sync_pos,
                         current_pos,
                         next_pts,
                         gap.as_millis(),
-                        ahead_tolerance.as_millis(),
+                        lead.as_millis(),
+                        accept_tolerance.as_millis(),
+                        self.video_pts_bias.as_millis(),
+                        self.reject_state,
                         audio_pos,
                         self.seek_generation
                     );
@@ -1539,6 +1649,10 @@ impl FrameScheduler {
                             ahead_tolerance,
                         );
                     }
+                }
+
+                if self.maybe_rebase_offset_for_stable_lead(current_pos, next_pts, lead) {
+                    continue;
                 }
 
                 let near_boundary = audio_started
@@ -1566,7 +1680,54 @@ impl FrameScheduler {
                 }
 
                 if stuck_duration >= force_timeout {
-                    if self.forced_resyncs_in_window < MAX_FORCED_RESYNCS_PER_WINDOW {
+                    if self.reject_state == RejectHandlingState::Normal {
+                        self.reject_state = RejectHandlingState::CatchUp;
+                        tracing::warn!(
+                            "get_next_frame: entering catch-up mode (stuck={:?}, lead={}ms, gap={}ms, tolerance={}ms, bias={}ms)",
+                            stuck_duration,
+                            lead.as_millis(),
+                            gap.as_millis(),
+                            accept_tolerance.as_millis(),
+                            self.video_pts_bias.as_millis()
+                        );
+                    }
+
+                    if self.reject_state == RejectHandlingState::CatchUp {
+                        let catch_up_timed_out =
+                            stuck_duration >= force_timeout.saturating_add(CATCH_UP_MAX_DURATION);
+                        if catch_up_timed_out
+                            || self.catch_up_frames_in_window >= CATCH_UP_MAX_FRAMES
+                        {
+                            self.reject_state = RejectHandlingState::Resync;
+                            tracing::warn!(
+                                "get_next_frame: escalating catch-up to resync (stuck={:?}, catch_up_frames={}, lead={}ms)",
+                                stuck_duration,
+                                self.catch_up_frames_in_window,
+                                lead.as_millis()
+                            );
+                        } else if let Some(frame) = queue.pop() {
+                            self.catch_up_frames_in_window =
+                                self.catch_up_frames_in_window.saturating_add(1);
+                            tracing::debug!(
+                                "get_next_frame: catch-up accepted frame pts={:?} (count={}, lead={}ms, bias={}ms)",
+                                frame.pts,
+                                self.catch_up_frames_in_window,
+                                lead.as_millis(),
+                                self.video_pts_bias.as_millis()
+                            );
+                            self.current_position = frame.pts;
+                            self.current_frame = Some(frame.clone());
+                            self.playback_start_time = Some(std::time::Instant::now());
+                            self.playback_start_position = frame.pts;
+                            self.record_sync(frame.pts);
+                            self.track_recovery_frame();
+                            return Some(frame);
+                        }
+                    }
+
+                    if self.reject_state == RejectHandlingState::Resync
+                        && self.forced_resyncs_in_window < MAX_FORCED_RESYNCS_PER_WINDOW
+                    {
                         self.forced_resyncs_in_window += 1;
                         tracing::warn!(
                             "get_next_frame: forcing resync attempt {}/{} (stuck={:?}, near_boundary={}, gap={}ms, tolerance={}ms, audio_pos={:?})",
@@ -1575,7 +1736,7 @@ impl FrameScheduler {
                             stuck_duration,
                             near_boundary,
                             gap.as_millis(),
-                            ahead_tolerance.as_millis(),
+                            accept_tolerance.as_millis(),
                             audio_pos
                         );
                         if let Some(frame) = queue.pop() {
@@ -1585,29 +1746,33 @@ impl FrameScheduler {
                             self.playback_start_position = frame.pts;
                             return Some(frame);
                         }
-                    } else if let Some(dropped_frame) = queue.pop() {
-                        tracing::warn!(
-                            "get_next_frame: forced-resync limit reached; dropping head frame pts={:?} after {:?} (rejects={}, peak_gap={}ms, audio_pos={:?})",
-                            dropped_frame.pts,
-                            stuck_duration,
-                            self.rejection_count,
-                            self.rejection_peak_gap.as_millis(),
-                            audio_pos
-                        );
-                        self.reset_rejection_tracking();
-                        continue;
+                    } else if self.reject_state == RejectHandlingState::Resync {
+                        if let Some(dropped_frame) = queue.pop() {
+                            tracing::warn!(
+                                "get_next_frame: forced-resync limit reached; dropping head frame pts={:?} after {:?} (rejects={}, peak_gap={}ms, audio_pos={:?})",
+                                dropped_frame.pts,
+                                stuck_duration,
+                                self.rejection_count,
+                                self.rejection_peak_gap.as_millis(),
+                                audio_pos
+                            );
+                            self.reset_rejection_tracking();
+                            continue;
+                        }
                     }
                 }
 
                 // Log rejection details periodically (every ~1 second)
                 if stuck_duration.as_millis() % 1000 < 20 {
                     tracing::debug!(
-                        "get_next_frame: rejecting, stuck={:?}, current_pos={:?}, next_pts={:?}, gap={:?}ms, tolerance={}ms, audio_pos={:?}, rejects={}",
+                        "get_next_frame: rejecting, stuck={:?}, current_pos={:?}, next_pts={:?}, gap={:?}ms, tolerance={}ms, bias={}ms, state={:?}, audio_pos={:?}, rejects={}",
                         stuck_duration,
                         current_pos,
                         next_pts,
                         gap.as_millis(),
-                        ahead_tolerance.as_millis(),
+                        accept_tolerance.as_millis(),
+                        self.video_pts_bias.as_millis(),
+                        self.reject_state,
                         audio_pos,
                         self.rejection_count
                     );
@@ -1625,7 +1790,7 @@ impl FrameScheduler {
                         stuck_duration,
                         self.rejection_count,
                         self.rejection_peak_gap.as_millis(),
-                        ahead_tolerance.as_millis(),
+                        accept_tolerance.as_millis(),
                         self.audio_position()
                     );
                 }
