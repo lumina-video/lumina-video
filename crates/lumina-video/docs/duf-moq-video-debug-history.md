@@ -1,6 +1,6 @@
 # web-egui-vid-duf: MoQ Video Debug History
 
-> Exported from bead `web-egui-vid-duf` on 2026-02-09 (56 comments)
+> Originally exported from bead `web-egui-vid-duf` (56 comments at export). Extended with manual session notes.
 > Bug: "MoQ: video broken (pixelated/frozen/artifacts) — audio works after 4s startup"
 > Status: in_progress | Priority: P1 | Type: bug
 > Created: 2026-02-06 07:46 | Updated: 2026-02-09 20:25
@@ -9,7 +9,7 @@
 
 MoQ video pixelation on BBB stream + choppy audio.
 
-### Current Status (2026-02-09 Session 14)
+### Current Status (2026-02-09 Session 15)
 
 #### All committed fixes (chronological):
 - PTS tolerance: 2000ms->2500ms for 2s group boundaries (674d0c70)
@@ -26,23 +26,33 @@ MoQ video pixelation on BBB stream + choppy audio.
 - Ignore VT info_flags=0x4 when frame decoded successfully (e886a8dc)
 - Graduated VT error handling (soft skip for 1-2 errors) (12e2ea36)
 - read_frame() 3s timeout + ReadTimeout resubscribe (5cd6dbe0)
-- One-shot VT session recreation at 2nd IDR (this session)
-- Frame-rate pacing: min display interval = 1/fps for live streams (this session)
-- FrameDumpHook: format-aware NAL parsing instead of heuristic (this session)
+- One-shot VT recreation at 2nd IDR (6ea17fb0) — **REVERTED** (r31 regression, this session)
+- Frame-rate pacing: min display interval = 1/fps for live streams (6ea17fb0)
+- FrameDumpHook: format-aware NAL parsing instead of heuristic (6ea17fb0)
+- Pacing log spam fix + updatable pacing interval (this session)
+- Persistent video stall watchdog — immune to audio-arm resets (this session)
 
 #### Latest validated (r30.1):
 - **No freeze** — continuous playback through 407+ frames
-- **FPS 18-21** (up from 13-19 in r29) — pacing fix expected to stabilize at 24fps
+- **FPS 18-21** (up from 13-19 in r29)
 - **2 errors** (down from 7 in r29), 0 IDR drops (down from 85)
 - **A/V Sync PASS** — max drift 12ms, 0.0% out of sync
 - **1 resubscribe** (decoder recovery), fast recovery
 
+#### r31 regression (one-shot VT recreation — reverted):
+- One-shot VT recreation destroyed working session at frame 96 → 44 IDR drops
+- Cascading re-subscribes (4 total), errors increased 2→8, FPS dropped to 8.0
+- Errors are content-dependent (specific BBB P-frames at group position 3), not lifecycle-dependent
+- **Conclusion**: One-shot recreation is harmful; disabled permanently
+
 #### Known open issues
-- Intermittent VT -12909 errors (2 per session in r30.1, content-dependent)
-- Intermittent transport stall: hang TrackConsumer.read_frame() blocks indefinitely (r28 @ frame 42, r30 @ frame 68, absent in r29/r30.1) — safety net in place via timeout
+- **Silent VT corruption**: pixelation with 0 decode errors (VT produces corrupted output without error flags). Not from format misclassification (is_avcc fix). Not from missing keyframe (moq-lite guarantees). Hypothesis: SPS/PPS catalog mismatch or first-group IDR too small (6KB vs 92KB).
+- **FPS 18-21 instead of 24**: frame-rate pacing doesn't fully solve it. Decode rate is ~23fps during clean windows; display FPS averages in error/drop windows → 18-21.
+- **Intermittent VT -12909 errors** (2 per session in r30.1, content-dependent at specific BBB frame positions)
+- **Intermittent transport stall**: hang TrackConsumer.read_frame() blocks indefinitely (r28 @ frame 42, r30 @ frame 68) — persistent watchdog now immune to audio resets
 
 ### Notes
-Next validation: r31 runtime test with one-shot VT recreation + frame-rate pacing. Success criteria: FPS stable at ~24fps, reduced/eliminated pixelation from VT lifecycle corruption.
+Next validation: r32 runtime test with one-shot reverted + persistent video watchdog. Expected baseline: matches r30.1 (2 errors, 18-21 FPS, smooth audio).
 
 ### Dependencies
 - Depends on: web-egui-vid-9feo (Remove dead get_group(seq-1) IDR fetch code from moq_decoder.rs) [P2]
@@ -791,6 +801,55 @@ Errors cluster in BBB credits section (complex scrolling text), clear when strea
 - **Implementation**: `set_frame_rate_pacing(fps)` called from `sync_metadata_from_decode_thread()` when frame_rate > 0 and stream is live (no duration). `last_frame_accept_time` tracked at all acceptance points (normal, catch-up, resync, first frame).
 - **Files changed**: frame_queue.rs (pacing logic), video_player.rs (enable pacing from metadata), moq_decoder.rs (enable one-shot recreation), moq/worker.rs (format-aware FrameDumpHook)
 
-### Next: r31 runtime test
-- Success criteria: FPS stable at ~24fps, reduced/eliminated pixelation
-- Watch for: one-shot VT recreation log at ~48 frames, pacing log on startup
+### r31 runtime test — REGRESSION
+
+| Metric | r30.1 | r31 |
+|--------|-------|-----|
+| Freeze | No | YES (frame 195, FPS→8) |
+| Frames decoded | 405/407 | 195/372 |
+| Errors | 2 | 8 |
+| IDR drops | 0 | 44 |
+| FPS | 18-21 | 20→8 |
+| A/V Sync | PASS | 3 buffer underruns |
+| Resubscribes | 1 | 4 |
+
+#### Root cause analysis
+1. **One-shot VT recreation** destroyed a working session at frame 96, causing 25 IDR drops → cascade of re-subscribes → more errors → more IDR drops → FPS collapse
+2. **-12909 errors are data-specific**: always at group position 3 (2nd P-frame after IDR, hash=893e50083356f13b). After re-subscribe, different P-frames at that position → no error. Content-dependent, not lifecycle-dependent.
+3. **Pacing log spam**: 938 occurrences at 60Hz (log was outside idempotent guard)
+4. **Pacing didn't improve FPS**: decode rate was ~23fps during clean windows, but error/drop windows average it down
+
+#### Actions taken (Session 15)
+- Reverted `ENABLE_ONESHOT_RECREATION` to false (r31 proved it harmful)
+- Moved pacing log inside `set_frame_rate_pacing()`, allowed interval updates
+- Replaced `tokio::timeout()` video watchdog with persistent deadline immune to audio-arm resets
+- Updated "Known open issues" to include silent VT corruption + FPS gap
+
+### Next: r32 runtime test
+
+#### How to run
+```bash
+RUST_LOG=warn,lumina_video::media::moq=info,lumina_video::media::moq_decoder=info,lumina_video::media::frame_queue=warn,lumina_video::media::audio=info,lumina_video::media::moq_audio=info,lumina_video::media::video_player=info,lumina_video::media::sync_metrics=warn \
+  cargo run -p lumina-video-demo 2>&1 | tee /tmp/moq-r32.log
+```
+Then click the cdn.moq.dev BBB stream in the demo UI.
+
+#### Success criteria (should match r30.1 baseline)
+- **No freeze** — continuous playback through 300+ frames
+- **FPS 18-24** — pacing log fires once (not 938 times)
+- **Errors ≤ 2** — content-dependent -12909 at group position 3
+- **IDR drops = 0** — one-shot recreation is disabled
+- **A/V sync PASS** — max drift < 50ms, 0 buffer underruns
+- **Resubscribes ≤ 1** — decoder recovery only
+
+#### What to watch for
+- `pacing enabled: 24.0 fps` — should appear exactly once
+- `video stall detected` — should NOT appear (proves watchdog doesn't false-positive)
+- No `one-shot VT recreation` log (reverted)
+- `Buffer underrun` count — should be 0 (was 3 in r31 due to one-shot cascade)
+- FrameStats progression: `drop_idr` stays at 0, `errors` stays ≤ 2
+
+#### If it regresses
+- Check `/tmp/moq-r32.log` for `video stall detected` (watchdog false positive on slow groups)
+- Check for `pacing updated` (unexpected FPS metadata change)
+- Compare FrameStats timeline to r30.1 (errors=2, decoded≈rendered, no IDR drops)

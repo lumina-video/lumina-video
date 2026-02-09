@@ -493,6 +493,12 @@ pub(crate) async fn run_moq_worker(
     const RESUBSCRIBE_COOLDOWN: Duration = Duration::from_millis(750);
     const READ_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 
+    // Persistent video deadline: tracks wall-clock time since last video frame.
+    // Unlike wrapping read_frame() in tokio::timeout(), this isn't reset when the
+    // audio arm completes — so a video-only stall is detected even while audio
+    // continues producing frames.
+    let mut video_deadline = tokio::time::Instant::now() + READ_FRAME_TIMEOUT;
+
     let mut loop_iter: u64 = 0;
     loop {
         loop_iter += 1;
@@ -501,45 +507,9 @@ pub(crate) async fn run_moq_worker(
         }
         tokio::select! {
             // No biased — fair scheduling prevents audio starvation
-            video_result = tokio::time::timeout(READ_FRAME_TIMEOUT, video_consumer.read_frame()) => {
-                match video_result {
-                    Err(_elapsed) => {
-                        // read_frame() hung — transport stall (seen at frame 42 in r28, 68 in r30)
-                        tracing::warn!(
-                            "MoQ {}: read_frame timeout ({}s) after {} frames — resubscribing",
-                            label, READ_FRAME_TIMEOUT.as_secs(),
-                            shared.frame_stats.received.load(Ordering::Relaxed),
-                        );
-                        idr_gate_broken_keyframes = 0;
-                        if !resubscribe_video_track(
-                            &shared,
-                            &hang_consumer,
-                            &video_track,
-                            cat.max_latency,
-                            &audio_track_for_resub,
-                            &mut audio_consumer_opt,
-                            &moq_audio_thread_opt,
-                            &mut video_consumer,
-                            idr_gate_enabled,
-                            &mut waiting_for_valid_idr,
-                            &mut idr_gate_groups_seen,
-                            &mut idr_gate_start,
-                            &mut resubscribe_count,
-                            &mut recent_resubscribes,
-                            MAX_RESUBSCRIBES_IN_WINDOW,
-                            RESUBSCRIBE_WINDOW,
-                            RESUBSCRIBE_COOLDOWN,
-                            label,
-                            ResubscribeReason::ReadTimeout,
-                            "read_frame hung",
-                        )
-                        .await
-                        {
-                            break;
-                        }
-                        continue;
-                    }
-                    Ok(video_result) =>
+            video_result = video_consumer.read_frame() => {
+                // Video produced a frame (or error/EOF) — reset the stall deadline
+                video_deadline = tokio::time::Instant::now() + READ_FRAME_TIMEOUT;
                 match video_result {
                     Ok(Some(frame)) => {
                         if shared
@@ -777,7 +747,46 @@ pub(crate) async fn run_moq_worker(
                         break;
                     }
                 }
-                } // Ok(video_result) from timeout
+            }
+            // Video stall watchdog: fires when no video frame has arrived for
+            // READ_FRAME_TIMEOUT, even if audio keeps producing. Unlike the old
+            // tokio::timeout() wrapper, this deadline persists across select iterations.
+            _ = tokio::time::sleep_until(video_deadline) => {
+                tracing::warn!(
+                    "MoQ {}: video stall detected ({}s, no video frames) after {} frames — resubscribing",
+                    label, READ_FRAME_TIMEOUT.as_secs(),
+                    shared.frame_stats.received.load(Ordering::Relaxed),
+                );
+                idr_gate_broken_keyframes = 0;
+                if !resubscribe_video_track(
+                    &shared,
+                    &hang_consumer,
+                    &video_track,
+                    cat.max_latency,
+                    &audio_track_for_resub,
+                    &mut audio_consumer_opt,
+                    &moq_audio_thread_opt,
+                    &mut video_consumer,
+                    idr_gate_enabled,
+                    &mut waiting_for_valid_idr,
+                    &mut idr_gate_groups_seen,
+                    &mut idr_gate_start,
+                    &mut resubscribe_count,
+                    &mut recent_resubscribes,
+                    MAX_RESUBSCRIBES_IN_WINDOW,
+                    RESUBSCRIBE_WINDOW,
+                    RESUBSCRIBE_COOLDOWN,
+                    label,
+                    ResubscribeReason::ReadTimeout,
+                    "video stall (no frames)",
+                )
+                .await
+                {
+                    break;
+                }
+                // Reset deadline after resubscribe
+                video_deadline = tokio::time::Instant::now() + READ_FRAME_TIMEOUT;
+                continue;
             }
             audio_result = async {
                 if let Some(consumer) = audio_consumer_opt.as_mut() {

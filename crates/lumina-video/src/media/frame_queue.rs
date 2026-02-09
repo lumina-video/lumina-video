@@ -1173,13 +1173,39 @@ impl FrameScheduler {
     /// Sets frame-rate pacing for live streams. When fps > 0, the scheduler
     /// won't accept a new frame sooner than 1/fps after the last acceptance.
     /// This prevents burst consumption of group-boundary deliveries.
-    /// No-op if pacing is already set (idempotent).
+    /// Updates pacing if fps changes (e.g., provisional → accurate metadata).
     pub fn set_frame_rate_pacing(&mut self, fps: f32) {
-        if !self.frame_pacing_interval.is_zero() {
-            return; // Already configured
+        if fps <= 0.0 {
+            return;
         }
-        if fps > 0.0 {
-            self.frame_pacing_interval = Duration::from_secs_f64(1.0 / fps as f64);
+        let new_interval = Duration::from_secs_f64(1.0 / fps as f64);
+        if self.frame_pacing_interval == new_interval {
+            return; // No change
+        }
+        let was_zero = self.frame_pacing_interval.is_zero();
+        self.frame_pacing_interval = new_interval;
+        if was_zero {
+            tracing::info!(
+                "Frame-rate pacing enabled: {:.1} fps ({:.1}ms interval)",
+                fps,
+                1000.0 / fps as f64,
+            );
+        } else {
+            tracing::info!(
+                "Frame-rate pacing updated: {:.1} fps ({:.1}ms interval)",
+                fps,
+                1000.0 / fps as f64,
+            );
+        }
+    }
+
+    /// Disables frame-rate pacing (e.g., when a stream acquires duration metadata
+    /// and is no longer treated as live).
+    pub fn clear_frame_rate_pacing(&mut self) {
+        if !self.frame_pacing_interval.is_zero() {
+            tracing::info!("Frame-rate pacing disabled");
+            self.frame_pacing_interval = Duration::ZERO;
+            self.last_frame_accept_time = None;
         }
     }
 
