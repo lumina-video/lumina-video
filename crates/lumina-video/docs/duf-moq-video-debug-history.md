@@ -607,3 +607,89 @@ Session 11 (r27): Runtime test revealed root cause of low FPS + freezes. VT call
 - Silent VT corruption: pixelation with 0 decode errors (open hypothesis — see comment #37)
 - Intermittent VT -12909 errors (run-dependent, 0-2 per session — some runs have zero)
 - Pixelation from degenerate first-group IDR (6KB vs 92KB)
+
+---
+
+## r28 Results (2026-02-09, Session 12)
+
+### What worked
+- **info_flags=0x4 fix validated**: VT callbacks show `status=0, info_flags=4, image_buffer=0x...` — no storms triggered
+- **IDR gate correct**: Rejected degenerate first-group keyframe (6384B, NAL=[1]), cleared on real IDR (72222B, NAL=[5]) at 2108ms
+- **VT decode clean**: Both frames decoded with status=0, valid pixel buffers, zero errors
+- **No RequiredFrameDropped storms** — fix works as designed
+
+### What failed
+- **Freeze after 2 frames**: Received 42, Submitted 2, Decoded 2, Rendered 2, FPS 0.0
+- **Worker hung on `video_consumer.read_frame()`**: After frame #42 (IDR + 1 P-frame from group 2), the hang TrackConsumer stopped producing frames
+- **No transport errors**: No QUIC errors, no panics, no resubscribe triggers, no track-end signals
+- **Audio also frozen**: Same `tokio::select!` loop — both video and audio consumers blocked
+
+### Timeline
+| Time | Event |
+|------|-------|
+| 20:42:58.251 | Group 1 keyframe: 6384B, NAL=[1] — degenerate, rejected by IDR gate |
+| 20:42:59.724 | FrameStats: recv=30, skip_startup=29, submit=0 |
+| 20:43:00.360 | Group 2 keyframe: 72222B, NAL=[5] — real IDR, gate cleared at 2108ms |
+| 20:43:00.441 | Frame #0 decoded (IDR), Frame #1 decoded (P-frame) |
+| 20:43:00.489 | Buffer underrun, decode stall — queue empty, no more frames arrive |
+| 20:43:13+ | App frozen, rendering same 2 frames via IOSurface |
+
+### Root cause hypothesis
+The hang `TrackConsumer` stops delivering frames after ~42 frames (1 full group + 2 frames of group 2). `read_frame()` blocks indefinitely — not returning `None` (track end) or `Err`. No QUIC/transport error logged. Possible causes:
+1. hang library flow control / group boundary issue
+2. QUIC stream-level flow control blocking
+3. Publisher-side issue (group delivery stall)
+
+### Diagnostic added (uncommitted)
+- Worker select loop iteration counter (logs first 50 + every 100th)
+- Frame send confirmation log after `frame_tx.send()`
+- Will confirm whether worker is stuck in `read_frame()` vs elsewhere
+
+### Next: r29
+- Run with diagnostic logging to confirm hang location
+- If confirmed: investigate hang TrackConsumer group transition behavior
+- Consider adding timeout to `video_consumer.read_frame()` with re-subscribe on expiry
+
+---
+
+## r29 Results (2026-02-09, Session 12 continued)
+
+### What worked
+- **No freeze** — r28 hang was transient; worker select loop ran 500+ iterations continuously
+- **Audio running** — A/V drift +5-16ms, 0.0% out of sync, excellent quality
+- **Video clears over time** — heavy pixelation first ~15s (BBB credits), then clean video
+- **Worker diagnostics confirmed**: select loop + frame send logs show healthy pipeline
+- **ResubscribeReason::DecoderRecovery working**: "Skipping worker IDR gate reset" logged correctly
+
+### What failed
+- **7 VT -12909 errors in 19s** — each triggers session destroy + resubscribe + IDR gate
+- **~12 frames dropped per error** → 85 total "Drop(no IDR)" → FPS 13-19 instead of 24
+- **Error pattern**: always on early P-frame (#2-#3) after IDR, different groups/content
+- **Root cause of low FPS**: hardcoded `consecutive_decode_errors = 3` on ANY callback error
+
+### Error timeline
+| Error # | Time | IDR size | Frames decoded before error |
+|---------|------|----------|---------------------------|
+| 1 | 20:53:13 | 104,950 | 2 (IDR + 1P) |
+| 2 | 20:53:18 | 104,622 | ~80 |
+| 3 | 20:53:23 | 70,938 | ~80 |
+| 4 | 20:53:25 | 56,463 | ~50 |
+| 5 | 20:53:28 | 41,145 | ~50 |
+| 6 | 20:53:30 | 45,440 | ~26 |
+| 7 | 20:53:32 | 47,301 | ~26 |
+| (none) | 20:53:33+ | — | clean from here |
+
+Errors cluster in BBB credits section (complex scrolling text), clear when stream moves to simpler scenes.
+
+### Fix applied (uncommitted): graduated VT error handling
+**Before**: Any VT callback error (-12909) → `consecutive_decode_errors = 3` (hardcoded) → immediate session destroy + resubscribe + IDR gate. Every error costs ~12 dropped frames.
+
+**After**: Natural increment (`+= 1`, already existed at line 1303). Graduated response:
+- **consecutive 1-2**: Soft skip — keep VT session alive, no resubscribe, no IDR gate. If next frame decodes OK, counter resets to 0. Cost: 1 frame per error.
+- **consecutive 3+**: Hard reset — destroy session + resubscribe + IDR gate (safety net for persistent failures). Cost: ~12 frames.
+
+**Expected improvement**: Isolated -12909 errors (majority of cases) skip 1 frame instead of 12. Only cascading failures (3+ in a row without success) trigger the expensive recovery path.
+
+### Next: r30
+- Runtime test with graduated error handling
+- Success criteria: FPS closer to 24, fewer "Drop(no IDR)" frames, same or fewer visible artifacts

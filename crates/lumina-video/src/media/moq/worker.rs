@@ -485,7 +485,12 @@ pub(crate) async fn run_moq_worker(
     const RESUBSCRIBE_WINDOW: Duration = Duration::from_secs(8);
     const RESUBSCRIBE_COOLDOWN: Duration = Duration::from_millis(750);
 
+    let mut loop_iter: u64 = 0;
     loop {
+        loop_iter += 1;
+        if loop_iter <= 50 || loop_iter % 100 == 0 {
+            tracing::info!("MoQ {}: select loop iter #{}", label, loop_iter);
+        }
         tokio::select! {
             // No biased — fair scheduling prevents audio starvation
             video_result = video_consumer.read_frame() => {
@@ -682,10 +687,12 @@ pub(crate) async fn run_moq_worker(
                             );
                         }
 
+                        tracing::info!("MoQ {}: sending frame #{} to channel ({} bytes, kf={})", label, recv_count, moq_frame.data.len(), moq_frame.is_keyframe);
                         if frame_tx.send(moq_frame).await.is_err() {
                             tracing::warn!("MoQ {}: Frame channel closed, stopping worker", label);
                             break;
                         }
+                        tracing::info!("MoQ {}: frame #{} sent to channel OK", label, recv_count);
                     }
                     Ok(None) => {
                         idr_gate_broken_keyframes = 0;

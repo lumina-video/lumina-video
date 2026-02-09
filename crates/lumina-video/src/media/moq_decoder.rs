@@ -1311,14 +1311,20 @@ impl MoqDecoder {
                 let hard_vt_callback_failure = error_text.contains("VT decode callback error:");
                 let required_drop_storm = error_text.contains("VT required-frame-drop storm");
                 if hard_vt_callback_failure {
-                    // Callback OSStatus failures (e.g. -12909) are not transient in our runs:
-                    // keeping session alive for 1-2 extra failures extends visible corruption.
-                    // Escalate immediately to the existing hard-reset + IDR resync path.
-                    self.consecutive_decode_errors = 3;
-                    if self.request_video_resubscribe_with_cooldown() {
-                        tracing::warn!(
-                            "MoQ: VT callback failure detected — requesting immediate video re-subscribe"
-                        );
+                    // Let consecutive_decode_errors increment naturally (+= 1 below).
+                    // First 1-2 errors: soft skip (keep session, no resubscribe).
+                    // At 3+ consecutive: hard reset + IDR resync + resubscribe.
+                    // This avoids destroying a valid VT session for isolated P-frame
+                    // errors (-12909) which are common on macOS with certain H.264
+                    // content. The session resets to 0 on any successful decode.
+                    if self.consecutive_decode_errors >= 2 {
+                        // About to hit 3 — request resubscribe for fast IDR delivery
+                        if self.request_video_resubscribe_with_cooldown() {
+                            tracing::warn!(
+                                "MoQ: VT callback failure #{} — requesting video re-subscribe",
+                                self.consecutive_decode_errors + 1
+                            );
+                        }
                     }
                 } else if required_drop_storm {
                     // Keep isolated storms soft, but don't loop forever on repeated
