@@ -381,6 +381,23 @@ pub(crate) async fn run_moq_worker(
                         // -- IDR gate: skip frames until a real IDR at group boundary --
                         if waiting_for_valid_idr {
                             let start = *idr_gate_start.get_or_insert_with(std::time::Instant::now);
+
+                            // Log first few keyframes BEFORE gate decision for diagnostics
+                            if frame.keyframe && idr_gate_groups_seen < 5 {
+                                let n = data.len().min(20);
+                                let is_avcc_fmt = idr_gate_enabled;
+                                let (nal_arr, nal_count) =
+                                    MoqDecoder::find_nal_types_for_format(&data, nal_length_size, is_avcc_fmt);
+                                tracing::info!(
+                                    "MoQ {}: IDR gate keyframe #{}: {} bytes, NAL types={:?}, first_20={:02x?}",
+                                    label,
+                                    idr_gate_groups_seen + 1,
+                                    data.len(),
+                                    &nal_arr[..nal_count],
+                                    &data[..n],
+                                );
+                            }
+
                             if frame.keyframe {
                                 idr_gate_groups_seen = idr_gate_groups_seen.saturating_add(1);
                             }

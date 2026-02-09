@@ -834,13 +834,15 @@ impl MoqDecoder {
                 )));
             }
 
-            // If we were waiting for IDR and got a keyframe, clear error state and prepare decoder
+            // If we were waiting for IDR and got a keyframe, clear error state.
+            // VT session was destroyed on error — lazy init will recreate it
+            // from catalog SPS/PPS on the next decode_frame() call below.
             if self.waiting_for_idr_after_error && (is_idr || moq_frame.is_keyframe) {
-                if let Some(ref mut decoder) = self.vt_decoder {
-                    decoder.prepare_for_idr_resync();
-                }
                 self.waiting_for_idr_after_error = false;
-                tracing::info!("MoQ: received IDR, cleared decoder error state and resyncing");
+                tracing::info!(
+                    "MoQ: received IDR after error, will recreate VT session (session={})",
+                    if self.vt_decoder.is_some() { "exists" } else { "None" }
+                );
             }
         }
 
@@ -886,35 +888,23 @@ impl MoqDecoder {
             Err(e) => {
                 self.consecutive_decode_errors += 1;
 
-                if self.consecutive_decode_errors < 3 {
-                    // Isolated error: skip this frame AND gate subsequent P-frames.
-                    // The VT session's DPB now has a gap from the skipped frame —
-                    // subsequent P-frames would decode "successfully" but reference
-                    // stale/missing data, causing visible pixelation until next IDR.
-                    // Keep the session alive (avoids 15ms recreation cost) but stop
-                    // feeding P-frames until the next IDR resets the DPB.
-                    self.waiting_for_idr_after_error = true;
-                    if let Some(ref mut decoder) = self.vt_decoder {
-                        decoder.prepare_for_idr_resync();
-                    }
-                    tracing::warn!(
-                        "MoQ: VT decode error #{}, gating on IDR (session kept): {}",
-                        self.consecutive_decode_errors,
-                        e
-                    );
-                    Err(e)
-                } else {
-                    // 3+ consecutive errors: session may be truly corrupted.
-                    // Destroy and wait for IDR to create a fresh session.
-                    self.waiting_for_idr_after_error = true;
-                    self.vt_decoder = None;
-                    self.consecutive_decode_errors = 0;
-                    tracing::warn!(
-                        "MoQ: 3+ consecutive VT errors, destroyed session for IDR resync: {}",
-                        e
-                    );
-                    Err(e)
-                }
+                // Always destroy the VT session on ANY decode error.
+                // prepare_for_idr_resync() only clears the output queue — VT's
+                // internal DPB retains stale reference frames. The next IDR
+                // SHOULD reset the DPB, but in practice VT can produce silently
+                // corrupted output for multiple groups after an error unless the
+                // session is fully recreated. The 15ms recreation cost is
+                // negligible compared to seconds of visible pixelation.
+                self.waiting_for_idr_after_error = true;
+                self.vt_decoder = None;
+                tracing::warn!(
+                    "MoQ: VT decode error #{} (consecutive={}), destroyed session for IDR resync: {}",
+                    self.shared.frame_stats.decode_errors.load(std::sync::atomic::Ordering::Relaxed) + 1,
+                    self.consecutive_decode_errors,
+                    e
+                );
+                self.consecutive_decode_errors = 0;
+                Err(e)
             }
         }
     }
