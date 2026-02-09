@@ -197,6 +197,32 @@ impl FrameDumpHook {
 ///
 /// All three platform decoders (macOS, Android, Linux/GStreamer) delegate to
 /// this function. The `label` parameter is used for tracing prefixes.
+/// Why the worker is re-subscribing to the video track.
+///
+/// Controls whether the startup IDR gate is re-enabled after re-subscribe.
+/// Decoder-initiated recovery already has its own IDR gate
+/// (`MoqDecoder::waiting_for_idr_after_error`), so re-enabling the worker
+/// gate would create a double-gate that starves the decoder of frames.
+#[derive(Debug, Clone, Copy)]
+enum ResubscribeReason {
+    /// First-subscribe startup gate timeout or broken-keyframe storm.
+    StartupGate,
+    /// Video track ended (Ok(None) from read_frame).
+    TrackEnded,
+    /// Decoder requested recovery (IDR starvation, VT error escalation).
+    DecoderRecovery,
+}
+
+impl std::fmt::Display for ResubscribeReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StartupGate => f.write_str("startup IDR gate"),
+            Self::TrackEnded => f.write_str("video track ended"),
+            Self::DecoderRecovery => f.write_str("decoder requested recovery"),
+        }
+    }
+}
+
 /// Result of catalog fetch and validation, avoiding positional tuple.
 struct CatalogResult {
     video_track_name: String,
@@ -209,6 +235,12 @@ struct CatalogResult {
 }
 
 /// Re-subscribe video (and audio, if still active) after stream end or decoder-requested recovery.
+///
+/// When `reason` is [`ResubscribeReason::DecoderRecovery`], the worker startup
+/// IDR gate is **not** re-enabled. The decoder already has its own IDR gate
+/// (`waiting_for_idr_after_error`) that filters frames post-channel. Re-enabling
+/// the worker gate would create a double-gate: the worker drops non-IDR frames
+/// before they reach the channel, so the decoder gate starves and cannot clear.
 async fn resubscribe_video_track(
     shared: &Arc<MoqSharedState>,
     hang_consumer: &hang::BroadcastConsumer,
@@ -228,7 +260,8 @@ async fn resubscribe_video_track(
     resubscribe_window: Duration,
     resubscribe_cooldown: Duration,
     label: &str,
-    reason: &str,
+    reason: ResubscribeReason,
+    detail: &str,
 ) -> bool {
     let now = Instant::now();
     while let Some(front) = recent_resubscribes.front() {
@@ -263,12 +296,13 @@ async fn resubscribe_video_track(
     *resubscribe_count += 1;
     recent_resubscribes.push_back(Instant::now());
     tracing::warn!(
-        "MoQ {}: Re-subscribing video (attempt #{}, recent={} within {:?}) — {}",
+        "MoQ {}: Re-subscribing video (attempt #{}, recent={} within {:?}) — {} ({})",
         label,
         *resubscribe_count,
         recent_resubscribes.len(),
         resubscribe_window,
         reason,
+        detail,
     );
 
     *video_consumer = hang_consumer.subscribe(video_track, max_latency);
@@ -286,12 +320,24 @@ async fn resubscribe_video_track(
         );
     }
 
-    // Reset startup gate and A/V startup sync after any video re-subscribe.
-    if idr_gate_enabled {
+    // Reset startup gate and A/V startup sync — but NOT for decoder recovery.
+    //
+    // DecoderRecovery: the decoder already has its own IDR gate
+    // (waiting_for_idr_after_error) that filters post-channel. Re-enabling
+    // the worker gate here would double-gate: worker drops non-IDR frames
+    // before they reach the decoder, starving its gate indefinitely.
+    let skip_gate_reset = matches!(reason, ResubscribeReason::DecoderRecovery);
+    if idr_gate_enabled && !skip_gate_reset {
         *waiting_for_valid_idr = true;
         *idr_gate_groups_seen = 0;
         *idr_gate_start = None;
         shared.audio.video_started.store(false, Ordering::Relaxed);
+    } else if idr_gate_enabled {
+        tracing::info!(
+            "MoQ {}: Skipping worker IDR gate reset (reason={}, decoder has its own gate)",
+            label,
+            reason,
+        );
     }
 
     true
@@ -469,7 +515,8 @@ pub(crate) async fn run_moq_worker(
                                 RESUBSCRIBE_WINDOW,
                                 RESUBSCRIBE_COOLDOWN,
                                 label,
-                                "decoder requested IDR starvation recovery",
+                                ResubscribeReason::DecoderRecovery,
+                                "IDR starvation recovery",
                             )
                             .await
                             {
@@ -572,8 +619,8 @@ pub(crate) async fn run_moq_worker(
                                     || elapsed > idr_gate_hard_failsafe_timeout
                                     || broken_keyframe_storm
                                 {
-                                    let reason = format!(
-                                        "startup IDR gate timeout (elapsed={}ms, groups_seen={}, broken_keyframes={}, groups_exhausted={}, broken_keyframe_storm={})",
+                                    let detail = format!(
+                                        "elapsed={}ms, groups_seen={}, broken_keyframes={}, groups_exhausted={}, broken_keyframe_storm={}",
                                         elapsed.as_millis(),
                                         idr_gate_groups_seen,
                                         idr_gate_broken_keyframes,
@@ -600,7 +647,8 @@ pub(crate) async fn run_moq_worker(
                                         RESUBSCRIBE_WINDOW,
                                         RESUBSCRIBE_COOLDOWN,
                                         label,
-                                        &reason,
+                                        ResubscribeReason::StartupGate,
+                                        &detail,
                                     )
                                     .await
                                     {
@@ -660,7 +708,8 @@ pub(crate) async fn run_moq_worker(
                             RESUBSCRIBE_WINDOW,
                             RESUBSCRIBE_COOLDOWN,
                             label,
-                            "video track ended",
+                            ResubscribeReason::TrackEnded,
+                            "read_frame returned None",
                         )
                         .await
                         {
