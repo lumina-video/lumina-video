@@ -796,6 +796,20 @@ impl MoqDecoder {
             Self::find_nal_types_for_format(&moq_frame.data, self.h264_nal_length_size, self.is_avcc);
         let nal_types = &nal_types_arr[..nal_count];
         let is_idr = nal_types.contains(&5);
+
+        // Recreate VT session at every group-boundary keyframe.
+        // The publisher may use I-frames (NAL type 1) instead of IDR (type 5) for
+        // some group boundaries. I-frames don't reset VT's DPB, so corruption from
+        // a bad initial IDR propagates indefinitely. Recreating the session forces a
+        // clean DPB. The 15ms cost per 2s group is negligible vs visible corruption.
+        if moq_frame.is_keyframe && self.vt_decoder.is_some() {
+            tracing::info!(
+                "MoQ: recreating VT session at keyframe boundary (NAL types={:?}, {} bytes)",
+                nal_types, moq_frame.data.len()
+            );
+            self.vt_decoder = None;
+        }
+
         if let Some(ref decoder) = self.vt_decoder {
             let frame_count = decoder.frame_count();
 
