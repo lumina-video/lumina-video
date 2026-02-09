@@ -866,3 +866,44 @@ The video decode pipeline is now at its best: 0 errors, 0 drops, 0 skips in r32.
 1. **A/V sync (bead do9, HIGH)**: Investigate SampleCountingSource position tracking. Check if `sample_rate` in `position()` uses stream rate (44100) vs device rate (48000). Check symphonia resampler sample count accuracy.
 2. **FPS 20 not 24**: May be caused by A/V sync — if audio position runs slow, video scheduler (audio as master clock) advances slowly too, accepting fewer frames per second than the actual 24fps rate.
 3. **Consider closing bead duf**: Video decode pipeline is stable. A/V sync and FPS are separate issues (do9).
+
+### Next: r33 runtime test (after A/V sync fix)
+
+#### How to run
+```bash
+RUST_LOG=warn,lumina_video::media::moq=info,lumina_video::media::moq_decoder=info,lumina_video::media::frame_queue=warn,lumina_video::media::audio=info,lumina_video::media::moq_audio=info,lumina_video::media::video_player=info,lumina_video::media::sync_metrics=warn \
+  cargo run -p lumina-video-demo 2>&1 | tee /tmp/moq-r33.log
+```
+Then click the cdn.moq.dev BBB stream in the demo UI. Let it run 15-20s.
+
+#### Success criteria
+- **Video pipeline** (should match r32.1): 0 errors, 0 IDR drops, 0 startup skips, FPS 20+
+- **A/V sync PASS**: max drift < 50ms, out-of-sync < 5%
+- **FPS ≥ 23**: If A/V drift was causing slow master clock, fixing it should bring FPS closer to 24
+- **No regressions**: no freeze, no video stall watchdog false positives
+
+#### Key log lines to check
+```bash
+# Pacing: should fire exactly once
+grep "pacing enabled" /tmp/moq-r33.log | wc -l
+
+# A/V drift: should stay < 50ms
+grep "A/V sync:" /tmp/moq-r33.log | tail -5
+
+# Errors: should be 0 (or ≤ 2 if content-dependent frames appear)
+grep "OSStatus" /tmp/moq-r33.log | wc -l
+
+# Video stall: should be 0
+grep "video stall detected" /tmp/moq-r33.log | wc -l
+
+# Pipeline summary
+grep "FrameStats" /tmp/moq-r33.log | tail -3
+```
+
+#### Investigation steps (before fix)
+To diagnose the A/V drift root cause:
+1. Check `audio.rs` — `AudioHandle.position()`: does it use `sample_rate` from stream (44100) or device (48000)?
+2. Check `SampleCountingSource` — are samples counted at output rate after resampling?
+3. Check `moq_audio.rs` — is `audio_base_pts` set from the first audio frame's PTS?
+4. Add temporary logging: `tracing::info!("audio_pos={}, samples_played={}, sample_rate={}", ...)` in `position()`
+5. Calculate expected vs actual: in 10s wall-clock, audio_pos should advance ~10s. If it advances ~8.3s, the rate denominator is wrong.
