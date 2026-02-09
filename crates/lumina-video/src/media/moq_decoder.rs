@@ -478,6 +478,12 @@ pub struct MoqDecoder {
     /// Used to prevent rapid request churn when stream metadata is unstable.
     #[cfg(target_os = "macos")]
     idr_last_resubscribe_request_at: Option<std::time::Instant>,
+    /// Start of the current RequiredFrameDropped storm-cycle window.
+    #[cfg(target_os = "macos")]
+    required_drop_window_started_at: Option<std::time::Instant>,
+    /// Number of storm cycles observed in the current window.
+    #[cfg(target_os = "macos")]
+    required_drop_storms_in_window: u8,
 }
 
 #[cfg(target_os = "macos")]
@@ -621,6 +627,10 @@ impl MoqDecoder {
             idr_wait_broken_keyframe_boundaries: 0,
             #[cfg(target_os = "macos")]
             idr_last_resubscribe_request_at: None,
+            #[cfg(target_os = "macos")]
+            required_drop_window_started_at: None,
+            #[cfg(target_os = "macos")]
+            required_drop_storms_in_window: 0,
         })
     }
 
@@ -1022,6 +1032,24 @@ impl MoqDecoder {
         self.idr_wait_broken_keyframe_boundaries = 0;
     }
 
+    #[cfg(target_os = "macos")]
+    fn note_required_drop_storm_cycle(&mut self) -> u8 {
+        const STORM_ESCALATION_WINDOW: Duration = Duration::from_millis(4500);
+
+        let now = std::time::Instant::now();
+        match self.required_drop_window_started_at {
+            Some(start) if now.saturating_duration_since(start) <= STORM_ESCALATION_WINDOW => {
+                self.required_drop_storms_in_window =
+                    self.required_drop_storms_in_window.saturating_add(1);
+            }
+            _ => {
+                self.required_drop_window_started_at = Some(now);
+                self.required_drop_storms_in_window = 1;
+            }
+        }
+        self.required_drop_storms_in_window
+    }
+
     /// Decodes an encoded frame.
     ///
     /// On macOS, uses VTDecompressionSession for zero-copy hardware decoding.
@@ -1293,16 +1321,34 @@ impl MoqDecoder {
                         );
                     }
                 } else if required_drop_storm {
-                    // Persistent RequiredFrameDropped callbacks correlate with prolonged
-                    // visible corruption, but hard session-destroy on every storm creates
-                    // reset loops and prolonged low-FPS windows. Use soft recovery:
-                    // skip this frame locally without forcing IDR wait or immediate
-                    // re-subscribe churn.
-                    self.consecutive_decode_errors = 0;
-                    self.waiting_for_idr_after_error = false;
-                    tracing::warn!(
-                        "MoQ: required-frame-drop storm detected — skipping frame without re-subscribe"
-                    );
+                    // Keep isolated storms soft, but don't loop forever on repeated
+                    // storm cycles in a short window.
+                    const STORM_ESCALATION_THRESHOLD: u8 = 3;
+                    const STORM_ESCALATION_WINDOW_MS: u128 = 4500;
+                    let storms_in_window = self.note_required_drop_storm_cycle();
+                    if storms_in_window >= STORM_ESCALATION_THRESHOLD {
+                        self.consecutive_decode_errors = 3;
+                        self.required_drop_window_started_at = Some(std::time::Instant::now());
+                        self.required_drop_storms_in_window = 0;
+                        let requested_resubscribe = self.request_video_resubscribe_with_cooldown();
+                        tracing::warn!(
+                            "MoQ: required-frame-drop storm persisted ({} storms within ~{}ms) — escalating to VT session reset{}",
+                            storms_in_window,
+                            STORM_ESCALATION_WINDOW_MS,
+                            if requested_resubscribe {
+                                " + video re-subscribe request"
+                            } else {
+                                ""
+                            }
+                        );
+                    } else {
+                        self.consecutive_decode_errors = 0;
+                        self.waiting_for_idr_after_error = false;
+                        tracing::warn!(
+                            "MoQ: required-frame-drop storm detected (window_count={}) — skipping frame without re-subscribe",
+                            storms_in_window
+                        );
+                    }
                 }
                 self.log_forensic_error_window();
 
