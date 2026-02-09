@@ -1140,7 +1140,7 @@ fn setup_audio(
         audio_cfg.sample_rate,
         audio_cfg.channel_count,
         audio_cfg.description.clone(),
-        audio_handle,
+        audio_handle.clone(),
         shared.audio.clone(),
     ) {
         Ok(thread) => {
