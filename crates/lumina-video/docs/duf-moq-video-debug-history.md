@@ -568,3 +568,42 @@ Session 10: Unified worker/decoder IDR gates via ResubscribeReason enum. Double-
 
 ### Comment 56 — 2026-02-09 20:25
 Session 11 (r27): Runtime test revealed root cause of low FPS + freezes. VT callback returns info_flags=0x4 (RequiredFrameDropped) on 100% of frames on macOS 15/M4, even with status=0 and valid image_buffer. Our storm detection (threshold=36) fires every ~1.5s, causing periodic error escalation. Fix: when VT produces valid pixels (status=0, non-null image_buffer), treat info_flags=0x4 as informational, not error. Set required_frame_dropped=false in callback. Compiles clean, needs runtime validation.
+
+---
+
+## Next Test: r28 — Validate info_flags=0x4 fix (2026-02-09)
+
+### Commits under test
+- `e886a8dc` — fix(moq): ignore VT info_flags=0x4 when frame decoded successfully
+- `359bd910` — fix(moq): unify worker/decoder IDR gates via ResubscribeReason enum
+
+### Setup
+1. Start local BBB publisher: `just dev` in moq repo directory
+2. Run demo with logging:
+   ```
+   RUST_LOG=warn LUMINA_MOQ_ERROR_FORENSICS=1 cargo run -p lumina-video-demo 2>&1 | tee /tmp/moq-fixall-r28.log
+   ```
+3. Connect to `moqs://localhost/bbb` (or `moq://localhost:4443/anon/bbb`)
+4. Let it run 2+ minutes
+
+### Success criteria
+
+| Metric | Before (r26) | Target |
+|--------|-------------|--------|
+| RequiredFrameDropped storms | Every 36 frames (~1.5s) | Zero (flag ignored) |
+| Measured FPS | 11-17fps, drops to 0.0fps | Stable ~24fps |
+| Decode errors | 2 per 100 frames (storm-triggered) | 0 (or only real -12909) |
+| Freeze windows | Periodic 0.0fps freezes | None from storm path |
+| "Skipping worker IDR gate reset" | n/a | On decoder-triggered re-subscribes |
+| Pixelation | Visible macroblocking | TBD (may still exist from silent VT corruption) |
+
+### What to look for in logs
+- **No more** `RequiredFrameDropped storm` lines (storms eliminated at source)
+- **No more** `VT required-frame-drop storm (streak=36)` errors
+- If real VT -12909 errors still occur: `drop(no IDR)` should stop at ~24 per event (not 48-130+)
+- "Skipping worker IDR gate reset" on any decoder-triggered re-subscribe
+
+### Known remaining issues (not addressed by this fix)
+- Silent VT corruption: pixelation with 0 decode errors (open hypothesis — see comment #37)
+- 1-2 real VT -12909 errors per session (non-format-related, run-dependent)
+- Pixelation from degenerate first-group IDR (6KB vs 92KB)
