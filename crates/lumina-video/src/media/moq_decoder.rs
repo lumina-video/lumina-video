@@ -2945,18 +2945,32 @@ mod macos_vt {
             );
             return;
         }
-        if info_flags & 0x4 != 0 {
-            // kVTDecodeInfo_RequiredFrameDropped - but we still have an image_buffer
-            tracing::debug!(
-                "VT decode: required frame drop flagged but continuing (info_flags=0x{:x})",
-                info_flags
-            );
-        }
-
         if image_buffer.is_null() {
-            tracing::warn!("VT decode callback: null image buffer");
+            if info_flags & 0x4 != 0 {
+                // kVTDecodeInfo_RequiredFrameDropped with no image — genuine drop
+                tracing::warn!(
+                    "VT decode: frame dropped (info_flags=0x{:x}, no image buffer)",
+                    info_flags
+                );
+            } else {
+                tracing::warn!("VT decode callback: null image buffer");
+            }
             return;
         }
+
+        // info_flags bit 0x4 (RequiredFrameDropped) fires on 100% of frames on
+        // macOS 15 / Apple Silicon even when status=0 and image_buffer is valid.
+        // When VT successfully produces pixels, treat the frame as good — the flag
+        // is informational, not an error signal.
+        let required_frame_dropped = if info_flags & 0x4 != 0 && !image_buffer.is_null() {
+            tracing::trace!(
+                "VT decode: info_flags=0x{:x} with valid image — treating as successful",
+                info_flags
+            );
+            false
+        } else {
+            false
+        };
 
         // CVImageBuffer is the same as CVPixelBuffer for video frames
         // Retain the pixel buffer so it stays valid
@@ -2979,7 +2993,7 @@ mod macos_vt {
         let frame = DecodedVTFrame {
             pts_us,
             pixel_buffer,
-            required_frame_dropped: (info_flags & 0x4) != 0,
+            required_frame_dropped,
         };
         tracing::debug!("VT decode callback: acquiring lock on decoded_frames queue");
         let mut queue = callback_state.decoded_frames.lock();
