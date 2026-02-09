@@ -211,6 +211,8 @@ enum ResubscribeReason {
     TrackEnded,
     /// Decoder requested recovery (IDR starvation, VT error escalation).
     DecoderRecovery,
+    /// read_frame() hung beyond timeout — transport stall.
+    ReadTimeout,
 }
 
 impl std::fmt::Display for ResubscribeReason {
@@ -219,6 +221,7 @@ impl std::fmt::Display for ResubscribeReason {
             Self::StartupGate => f.write_str("startup IDR gate"),
             Self::TrackEnded => f.write_str("video track ended"),
             Self::DecoderRecovery => f.write_str("decoder requested recovery"),
+            Self::ReadTimeout => f.write_str("read_frame timeout"),
         }
     }
 }
@@ -484,6 +487,7 @@ pub(crate) async fn run_moq_worker(
     const MAX_RESUBSCRIBES_IN_WINDOW: usize = 5;
     const RESUBSCRIBE_WINDOW: Duration = Duration::from_secs(8);
     const RESUBSCRIBE_COOLDOWN: Duration = Duration::from_millis(750);
+    const READ_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 
     let mut loop_iter: u64 = 0;
     loop {
@@ -493,7 +497,45 @@ pub(crate) async fn run_moq_worker(
         }
         tokio::select! {
             // No biased — fair scheduling prevents audio starvation
-            video_result = video_consumer.read_frame() => {
+            video_result = tokio::time::timeout(READ_FRAME_TIMEOUT, video_consumer.read_frame()) => {
+                match video_result {
+                    Err(_elapsed) => {
+                        // read_frame() hung — transport stall (seen at frame 42 in r28, 68 in r30)
+                        tracing::warn!(
+                            "MoQ {}: read_frame timeout ({}s) after {} frames — resubscribing",
+                            label, READ_FRAME_TIMEOUT.as_secs(),
+                            shared.frame_stats.received.load(Ordering::Relaxed),
+                        );
+                        idr_gate_broken_keyframes = 0;
+                        if !resubscribe_video_track(
+                            &shared,
+                            &hang_consumer,
+                            &video_track,
+                            cat.max_latency,
+                            &audio_track_for_resub,
+                            &mut audio_consumer_opt,
+                            &moq_audio_thread_opt,
+                            &mut video_consumer,
+                            idr_gate_enabled,
+                            &mut waiting_for_valid_idr,
+                            &mut idr_gate_groups_seen,
+                            &mut idr_gate_start,
+                            &mut resubscribe_count,
+                            &mut recent_resubscribes,
+                            MAX_RESUBSCRIBES_IN_WINDOW,
+                            RESUBSCRIBE_WINDOW,
+                            RESUBSCRIBE_COOLDOWN,
+                            label,
+                            ResubscribeReason::ReadTimeout,
+                            "read_frame hung",
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    Ok(video_result) =>
                 match video_result {
                     Ok(Some(frame)) => {
                         if shared
@@ -731,6 +773,7 @@ pub(crate) async fn run_moq_worker(
                         break;
                     }
                 }
+                } // Ok(video_result) from timeout
             }
             audio_result = async {
                 if let Some(consumer) = audio_consumer_opt.as_mut() {

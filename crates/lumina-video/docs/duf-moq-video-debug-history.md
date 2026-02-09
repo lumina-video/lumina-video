@@ -9,7 +9,7 @@
 
 MoQ video pixelation on BBB stream + choppy audio.
 
-### Current Status (2026-02-09 Session 11)
+### Current Status (2026-02-09 Session 13)
 
 #### All committed fixes (chronological):
 - PTS tolerance: 2000ms->2500ms for 2s group boundaries (674d0c70)
@@ -24,14 +24,21 @@ MoQ video pixelation on BBB stream + choppy audio.
 - VT session quiesce barrier (27b9eaf7)
 - Unified worker/decoder IDR gates via ResubscribeReason enum (359bd910)
 - Ignore VT info_flags=0x4 when frame decoded successfully (e886a8dc)
+- Graduated VT error handling (soft skip for 1-2 errors) (12e2ea36)
+- read_frame() 3s timeout + ReadTimeout resubscribe (this session)
 
-#### Awaiting runtime validation (r28)
-- info_flags=0x4 fix + ResubscribeReason unification — see test plan at bottom
+#### Latest validated (r30.1):
+- **No freeze** — continuous playback through 407+ frames
+- **FPS 18-21** (up from 13-19 in r29)
+- **2 errors** (down from 7 in r29), 0 IDR drops (down from 85)
+- **A/V Sync PASS** — max drift 12ms, 0.0% out of sync
+- **1 resubscribe** (decoder recovery), fast recovery
 
 #### Known open issues
-- Silent VT corruption: pixelation with 0 decode errors (see comment #37)
-- Intermittent VT -12909 errors (run-dependent, 0-2 per session)
-- Degenerate first-group IDR (6KB vs 92KB) may cause initial pixelation
+- Silent VT corruption: pixelation with 0 decode errors (see comment #37, r30.1 screenshots)
+- FPS 18-21 instead of 24 — likely presentation pacing, not transport
+- Intermittent VT -12909 errors (2 per session in r30.1, content-dependent)
+- Intermittent transport stall: hang TrackConsumer.read_frame() blocks indefinitely (r28 @ frame 42, r30 @ frame 68, absent in r29/r30.1)
 
 ### Notes
 Next validation plan (determinism check): rerun the same BBB scenario with LUMINA_MOQ_ERROR_FORENSICS=1 and compare failing frame hash64 values against prior run. Prior failing triplet: d8b88f02b47590e4, af827e33672d222a, 970741a3001f2163 (with preceding IDR hash ad78eefdd683534e). Decision rule: if same hashes fail again at similar relative position, classify as deterministic content-triggered (specific AU/bitstream incompatibility). If hashes differ run-to-run, classify as nondeterministic runtime/lifecycle/timing issue and prioritize VT/session scheduling investigation.
@@ -693,3 +700,77 @@ Errors cluster in BBB credits section (complex scrolling text), clear when strea
 ### Next: r30
 - Runtime test with graduated error handling
 - Success criteria: FPS closer to 24, fewer "Drop(no IDR)" frames, same or fewer visible artifacts
+
+---
+
+## r30 Results (2026-02-09, Session 13)
+
+### FROZEN at frame 68 (same pattern as r28)
+- Received 68, Submitted 68, Decoded 68, Rendered 68 — all equal, 0 errors
+- Worker select loop reached iter #100, then stuck — no iter #200 logged
+- Frame #61 was keyframe (100,506 bytes), frames 62-68 were P-frames, then hang
+- `video_consumer.read_frame()` blocked indefinitely — no `Ok(None)`, no `Err`, just silent stall
+- Audio: Running. A/V Sync: Drift +256ms (stale), Quality FAIL (frozen video)
+- Frame rate correctly detected as 24fps (improvement from 30fps default)
+
+### Root cause: hang TrackConsumer transport stall
+- Same issue as r28 (frame 42): the `hang` crate's `read_frame()` future never resolves
+- Intermittent — absent in r29 (500+ iterations) and r30.1 (1400+ iterations)
+- No QUIC errors, no transport logs, no panics — completely silent
+- Hypothesis: QUIC stream for current group ends, next group subscription fails silently
+
+### Fix applied: read_frame() timeout with resubscribe
+- Added `READ_FRAME_TIMEOUT = 3s` constant
+- Wrapped `video_consumer.read_frame()` in `tokio::time::timeout()`
+- On timeout: log warning, resubscribe as `ResubscribeReason::ReadTimeout`
+- Added `ReadTimeout` variant to `ResubscribeReason` enum (re-enables IDR gate like TrackEnded)
+
+---
+
+## r30.1 Results (2026-02-09, Session 13)
+
+### What worked
+- **No freeze** — continuous playback through 407+ frames, 1400+ select loop iterations
+- **Graduated error handling effective**: 2 VT -12909 errors, soft-skipped (no session destroy for first), resubscribe only triggered at consecutive=3
+- **0 IDR gate drops** — massive improvement from r29's 85
+- **A/V Sync PASS** — max drift 12ms, 0.0% out of sync, Quality: PASS
+- **Audio: Running** — continuous, no choppy, no eviction pressure
+- **Frame rate**: 24fps correctly detected (not 30fps default)
+- **No read_frame timeouts** — transport didn't stall this run (stall is intermittent)
+
+### Progression over time
+| Screenshot | Received | Decoded | Errors | FPS | Visual |
+|-----------|----------|---------|--------|-----|--------|
+| 1 | 113 | 113 | 0 | 18.0 | Pixelated |
+| 2 | 191 | 191 | 0 | 19.0 | Cleaner |
+| 3 | 260 | 260 | 0 | 20.0 | Some pixelation (butterflies) |
+| 4 | 331 | 331 | 0 | 19.0 | Heavy corruption (battle scene) |
+| 5 | 407 | 405 | 2 | 21.0 | CLEAN |
+
+### Error details
+- 2 VT -12909 errors at ~407 frames, in quick succession
+- Error #1: consecutive=1, soft skip (keep session, no resubscribe)
+- Error #2: consecutive=2, triggers resubscribe at consecutive=3 threshold
+- 1 resubscribe total (DecoderRecovery) — fast recovery
+- Cost: 2 frames (407 submitted, 405 decoded) — down from 85 in r29
+
+### Comparison table
+| Metric | r29 | r30 (frozen) | r30.1 |
+|--------|-----|-------------|-------|
+| Freeze | No | YES (frame 68) | **No** |
+| Frames decoded | 368/548 | 68/68 | **405/407** |
+| Errors | 6-7 | 0 | **2** |
+| IDR drops | 85 | 0 | **0** |
+| FPS | 13-19 | 0 | **18-21** |
+| A/V Sync | N/A | N/A | **PASS (max 12ms)** |
+| Resubscribes | many | 0 | **1** |
+
+### Remaining issues
+1. **Silent VT corruption** — pixelation with 0 decode errors in screenshots 1,3,4. VT produces corrupted output without setting error flag. Content-dependent (complex BBB scenes). Separate open issue.
+2. **FPS 18-21 instead of 24** — not caused by errors (only 2 frames lost). Likely presentation pacing in frame_queue.rs or wgpu texture upload overhead.
+3. **Intermittent transport stall** — read_frame timeout is a safety net, not a fix. Root cause in hang/moq-lite group subscription lifecycle.
+
+### Next: r31
+- Investigate FPS gap (24 expected, 18-21 actual) — profile frame_queue decode/render loop timing
+- Consider reducing READ_FRAME_TIMEOUT from 3s to 2s for faster stall recovery
+- Silent VT corruption requires separate investigation (frame dump + hex analysis)
