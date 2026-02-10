@@ -1433,14 +1433,24 @@ impl MoqDecoder {
             }
         }
 
-        // Decode the frame using VTDecoder
-        let vt_is_keyframe = is_idr;
+        // Treat metadata keyframe boundaries without a real IDR as discontinuities.
+        // Decoding these as plain P-frames can poison visual output without emitting
+        // callback errors. Instead, enter IDR wait and let the existing bounded
+        // recovery/resubscribe machinery converge on a real IDR boundary.
         if moq_frame.is_keyframe && !is_idr {
+            self.waiting_for_idr_after_error = true;
             tracing::warn!(
-                "MoQ: keyframe metadata mismatch (is_keyframe=true but NAL types={:?}); submitting as non-keyframe",
+                "MoQ: keyframe metadata mismatch (is_keyframe=true but NAL types={:?}); entering IDR wait",
                 nal_types
             );
+            return Err(VideoError::DecodeFailed(format!(
+                "Waiting for IDR frame (metadata keyframe without IDR, NAL types {:?})",
+                nal_types
+            )));
         }
+
+        // Decode the frame using VTDecoder
+        let vt_is_keyframe = is_idr;
 
         let decode_result = if let Some(ref mut decoder) = self.vt_decoder {
             decoder.decode_frame(&moq_frame.data, moq_frame.timestamp_us, vt_is_keyframe)
