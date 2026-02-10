@@ -208,6 +208,8 @@ pub(crate) struct FrameStats {
     pub(crate) rendered: AtomicU64,
     /// Decode errors
     pub(crate) decode_errors: AtomicU64,
+    /// Frames dropped during DPB grace (after isolated VT callback error)
+    pub(crate) dropped_dpb_grace: AtomicU64,
 }
 
 impl FrameStats {
@@ -220,10 +222,11 @@ impl FrameStats {
         let decoded = self.decoded.load(Ordering::Relaxed);
         let rendered = self.rendered.load(Ordering::Relaxed);
         let errors = self.decode_errors.load(Ordering::Relaxed);
+        let dropped_dpb = self.dropped_dpb_grace.load(Ordering::Relaxed);
 
         tracing::info!(
-            "MoQ FrameStats [{}]: recv={}, drop_bp={}, drop_idr={}, skip_startup={}, submit={}, decoded={}, rendered={}, errors={}",
-            label, received, dropped_bp, dropped_idr, skipped_startup, submitted, decoded, rendered, errors
+            "MoQ FrameStats [{}]: recv={}, drop_bp={}, drop_idr={}, drop_dpb={}, skip_startup={}, submit={}, decoded={}, rendered={}, errors={}",
+            label, received, dropped_bp, dropped_idr, dropped_dpb, skipped_startup, submitted, decoded, rendered, errors
         );
     }
 
@@ -237,6 +240,7 @@ impl FrameStats {
             decoded: self.decoded.load(Ordering::Relaxed),
             rendered: self.rendered.load(Ordering::Relaxed),
             decode_errors: self.decode_errors.load(Ordering::Relaxed),
+            dropped_dpb_grace: self.dropped_dpb_grace.load(Ordering::Relaxed),
         }
     }
 }
@@ -252,6 +256,7 @@ pub struct MoqFrameStatsSnapshot {
     pub decoded: u64,
     pub rendered: u64,
     pub decode_errors: u64,
+    pub dropped_dpb_grace: u64,
 }
 
 /// Point-in-time snapshot of all MoQ decoder stats for UI display.
@@ -438,6 +443,16 @@ pub struct MoqDecoder {
     /// successful decode or IDR resync.
     #[cfg(target_os = "macos")]
     consecutive_decode_errors: u32,
+    /// Lightweight DPB grace: skip non-IDR frames after an isolated VT callback
+    /// error (consecutive_decode_errors == 1 only). Bypasses note_idr_wait_progress()
+    /// to avoid premature resubscribe. Bounded by timeout/drop budget;
+    /// on expiry, escalates to waiting_for_idr_after_error for normal recovery.
+    #[cfg(target_os = "macos")]
+    skip_pframes_until_idr: bool,
+    #[cfg(target_os = "macos")]
+    dpb_grace_started_at: Option<std::time::Instant>,
+    #[cfg(target_os = "macos")]
+    dpb_grace_dropped_frames: u32,
     /// True until the one-shot VT session recreation has fired.
     #[cfg(target_os = "macos")]
     needs_session_recreation: bool,
@@ -603,6 +618,12 @@ impl MoqDecoder {
             waiting_for_idr_after_error: false,
             #[cfg(target_os = "macos")]
             consecutive_decode_errors: 0,
+            #[cfg(target_os = "macos")]
+            skip_pframes_until_idr: false,
+            #[cfg(target_os = "macos")]
+            dpb_grace_started_at: None,
+            #[cfg(target_os = "macos")]
+            dpb_grace_dropped_frames: 0,
             #[cfg(target_os = "macos")]
             needs_session_recreation: true,
             #[cfg(target_os = "macos")]
@@ -948,6 +969,89 @@ impl MoqDecoder {
         self.idr_wait_broken_keyframe_boundaries = 0;
     }
 
+    /// Ensure a VTDecompressionSession exists, creating one if needed.
+    ///
+    /// Tries catalog avcC description first, falls back to keyframe SPS/PPS
+    /// extraction. Respects quiesce window after session destruction.
+    #[cfg(target_os = "macos")]
+    fn ensure_vt_session(
+        &mut self,
+        moq_frame: &MoqVideoFrame,
+    ) -> Result<(), VideoError> {
+        if self.vt_decoder.is_some() {
+            return Ok(());
+        }
+
+        // Enforce non-blocking quiesce window after session destruction
+        if let Some(quiesce_until) = self.quiesce_until {
+            let now = std::time::Instant::now();
+            if now < quiesce_until {
+                return Err(VideoError::DecodeFailed(
+                    "Waiting for VT quiesce".to_string(),
+                ));
+            }
+            self.quiesce_until = None;
+            tracing::info!("MoQ: VT quiesce window complete, creating new session");
+        }
+
+        let metadata = self.shared.metadata.lock().clone();
+
+        // First, try to use codec description from catalog (avcC/hvcC box)
+        if let Some(ref desc) = *self.shared.codec_description.lock() {
+            match Self::parse_avcc_box(desc) {
+                Ok((sps, pps, nal_length_size)) => {
+                    let decoder = macos_vt::VTDecoder::new_h264(
+                        &sps,
+                        &pps,
+                        metadata.width,
+                        metadata.height,
+                        true, // catalog avcC = AVCC format
+                    )?;
+                    self.vt_decoder = Some(decoder);
+                    self.h264_nal_length_size = nal_length_size;
+                    self.is_avcc = true;
+                    self.vt_session_count += 1;
+                    tracing::info!("MoQ: initialized VTDecoder session #{} from catalog avcC ({} bytes SPS, {} bytes PPS, NAL len size {})", self.vt_session_count, sps.len(), pps.len(), nal_length_size);
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!("MoQ: failed to parse avcC from catalog: {}", e);
+                }
+            }
+        }
+
+        // Fallback: extract SPS/PPS from keyframe
+        if !moq_frame.is_keyframe {
+            tracing::debug!("MoQ: waiting for keyframe to initialize VTDecoder");
+            return Err(VideoError::DecodeFailed(
+                "Waiting for keyframe with SPS/PPS".to_string(),
+            ));
+        }
+
+        match Self::extract_h264_params(&moq_frame.data) {
+            Ok((sps, pps)) => {
+                let decoder = macos_vt::VTDecoder::new_h264(
+                    &sps,
+                    &pps,
+                    metadata.width,
+                    metadata.height,
+                    false, // keyframe extraction = Annex B format
+                )?;
+                self.vt_decoder = Some(decoder);
+                self.h264_nal_length_size = 4;
+                self.vt_session_count += 1;
+                tracing::info!(
+                    "MoQ: initialized VTDecoder session #{} from keyframe SPS/PPS (Annex B)", self.vt_session_count
+                );
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!("MoQ: failed to extract H.264 params: {}", e);
+                Err(e)
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     fn request_video_resubscribe_with_cooldown(&mut self) -> bool {
         const RESUBSCRIBE_REQUEST_COOLDOWN: Duration = Duration::from_millis(800);
@@ -1056,78 +1160,8 @@ impl MoqDecoder {
     /// On other platforms, returns a placeholder (FFmpeg integration TODO).
     #[cfg(target_os = "macos")]
     fn decode_frame(&mut self, moq_frame: &MoqVideoFrame) -> Result<VideoFrame, VideoError> {
-        // Initialize VTDecoder lazily
-        if self.vt_decoder.is_none() {
-            // If a previous session was just destroyed, enforce a non-blocking
-            // quiesce window before creating a new session.
-            if let Some(quiesce_until) = self.quiesce_until {
-                let now = std::time::Instant::now();
-                if now < quiesce_until {
-                    return Err(VideoError::DecodeFailed(
-                        "Waiting for VT quiesce".to_string(),
-                    ));
-                }
-                self.quiesce_until = None;
-                tracing::info!("MoQ: VT quiesce window complete, creating new session");
-            }
-            let metadata = self.shared.metadata.lock().clone();
-
-            // First, try to use codec description from catalog (avcC/hvcC box)
-            if let Some(ref desc) = *self.shared.codec_description.lock() {
-                match Self::parse_avcc_box(desc) {
-                    Ok((sps, pps, nal_length_size)) => {
-                        let decoder = macos_vt::VTDecoder::new_h264(
-                            &sps,
-                            &pps,
-                            metadata.width,
-                            metadata.height,
-                            true, // catalog avcC = AVCC format
-                        )?;
-                        self.vt_decoder = Some(decoder);
-                        self.h264_nal_length_size = nal_length_size;
-                        self.is_avcc = true;
-                        self.vt_session_count += 1;
-                        tracing::info!("MoQ: initialized VTDecoder session #{} from catalog avcC ({} bytes SPS, {} bytes PPS, NAL len size {})", self.vt_session_count, sps.len(), pps.len(), nal_length_size);
-                    }
-                    Err(e) => {
-                        tracing::warn!("MoQ: failed to parse avcC from catalog: {}", e);
-                    }
-                }
-            }
-
-            // If still no decoder, try extracting SPS/PPS from keyframe
-            if self.vt_decoder.is_none() {
-                if !moq_frame.is_keyframe {
-                    tracing::debug!("MoQ: waiting for keyframe to initialize VTDecoder");
-                    return Err(VideoError::DecodeFailed(
-                        "Waiting for keyframe with SPS/PPS".to_string(),
-                    ));
-                }
-
-                // Try to extract SPS/PPS from the keyframe data
-                match Self::extract_h264_params(&moq_frame.data) {
-                    Ok((sps, pps)) => {
-                        let decoder = macos_vt::VTDecoder::new_h264(
-                            &sps,
-                            &pps,
-                            metadata.width,
-                            metadata.height,
-                            false, // keyframe extraction = Annex B format
-                        )?;
-                        self.vt_decoder = Some(decoder);
-                        self.h264_nal_length_size = 4; // Default for Annex B extraction
-                        self.vt_session_count += 1;
-                        tracing::info!(
-                            "MoQ: initialized VTDecoder session #{} from keyframe SPS/PPS (Annex B)", self.vt_session_count
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!("MoQ: failed to extract H.264 params: {}", e);
-                        return Err(e);
-                    }
-                }
-            }
-        }
+        // Initialize VTDecoder lazily (creates from catalog avcC or keyframe SPS/PPS)
+        self.ensure_vt_session(moq_frame)?;
 
         // Check if we're waiting for IDR resync after a decode error
         if self.should_wait_for_idr(moq_frame) {
@@ -1159,6 +1193,69 @@ impl MoqDecoder {
         let nal_types = &nal_types_arr[..nal_count];
         let is_idr = nal_types.contains(&5);
         self.record_forensic_sample(moq_frame, nal_types);
+
+        // Bounded DPB grace: skip non-IDR frames after isolated VT callback error.
+        // The skipped error frame leaves a stale DPB reference — subsequent
+        // P-frames decode with status=0 but produce macroblock artifacts.
+        // Bypasses note_idr_wait_progress() to avoid premature resubscribe.
+        const DPB_GRACE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2500);
+        const DPB_GRACE_MAX_DROPS: u32 = 60;
+        if self.skip_pframes_until_idr {
+            if is_idr {
+                let dpb_drops = self.dpb_grace_dropped_frames;
+                // Clear DPB grace state
+                self.skip_pframes_until_idr = false;
+                self.dpb_grace_started_at = None;
+                self.dpb_grace_dropped_frames = 0;
+                // Reset error tracking — fresh session starts clean
+                self.consecutive_decode_errors = 0;
+                self.waiting_for_idr_after_error = false;
+                self.reset_idr_wait_tracking();
+                // Destroy corrupted VT session — IDR alone doesn't clear
+                // VT's internal corruption state (r34: SS4 still pixelated
+                // after IDR on same session, SS6 clean after recreation).
+                self.vt_decoder = None;
+                self.ensure_vt_session(moq_frame)?;
+                tracing::info!(
+                    "MoQ: DPB grace cleared by IDR — recreated VT session #{} ({} frames dropped)",
+                    self.vt_session_count, dpb_drops
+                );
+                // Fall through to decode this IDR on the fresh session
+            } else {
+                let start = *self
+                    .dpb_grace_started_at
+                    .get_or_insert_with(std::time::Instant::now);
+                self.dpb_grace_dropped_frames += 1;
+                self.shared
+                    .frame_stats
+                    .dropped_dpb_grace
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let elapsed = start.elapsed();
+
+                if elapsed > DPB_GRACE_TIMEOUT
+                    || self.dpb_grace_dropped_frames > DPB_GRACE_MAX_DROPS
+                {
+                    // Grace expired — escalate to normal IDR-wait with resubscribe.
+                    self.skip_pframes_until_idr = false;
+                    let drops = self.dpb_grace_dropped_frames;
+                    self.dpb_grace_started_at = None;
+                    self.dpb_grace_dropped_frames = 0;
+                    self.waiting_for_idr_after_error = true;
+                    tracing::warn!(
+                        "MoQ: DPB grace expired ({}ms, {} drops) — escalating to IDR-wait",
+                        elapsed.as_millis(),
+                        drops
+                    );
+                }
+
+                // Use distinct message that does NOT contain "Waiting for IDR frame"
+                // to avoid double-counting in dropped_waiting_idr (line ~1729).
+                return Err(VideoError::DecodeFailed(format!(
+                    "DPB grace skip (NAL type {})",
+                    nal_types.first().copied().unwrap_or(0)
+                )));
+            }
+        }
 
         // One-shot VT session recreation at the second IDR after startup.
         // The initial VT session can produce silently corrupted output (VT
@@ -1402,6 +1499,9 @@ impl MoqDecoder {
                     // internal DPB retains stale reference frames. Full session
                     // recreation from catalog SPS/PPS is needed for clean recovery.
                     self.waiting_for_idr_after_error = true;
+                    self.skip_pframes_until_idr = false;
+                    self.dpb_grace_started_at = None;
+                    self.dpb_grace_dropped_frames = 0;
                     self.vt_decoder = None; // Drop: WaitForAsync → Invalidate → CFRelease
                     self.quiesce_until =
                         Some(std::time::Instant::now() + std::time::Duration::from_millis(50));
@@ -1410,17 +1510,28 @@ impl MoqDecoder {
                         total_errors, self.consecutive_decode_errors, e
                     );
                 } else {
-                    // Isolated error: skip this frame, keep session alive.
-                    // VT can often recover from transient errors on the next frame.
-                    // Do NOT enter IDR wait mode here, or we can drop an entire GOP
-                    // for each one-off error.
                     self.waiting_for_idr_after_error = false;
-                    tracing::warn!(
-                        "MoQ: VT decode error #{} (consecutive={}), skipping frame without IDR gate: {}",
-                        total_errors,
-                        self.consecutive_decode_errors,
-                        e
-                    );
+
+                    if hard_vt_callback_failure && self.consecutive_decode_errors == 1 {
+                        // First isolated VT callback failure: the skipped P-frame was
+                        // a DPB reference. Subsequent P-frames will decode successfully
+                        // but produce macroblock artifacts. Enter bounded DPB grace
+                        // to skip until next natural IDR resets the DPB.
+                        self.skip_pframes_until_idr = true;
+                        self.dpb_grace_started_at = None;
+                        self.dpb_grace_dropped_frames = 0;
+                        tracing::warn!(
+                            "MoQ: VT callback error #{} (isolated), DPB grace until next IDR: {}",
+                            total_errors, e
+                        );
+                    } else {
+                        tracing::warn!(
+                            "MoQ: VT decode error #{} (consecutive={}), skipping frame without IDR gate: {}",
+                            total_errors,
+                            self.consecutive_decode_errors,
+                            e
+                        );
+                    }
                 }
                 Err(e)
             }
@@ -1723,9 +1834,11 @@ impl VideoDecoderBackend for MoqDecoder {
                         if msg.contains("Waiting for keyframe")
                             || msg.contains("Waiting for IDR frame")
                             || msg.contains("Waiting for VT quiesce")
+                            || msg.contains("DPB grace skip")
                             || msg.contains("no frame decoded") =>
                     {
-                        // Track frames dropped waiting for IDR
+                        // Track frames dropped waiting for IDR (but NOT DPB grace —
+                        // those are already counted via dropped_dpb_grace)
                         if msg.contains("Waiting for IDR") {
                             self.shared
                                 .frame_stats

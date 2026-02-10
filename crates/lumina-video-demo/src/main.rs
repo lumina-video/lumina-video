@@ -954,6 +954,14 @@ impl eframe::App for DemoApp {
                                         );
                                         ui.end_row();
                                     }
+                                    if fs.dropped_dpb_grace > 0 {
+                                        ui.label("DPB Grace:");
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(255, 200, 100),
+                                            format!("{}", fs.dropped_dpb_grace),
+                                        );
+                                        ui.end_row();
+                                    }
                                     if fs.skipped_startup_frames > 0 {
                                         ui.label("Skip (startup):");
                                         ui.colored_label(
