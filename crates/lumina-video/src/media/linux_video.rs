@@ -12,6 +12,13 @@
 //! 2. DMABuf FDs are imported directly into Vulkan via `VK_EXT_external_memory_dma_buf`
 //! 3. Vulkan images are used by wgpu for rendering (no CPU copy)
 //!
+//! # Vulkan Specification References
+//!
+//! - [VK_EXT_external_memory_dma_buf](https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_EXT_external_memory_dma_buf.html)
+//! - [VK_EXT_image_drm_format_modifier](https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_EXT_image_drm_format_modifier.html)
+//!
+//! See `docs/VULKAN-REFERENCE.md` for detailed extension usage and troubleshooting.
+//!
 //! # Fallback Policy
 //!
 //! Zero-copy is the only acceptable path for production use. Any fallback to CPU copy

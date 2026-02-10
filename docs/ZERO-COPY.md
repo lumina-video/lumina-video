@@ -123,3 +123,15 @@ See [PR #22](https://github.com/lumina-video/lumina-video/pull/22) for implement
 | Web | 1 GPU hop via copyExternalImageToTexture |
 | Android | 1 GPU hop via VkSamplerYcbcrConversion (PR #22) |
 | Windows | Implemented, needs device testing |
+
+## Developer Resources
+
+### Vulkan Specification
+- **Full spec**: [Vulkan-Docs](https://github.com/KhronosGroup/Vulkan-Docs)
+- **Extension registry**: [Vulkan Extension Registry](https://registry.khronos.org/vulkan/)
+- **Quick reference**: See `docs/VULKAN-REFERENCE.md` for extensions used in this project
+
+### Debugging Tools
+- **Vulkan Validation Layers**: Enable with `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`
+- **RenderDoc**: GPU frame capture and analysis
+- **Android GPU Inspector**: Real-time profiling on Android

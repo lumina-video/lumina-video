@@ -83,6 +83,27 @@ Be respectful and constructive. We're all here to build great software.
 
    > **Note**: No features are enabled by default. You must explicitly enable a platform feature (except Android, which is target-based).
 
+## Technical Resources
+
+### Zero-Copy Video Architecture
+- **High-level overview**: See `docs/ZERO-COPY.md` for platform-specific implementations
+- **Platform guides**: `docs/ANDROID.md`, `docs/PLATFORMS.md`
+- **A/V sync details**: `docs/AV-SYNC.md`
+
+### Vulkan Development (Android/Linux Zero-Copy)
+If you're working on Android or Linux zero-copy paths, you'll need Vulkan knowledge:
+
+- **Quick reference**: `docs/VULKAN-REFERENCE.md` - Extensions used in this project
+- **Official spec**: [Vulkan-Docs](https://github.com/KhronosGroup/Vulkan-Docs) - Full Vulkan specification
+- **Extension registry**: [registry.khronos.org/vulkan](https://registry.khronos.org/vulkan/)
+
+**Debugging tools**:
+- Vulkan Validation Layers (`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`)
+- [RenderDoc](https://renderdoc.org/) - GPU frame capture
+- [Android GPU Inspector](https://gpuinspector.dev/) - Real-time profiling
+
+**Note**: Vulkan is only needed for the zero-copy import layer (android_vulkan.rs, linux_video.rs). The rest of the codebase uses wgpu's abstraction.
+
 ## Development Guidelines
 
 ### Code Style
