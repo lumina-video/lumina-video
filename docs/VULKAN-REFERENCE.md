@@ -208,6 +208,19 @@ export VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_DEBUG_PRINTF_EXT
 
 ---
 
+## Known Issues & Workarounds
+
+### Vulkan Validation Layers
+- **[Issue #5687](https://github.com/KhronosGroup/Vulkan-ValidationLayers/issues/5687)**: DMABuf validation bug - validation layers incorrectly validate VkExternalMemoryImageCreateInfo with DMA_BUF handle type. **Workaround**: Disable validation or filter this specific error.
+- **[Mesa Issue #9161](https://gitlab.freedesktop.org/mesa/mesa/-/issues/9161)**: AMD radeon segfault with validation + VK_EXT_image_drm_format_modifiers. **Workaround**: Disable validation on affected drivers.
+
+### Platform-Specific
+- **Intel ANV (Mesa ≤25.1)**: UV plane offset corruption with NV12 (documented in MEMORY.md)
+- **AMD GPUs**: [Zero-copy not in Firefox release](https://bugzilla.mozilla.org/show_bug.cgi?id=1998839) as of early 2026
+- **VA-API DMABuf**: [Texture creation failures](https://bugzilla.mozilla.org/show_bug.cgi?id=1645672) in some Mesa configurations
+
+---
+
 ## Extension Support Matrix
 
 | Extension | Android Min API | Linux Kernel | Notes |
