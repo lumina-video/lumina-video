@@ -29,8 +29,8 @@ MoQ video pixelation on BBB stream + choppy audio.
 - One-shot VT recreation at 2nd IDR (6ea17fb0) — **REVERTED** (r31 regression, this session)
 - Frame-rate pacing: min display interval = 1/fps for live streams (6ea17fb0)
 - FrameDumpHook: format-aware NAL parsing instead of heuristic (6ea17fb0)
-- Pacing log spam fix + updatable pacing interval (this session)
-- Persistent video stall watchdog — immune to audio-arm resets (this session)
+- Pacing log spam fix + updatable/clearable pacing interval (5f3cf213)
+- Persistent video stall watchdog — immune to audio-arm resets (5f3cf213, ee1856f6)
 
 #### Latest validated (r32.1 — best video pipeline results):
 - **No freeze** — continuous playback through 298+ frames
@@ -46,7 +46,7 @@ MoQ video pixelation on BBB stream + choppy audio.
 - **Silent VT corruption**: Not observed in r32.1 (may be correlated with the errors that didn't occur this session).
 
 ### Notes
-Video decode pipeline is stable. Remaining issues are in the A/V sync / presentation layer (bead do9). Consider closing bead duf.
+Video decode pipeline (format detection, VT session management, IDR gating, watchdog) is stable with 0 errors in r32.1. However, A/V drift (bead do9) and FPS gap remain open and affect overall playback quality. Keep bead duf open until these are resolved or explicitly scoped out to do9.
 
 ### Dependencies
 - Depends on: web-egui-vid-9feo (Remove dead get_group(seq-1) IDR fetch code from moq_decoder.rs) [P2]
@@ -860,18 +860,70 @@ r32 revealed a bug in the new persistent video watchdog: `video_deadline` was re
 - `ee1856f6` — Watchdog only resets on submitted frames, not IDR-gated skips
 
 #### Video pipeline status: STABLE
-The video decode pipeline is now at its best: 0 errors, 0 drops, 0 skips in r32.1. The remaining issues (FPS 20 not 24, A/V drift) are in the presentation/sync layer, not the decode pipeline. Bead `duf` (video broken) can be considered substantially resolved — remaining work is A/V sync (do9) and FPS tuning.
+The video decode pipeline is now at its best: 0 errors, 0 drops, 0 skips in r32.1. The remaining issues (FPS 20 not 24, A/V drift) are in the presentation/sync layer, not the decode pipeline. Bead `duf` remains open — A/V sync (do9) and FPS gap still affect overall playback quality.
 
 ### Next steps
 1. **A/V sync (bead do9, HIGH)**: Investigate SampleCountingSource position tracking. Check if `sample_rate` in `position()` uses stream rate (44100) vs device rate (48000). Check symphonia resampler sample count accuracy.
 2. **FPS 20 not 24**: May be caused by A/V sync — if audio position runs slow, video scheduler (audio as master clock) advances slowly too, accepting fewer frames per second than the actual 24fps rate.
-3. **Consider closing bead duf**: Video decode pipeline is stable. A/V sync and FPS are separate issues (do9).
+3. **Scope review for bead duf vs do9**: Decide whether A/V drift and FPS gap belong under duf (video broken) or should be fully scoped to do9 (A/V sync). Keep duf open until resolved.
 
-### Next: r33 runtime test (after A/V sync fix)
+### r33 results
+
+| Metric | r32.1 | r33 | Status |
+|--------|-------|-----|--------|
+| Errors | 0 | 2 | Content-dependent (known) |
+| IDR drops | 0 | 0 | PASS |
+| Startup skips | 0 | 42 | First group needed 2nd IDR |
+| Resubscribes | 0 | 1 | Triggered by errors |
+| FPS | 20 | 14→20 | Similar |
+| A/V Drift | +2690ms | **+2ms** | **FIXED** |
+| Out of Sync | - | 0.0% | **PASS** |
+| Max Drift | - | +7ms | PASS |
+| Quality | FAIL | **PASS** | A/V sync excellent |
+| Pixelation | not observed | YES | Silent VT corruption (open) |
+| Video stall watchdog | - | 0 fires | PASS |
+| Pacing | 1 | 1 | PASS |
+
+#### r33 freeze root cause: demo UI, NOT decoder
+
+The video freeze at ~7s was caused by the demo UI, not the decoder:
+1. Auto-discover loaded cdn.moq.dev BBB stream → playing correctly
+2. User clicked "Go" with **localhost** relay selected (default, index 0) → `load_video("moq://localhost:4443/anon/bbb")` **replaced** the working player
+3. Localhost QUIC connection attempt started at 23:08:37.479 (HTTP cert fetch)
+4. ~7s later at 23:08:44.362 — connection timed out → `set_error()` → `eof_reached=true` → `playing=false` → PAUSED
+5. Old cdn.moq.dev tokio worker kept running (detached task, not cancelled), so FrameStats continued incrementing — but the active player was now the failed localhost one
+
+**Fix**: Change default relay from localhost (index 0) to cdn.moq.dev (index 1) in demo.
+
+#### A/V sync: unexpectedly fixed
+
+A/V drift went from +2690ms (r32.1) to +2ms (r33) without any explicit sync fix. Possible explanations:
+- The r32.1 drift was caused by the error-triggered resubscribe creating a PTS discontinuity (r32.1 had 0 errors, no resubscribe to realign)
+- Different BBB loop position at join time may affect initial PTS alignment
+- The pacing fixes (updatable interval, clearable) may have had an indirect effect
+- Needs confirmation in r34 with clean test (no accidental localhost replacement)
+
+### Next: r34 runtime test (clean, no localhost)
 
 #### How to run
 ```bash
-RUST_LOG=warn,lumina_video::media::moq=info,lumina_video::media::moq_decoder=info,lumina_video::media::frame_queue=warn,lumina_video::media::audio=info,lumina_video::media::moq_audio=info,lumina_video::media::video_player=info,lumina_video::media::sync_metrics=warn \
+RUST_LOG=warn,lumina_video::media::moq=info,lumina_video::media::moq_decoder=info,lumina_video::media::frame_queue=info,lumina_video::media::audio=info,lumina_video::media::moq_audio=info,lumina_video::media::video_player=info,lumina_video::media::sync_metrics=warn \
+  cargo run -p lumina-video-demo 2>&1 | tee /tmp/moq-r34.log
+```
+**IMPORTANT**: Do NOT click "Go" with localhost. Only use the cdn.moq.dev auto-discover stream.
+Let it run 20-30s without touching controls after initial click.
+
+#### Success criteria
+- **Video pipeline**: ≤ 2 errors (content-dependent), 0 IDR drops, FPS 20+
+- **A/V sync PASS**: max drift < 50ms, out-of-sync < 5% (confirm r33 wasn't a fluke)
+- **No freeze**: stream plays continuously for 20s+
+- **Pixelation**: note whether present (open issue, not a blocker for r34)
+
+#### Previous r33 test plan
+
+#### How to run
+```bash
+RUST_LOG=warn,lumina_video::media::moq=info,lumina_video::media::moq_decoder=info,lumina_video::media::frame_queue=info,lumina_video::media::audio=info,lumina_video::media::moq_audio=info,lumina_video::media::video_player=info,lumina_video::media::sync_metrics=warn \
   cargo run -p lumina-video-demo 2>&1 | tee /tmp/moq-r33.log
 ```
 Then click the cdn.moq.dev BBB stream in the demo UI. Let it run 15-20s.
@@ -884,11 +936,14 @@ Then click the cdn.moq.dev BBB stream in the demo UI. Let it run 15-20s.
 
 #### Key log lines to check
 ```bash
-# Pacing: should fire exactly once
+# Pacing: should fire exactly once (logged at info level)
 grep "pacing enabled" /tmp/moq-r33.log | wc -l
 
-# A/V drift: should stay < 50ms
+# A/V drift: only emits at warn level when drift > 150ms.
+# No output = drift stayed below 150ms (PASS for <50ms criteria requires UI check).
+# Any output = FAIL — shows drift direction and magnitude.
 grep "A/V sync:" /tmp/moq-r33.log | tail -5
+# Also check demo UI stats panel for real-time drift value.
 
 # Errors: should be 0 (or ≤ 2 if content-dependent frames appear)
 grep "OSStatus" /tmp/moq-r33.log | wc -l

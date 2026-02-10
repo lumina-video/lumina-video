@@ -77,9 +77,9 @@ fn get_moq_test_streams() -> Vec<(String, String)> {
 
 /// Known MoQ relay endpoints for manual entry
 const MOQ_RELAYS: &[(&str, &str)] = &[
-    ("localhost (anon)", "moq://localhost:4443/anon"),
     ("cdn.moq.dev (anon)", "moqs://cdn.moq.dev:443/anon"),
     ("cdn.moq.dev", "moqs://cdn.moq.dev:443"),
+    ("localhost (anon)", "moq://localhost:4443/anon"),
     (
         "Cloudflare (interop)",
         "moqs://interop-relay.cloudflare.mediaoverquic.com:443",
