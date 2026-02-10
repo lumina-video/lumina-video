@@ -453,6 +453,18 @@ pub struct MoqDecoder {
     dpb_grace_started_at: Option<std::time::Instant>,
     #[cfg(target_os = "macos")]
     dpb_grace_dropped_frames: u32,
+    /// Observed real-IDR cadence (EMA, microseconds). Used to adapt DPB grace
+    /// timeout/drop budget to stream cadence instead of fixed constants.
+    #[cfg(target_os = "macos")]
+    observed_idr_interval_us: Option<u64>,
+    /// Last seen real-IDR PTS (microseconds) for cadence estimation.
+    #[cfg(target_os = "macos")]
+    last_idr_pts_us: Option<u64>,
+    /// Strict recovery gate: after VT session recreation for recovery, only
+    /// allow non-IDR frames once a real IDR decodes successfully on the fresh
+    /// session.
+    #[cfg(target_os = "macos")]
+    require_clean_idr_after_recreate: bool,
     /// True until the one-shot VT session recreation has fired.
     #[cfg(target_os = "macos")]
     needs_session_recreation: bool,
@@ -624,6 +636,12 @@ impl MoqDecoder {
             dpb_grace_started_at: None,
             #[cfg(target_os = "macos")]
             dpb_grace_dropped_frames: 0,
+            #[cfg(target_os = "macos")]
+            observed_idr_interval_us: None,
+            #[cfg(target_os = "macos")]
+            last_idr_pts_us: None,
+            #[cfg(target_os = "macos")]
+            require_clean_idr_after_recreate: false,
             #[cfg(target_os = "macos")]
             needs_session_recreation: true,
             #[cfg(target_os = "macos")]
@@ -974,10 +992,7 @@ impl MoqDecoder {
     /// Tries catalog avcC description first, falls back to keyframe SPS/PPS
     /// extraction. Respects quiesce window after session destruction.
     #[cfg(target_os = "macos")]
-    fn ensure_vt_session(
-        &mut self,
-        moq_frame: &MoqVideoFrame,
-    ) -> Result<(), VideoError> {
+    fn ensure_vt_session(&mut self, moq_frame: &MoqVideoFrame) -> Result<(), VideoError> {
         if self.vt_decoder.is_some() {
             return Ok(());
         }
@@ -1041,7 +1056,8 @@ impl MoqDecoder {
                 self.h264_nal_length_size = 4;
                 self.vt_session_count += 1;
                 tracing::info!(
-                    "MoQ: initialized VTDecoder session #{} from keyframe SPS/PPS (Annex B)", self.vt_session_count
+                    "MoQ: initialized VTDecoder session #{} from keyframe SPS/PPS (Annex B)",
+                    self.vt_session_count
                 );
                 Ok(())
             }
@@ -1154,6 +1170,47 @@ impl MoqDecoder {
         self.required_drop_storms_in_window
     }
 
+    #[cfg(target_os = "macos")]
+    fn note_real_idr_timestamp(&mut self, pts_us: u64) {
+        // Ignore clearly invalid cadence deltas.
+        const MIN_IDR_INTERVAL_US: u64 = 300_000;
+        const MAX_IDR_INTERVAL_US: u64 = 8_000_000;
+
+        if let Some(prev_pts) = self.last_idr_pts_us {
+            let delta_us = pts_us.saturating_sub(prev_pts);
+            if (MIN_IDR_INTERVAL_US..=MAX_IDR_INTERVAL_US).contains(&delta_us) {
+                self.observed_idr_interval_us = Some(match self.observed_idr_interval_us {
+                    // Smooth noisy group boundaries while still adapting.
+                    Some(current) => ((current * 3) + delta_us) / 4,
+                    None => delta_us,
+                });
+            }
+        }
+        self.last_idr_pts_us = Some(pts_us);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn dpb_grace_budget(&self) -> (Duration, u32) {
+        // Base timeout from observed IDR cadence + margin for jitter/bursting.
+        let observed_us = self.observed_idr_interval_us.unwrap_or(2_000_000);
+        let timeout_us = observed_us.saturating_add(900_000);
+        let timeout_us = timeout_us.clamp(2_500_000, 5_000_000);
+        let timeout = Duration::from_micros(timeout_us);
+
+        let fps = if self.cached_metadata.frame_rate.is_finite()
+            && self.cached_metadata.frame_rate > 1.0
+        {
+            self.cached_metadata.frame_rate as f64
+        } else {
+            24.0
+        };
+        let max_drops = ((timeout.as_secs_f64() * fps).ceil() as u32)
+            .saturating_add(8)
+            .clamp(60, 180);
+
+        (timeout, max_drops)
+    }
+
     /// Decodes an encoded frame.
     ///
     /// On macOS, uses VTDecompressionSession for zero-copy hardware decoding.
@@ -1192,14 +1249,16 @@ impl MoqDecoder {
         );
         let nal_types = &nal_types_arr[..nal_count];
         let is_idr = nal_types.contains(&5);
+        if is_idr {
+            self.note_real_idr_timestamp(moq_frame.timestamp_us);
+        }
         self.record_forensic_sample(moq_frame, nal_types);
 
         // Bounded DPB grace: skip non-IDR frames after isolated VT callback error.
         // The skipped error frame leaves a stale DPB reference — subsequent
         // P-frames decode with status=0 but produce macroblock artifacts.
         // Bypasses note_idr_wait_progress() to avoid premature resubscribe.
-        const DPB_GRACE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2500);
-        const DPB_GRACE_MAX_DROPS: u32 = 60;
+        let (dpb_grace_timeout, dpb_grace_max_drops) = self.dpb_grace_budget();
         if self.skip_pframes_until_idr {
             if is_idr {
                 let dpb_drops = self.dpb_grace_dropped_frames;
@@ -1215,10 +1274,14 @@ impl MoqDecoder {
                 // VT's internal corruption state (r34: SS4 still pixelated
                 // after IDR on same session, SS6 clean after recreation).
                 self.vt_decoder = None;
+                self.require_clean_idr_after_recreate = true;
                 self.ensure_vt_session(moq_frame)?;
                 tracing::info!(
-                    "MoQ: DPB grace cleared by IDR — recreated VT session #{} ({} frames dropped)",
-                    self.vt_session_count, dpb_drops
+                    "MoQ: DPB grace cleared by IDR — recreated VT session #{} ({} frames dropped, budget={}ms/{} drops)",
+                    self.vt_session_count,
+                    dpb_drops,
+                    dpb_grace_timeout.as_millis(),
+                    dpb_grace_max_drops
                 );
                 // Fall through to decode this IDR on the fresh session
             } else {
@@ -1232,8 +1295,8 @@ impl MoqDecoder {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let elapsed = start.elapsed();
 
-                if elapsed > DPB_GRACE_TIMEOUT
-                    || self.dpb_grace_dropped_frames > DPB_GRACE_MAX_DROPS
+                if elapsed > dpb_grace_timeout
+                    || self.dpb_grace_dropped_frames > dpb_grace_max_drops
                 {
                     // Grace expired — escalate to normal IDR-wait with resubscribe.
                     self.skip_pframes_until_idr = false;
@@ -1242,9 +1305,11 @@ impl MoqDecoder {
                     self.dpb_grace_dropped_frames = 0;
                     self.waiting_for_idr_after_error = true;
                     tracing::warn!(
-                        "MoQ: DPB grace expired ({}ms, {} drops) — escalating to IDR-wait",
+                        "MoQ: DPB grace expired ({}ms, {} drops; budget={}ms/{} drops) — escalating to IDR-wait",
                         elapsed.as_millis(),
-                        drops
+                        drops,
+                        dpb_grace_timeout.as_millis(),
+                        dpb_grace_max_drops
                     );
                 }
 
@@ -1255,6 +1320,18 @@ impl MoqDecoder {
                     nal_types.first().copied().unwrap_or(0)
                 )));
             }
+        }
+
+        if self.require_clean_idr_after_recreate && !is_idr {
+            tracing::debug!(
+                "MoQ: post-recreate clean-IDR gate active (NAL type {}, {} bytes)",
+                nal_types.first().copied().unwrap_or(0),
+                moq_frame.data.len()
+            );
+            return Err(VideoError::DecodeFailed(format!(
+                "Waiting for IDR frame (post-recreate gate, NAL type {})",
+                nal_types.first().copied().unwrap_or(0)
+            )));
         }
 
         // One-shot VT session recreation at the second IDR after startup.
@@ -1385,6 +1462,13 @@ impl MoqDecoder {
 
                 // Reset consecutive error counter on success
                 self.consecutive_decode_errors = 0;
+                if self.require_clean_idr_after_recreate && is_idr {
+                    self.require_clean_idr_after_recreate = false;
+                    tracing::info!(
+                        "MoQ: post-recreate clean-IDR gate satisfied on session #{}",
+                        self.vt_session_count
+                    );
+                }
 
                 // Log first few successful decodes
                 if decoded_count <= 5 {
@@ -1502,6 +1586,7 @@ impl MoqDecoder {
                     self.skip_pframes_until_idr = false;
                     self.dpb_grace_started_at = None;
                     self.dpb_grace_dropped_frames = 0;
+                    self.require_clean_idr_after_recreate = true;
                     self.vt_decoder = None; // Drop: WaitForAsync → Invalidate → CFRelease
                     self.quiesce_until =
                         Some(std::time::Instant::now() + std::time::Duration::from_millis(50));
@@ -1522,7 +1607,8 @@ impl MoqDecoder {
                         self.dpb_grace_dropped_frames = 0;
                         tracing::warn!(
                             "MoQ: VT callback error #{} (isolated), DPB grace until next IDR: {}",
-                            total_errors, e
+                            total_errors,
+                            e
                         );
                     } else {
                         tracing::warn!(
