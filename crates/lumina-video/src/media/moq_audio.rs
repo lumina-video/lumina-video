@@ -367,7 +367,7 @@ fn moq_audio_thread_main(
         // 23ms SamplesBuffers that cause ~10% audio rate shortfall.
         let mut consecutive_errors: u32 = 0;
         let mut batch_data: Vec<f32> = Vec::with_capacity(1024 * channels as usize * 8);
-        let mut batch_pts: Duration = Duration::ZERO;
+        let mut batch_pts: Option<Duration> = None;
 
         loop {
             if stop_flag.load(Ordering::Relaxed) {
@@ -386,9 +386,11 @@ fn moq_audio_thread_main(
             };
 
             // Decode first frame into batch, preserving its PTS for AudioPlayer.
-            batch_pts = Duration::from_micros(first_frame.timestamp_us);
             match aac_decoder.decode_frame(&first_frame.data, first_frame.timestamp_us) {
                 Ok(samples) => {
+                    if batch_pts.is_none() {
+                        batch_pts = Some(Duration::from_micros(first_frame.timestamp_us));
+                    }
                     batch_data.extend_from_slice(&samples.data);
                     consecutive_errors = 0;
                 }
@@ -417,6 +419,9 @@ fn moq_audio_thread_main(
                     Ok(frame) => {
                         match aac_decoder.decode_frame(&frame.data, frame.timestamp_us) {
                             Ok(samples) => {
+                                if batch_pts.is_none() {
+                                    batch_pts = Some(Duration::from_micros(frame.timestamp_us));
+                                }
                                 batch_data.extend_from_slice(&samples.data);
                                 consecutive_errors = 0;
                             }
@@ -455,9 +460,10 @@ fn moq_audio_thread_main(
                     data: std::mem::take(&mut batch_data),
                     sample_rate,
                     channels: channels as u16,
-                    pts: batch_pts,
+                    pts: batch_pts.unwrap_or(Duration::ZERO),
                 };
                 player.queue_samples(samples);
+                batch_pts = None;
             }
         }
     } else if channel_disconnected {
