@@ -330,8 +330,21 @@ fn moq_audio_thread_main(
 
     // -- Phase 2: Flush pre-buffer + start playback --
     if !stopped && !channel_disconnected {
-        for samples in pre_buffer {
-            player.queue_samples(samples);
+        // Merge pre-buffered frames into one SamplesBuffer to avoid rodio queue gaps.
+        // Preserve the first frame's PTS — AudioPlayer uses it as base_pts for sync.
+        if !pre_buffer.is_empty() {
+            let first_pts = pre_buffer[0].pts;
+            let total_samples: usize = pre_buffer.iter().map(|s| s.data.len()).sum();
+            let mut merged = Vec::with_capacity(total_samples);
+            for s in pre_buffer {
+                merged.extend_from_slice(&s.data);
+            }
+            player.queue_samples(AudioSamples {
+                data: merged,
+                sample_rate,
+                channels: channels as u16,
+                pts: first_pts,
+            });
         }
 
         // Advertise audio availability once playback is actually starting.
@@ -349,7 +362,12 @@ fn moq_audio_thread_main(
         );
 
         // -- Phase 3: Steady-state decode loop --
+        // Batch-drain: accumulate all available decoded PCM into one large SamplesBuffer
+        // before queuing to rodio. This eliminates silent gaps between individual
+        // 23ms SamplesBuffers that cause ~10% audio rate shortfall.
         let mut consecutive_errors: u32 = 0;
+        let mut batch_data: Vec<f32> = Vec::with_capacity(1024 * channels as usize * 8);
+        let mut batch_pts: Duration = Duration::ZERO;
 
         loop {
             if stop_flag.load(Ordering::Relaxed) {
@@ -357,35 +375,89 @@ fn moq_audio_thread_main(
                 break;
             }
 
-            match audio_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(frame) => match aac_decoder.decode_frame(&frame.data, frame.timestamp_us) {
-                    Ok(samples) => {
-                        player.queue_samples(samples);
-                        consecutive_errors = 0;
-                    }
-                    Err(e) => {
-                        consecutive_errors += 1;
-                        tracing::debug!("MoQ audio: decode error #{}: {e}", consecutive_errors);
-                        if consecutive_errors >= MAX_CONSECUTIVE_DECODE_ERRORS {
-                            tracing::warn!(
-                                "MoQ audio: {} consecutive decode errors, likely unsupported AAC profile",
-                                consecutive_errors
-                            );
-                            *audio_shared.audio_status.lock() = MoqAudioStatus::Error;
-                            audio_shared
-                                .internal_audio_ready
-                                .store(false, Ordering::Relaxed);
-                            break;
-                        }
-                    }
-                },
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    continue;
-                }
+            // Block until at least one frame arrives (or timeout/disconnect).
+            let first_frame = match audio_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(frame) => frame,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                     tracing::debug!("MoQ audio: channel disconnected, exiting");
                     break;
                 }
+            };
+
+            // Decode first frame into batch, preserving its PTS for AudioPlayer.
+            batch_pts = Duration::from_micros(first_frame.timestamp_us);
+            match aac_decoder.decode_frame(&first_frame.data, first_frame.timestamp_us) {
+                Ok(samples) => {
+                    batch_data.extend_from_slice(&samples.data);
+                    consecutive_errors = 0;
+                }
+                Err(e) => {
+                    consecutive_errors += 1;
+                    tracing::debug!("MoQ audio: decode error #{}: {e}", consecutive_errors);
+                    if consecutive_errors >= MAX_CONSECUTIVE_DECODE_ERRORS {
+                        tracing::warn!(
+                            "MoQ audio: {} consecutive decode errors, likely unsupported AAC profile",
+                            consecutive_errors
+                        );
+                        *audio_shared.audio_status.lock() = MoqAudioStatus::Error;
+                        audio_shared
+                            .internal_audio_ready
+                            .store(false, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+
+            let mut fatal_decode_error = false;
+
+            // Drain all remaining available frames without blocking.
+            loop {
+                match audio_rx.try_recv() {
+                    Ok(frame) => {
+                        match aac_decoder.decode_frame(&frame.data, frame.timestamp_us) {
+                            Ok(samples) => {
+                                batch_data.extend_from_slice(&samples.data);
+                                consecutive_errors = 0;
+                            }
+                            Err(e) => {
+                                consecutive_errors += 1;
+                                tracing::debug!(
+                                    "MoQ audio: decode error #{}: {e}",
+                                    consecutive_errors
+                                );
+                                if consecutive_errors >= MAX_CONSECUTIVE_DECODE_ERRORS {
+                                    tracing::warn!(
+                                        "MoQ audio: {} consecutive decode errors, likely unsupported AAC profile",
+                                        consecutive_errors
+                                    );
+                                    *audio_shared.audio_status.lock() = MoqAudioStatus::Error;
+                                    audio_shared
+                                        .internal_audio_ready
+                                        .store(false, Ordering::Relaxed);
+                                    fatal_decode_error = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => break, // Channel empty or disconnected
+                }
+            }
+
+            if fatal_decode_error {
+                break;
+            }
+
+            // Flush batch as one large SamplesBuffer.
+            if !batch_data.is_empty() {
+                let samples = AudioSamples {
+                    data: std::mem::take(&mut batch_data),
+                    sample_rate,
+                    channels: channels as u16,
+                    pts: batch_pts,
+                };
+                player.queue_samples(samples);
             }
         }
     } else if channel_disconnected {
