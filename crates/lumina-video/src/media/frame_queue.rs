@@ -1054,6 +1054,10 @@ pub struct FrameScheduler {
     audio_start_time: Option<std::time::Instant>,
     /// Audio position when audio_start_time was recorded (for seek-aware drift calculation)
     audio_start_pos: Duration,
+    /// Last time we logged 10s A/V clock delta diagnostics.
+    last_clock_delta_log: Option<std::time::Instant>,
+    /// Wall-clock elapsed and audio_delta at last log point (for computing 10s deltas).
+    last_clock_delta_values: Option<(Duration, Duration)>,
     /// Number of consecutive rejections in the current reject window.
     rejection_count: u32,
     /// Peak observed A/V gap in the current reject window.
@@ -1106,6 +1110,8 @@ impl FrameScheduler {
             seek_generation: 0,
             audio_start_time: None,
             audio_start_pos: Duration::ZERO,
+            last_clock_delta_log: None,
+            last_clock_delta_values: None,
             rejection_count: 0,
             rejection_peak_gap: Duration::ZERO,
             forced_resyncs_in_window: 0,
@@ -1145,6 +1151,8 @@ impl FrameScheduler {
             seek_generation: 0,
             audio_start_time: None,
             audio_start_pos: Duration::ZERO,
+            last_clock_delta_log: None,
+            last_clock_delta_values: None,
             rejection_count: 0,
             rejection_peak_gap: Duration::ZERO,
             forced_resyncs_in_window: 0,
@@ -1285,6 +1293,8 @@ impl FrameScheduler {
         self.waiting_for_first_frame = true;
         self.stalled = false;
         self.reset_rejection_tracking();
+        self.last_clock_delta_log = None;
+        self.last_clock_delta_values = None;
         // Don't set playback_start_time yet - wait for first frame
     }
 
@@ -1296,6 +1306,8 @@ impl FrameScheduler {
         self.reset_rejection_tracking();
         self.audio_start_time = None;
         self.audio_start_pos = Duration::ZERO;
+        self.last_clock_delta_log = None;
+        self.last_clock_delta_values = None;
         if let Some(start) = self.playback_start_time.take() {
             // Calculate wall-clock position
             let wall_clock_pos = self.playback_start_position + start.elapsed();
@@ -1341,6 +1353,8 @@ impl FrameScheduler {
             self.playback_start_time = None;
             self.audio_start_time = None;
             self.audio_start_pos = Duration::ZERO;
+            self.last_clock_delta_log = None;
+            self.last_clock_delta_values = None;
 
             // Clear audio epoch and native position so they get re-synchronized
             if let Some(ref audio) = self.audio_handle {
@@ -1942,6 +1956,37 @@ impl FrameScheduler {
                     .unwrap_or(Duration::ZERO);
                 let audio_delta = audio_pos.saturating_sub(self.audio_start_pos);
                 self.sync_metrics.record_frame(elapsed, audio_delta);
+
+                // 10s clock-source diagnostic: log wall-clock vs audio-clock deltas
+                // to determine whether drift is from audio sample counting or video pacing.
+                let now = std::time::Instant::now();
+                let should_log = match self.last_clock_delta_log {
+                    None => elapsed > Duration::from_secs(1), // emit first diagnostic after 1s
+                    Some(last) => now.duration_since(last) >= Duration::from_secs(10),
+                };
+                if should_log {
+                    let (prev_elapsed, prev_audio) = self
+                        .last_clock_delta_values
+                        .unwrap_or((Duration::ZERO, Duration::ZERO));
+                    let d_wall = elapsed.saturating_sub(prev_elapsed);
+                    let d_audio = audio_delta.saturating_sub(prev_audio);
+                    let d_wall_s = d_wall.as_secs_f64();
+                    let d_audio_s = d_audio.as_secs_f64();
+                    let rate = if d_wall_s > 0.0 {
+                        d_audio_s / d_wall_s
+                    } else {
+                        1.0
+                    };
+                    tracing::info!(
+                        "A/V clock delta (10s): wall={}ms, audio={}ms, rate={:.4} (1.0=perfect), drift_now={}ms",
+                        d_wall.as_millis(),
+                        d_audio.as_millis(),
+                        rate,
+                        elapsed.as_millis() as i64 - audio_delta.as_millis() as i64
+                    );
+                    self.last_clock_delta_log = Some(now);
+                    self.last_clock_delta_values = Some((elapsed, audio_delta));
+                }
             }
         }
     }
