@@ -1,0 +1,132 @@
+name: Release Android APK
+
+on:
+  release:
+    types: [published]
+  # Allow manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g., 0.2.1)'
+        required: true
+        default: '0.2.1'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-apk:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$EVENT_NAME" = "release" ]; then
+            VERSION="${TAG_NAME#v}"
+          else
+            VERSION="$INPUT_VERSION"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-release
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: sdkmanager "ndk;27.0.12077973"
+
+      - name: Add Android target
+        run: rustup target add aarch64-linux-android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version 4.1.2
+
+      - name: Build native library (arm64)
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.0.12077973
+        run: cargo ndk -t arm64-v8a -P 26 build --package lumina-video-android --release
+
+      - name: Copy native library to jniLibs
+        run: |
+          mkdir -p android/app/src/main/jniLibs/arm64-v8a
+          cp target/aarch64-linux-android/release/liblumina_video_android.so \
+             android/app/src/main/jniLibs/arm64-v8a/
+
+      - name: Update version in build.gradle.kts
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Derive versionCode from version string: 0.2.1 -> 201, 1.0.0 -> 10000
+          VERSION_CODE=$(echo "$VERSION" | awk -F. '{ printf "%d", $1*10000 + $2*100 + $3 }')
+          sed -i "s|versionCode = [0-9]*|versionCode = $VERSION_CODE|" android/app/build.gradle.kts
+          sed -i "s|versionName = \".*\"|versionName = \"$VERSION\"|" android/app/build.gradle.kts
+
+      - name: Build release APK
+        working-directory: android
+        run: ./gradlew assembleRelease
+
+      - name: Build debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug
+
+      - name: Rename APKs
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cp android/app/build/outputs/apk/release/app-release-unsigned.apk \
+             "lumina-video-demo-${VERSION}-release-unsigned.apk"
+          cp android/app/build/outputs/apk/debug/app-debug.apk \
+             "lumina-video-demo-${VERSION}-debug.apk"
+
+      - name: Upload release APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk-release
+          path: "lumina-video-demo-*-release-unsigned.apk"
+
+      - name: Upload debug APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk-debug
+          path: "lumina-video-demo-*-debug.apk"
+
+  upload-release:
+    name: Upload to Release
+    needs: [build-apk]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/android-apk-release/*.apk
+            artifacts/android-apk-debug/*.apk
