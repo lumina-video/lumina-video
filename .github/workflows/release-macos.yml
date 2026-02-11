@@ -16,15 +16,17 @@ env:
 
 jobs:
   build-dmg:
-    name: Build macOS DMG (${{ matrix.target }})
-    runs-on: macos-latest
+    name: Build macOS DMG (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
         include:
           - target: aarch64-apple-darwin
             arch: arm64
+            runner: macos-latest
           - target: x86_64-apple-darwin
             arch: x86_64
+            runner: macos-13
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -65,6 +67,7 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
+          set -euo pipefail
           APP_NAME="Lumina Video Demo"
           APP_DIR="${APP_NAME}.app"
           BINARY="target/${{ matrix.target }}/release/lumina-video-demo"
@@ -83,50 +86,73 @@ jobs:
           for lib in $(otool -L "${APP_DIR}/Contents/MacOS/lumina-video-demo" \
                        | grep '/opt/homebrew\|/usr/local' \
                        | awk '{print $1}'); do
-            cp "$lib" "$LIBS_DIR/" 2>/dev/null || true
+            cp "$lib" "$LIBS_DIR/"
             LIB_NAME=$(basename "$lib")
             install_name_tool -change "$lib" "@executable_path/../Frameworks/$LIB_NAME" \
-              "${APP_DIR}/Contents/MacOS/lumina-video-demo" 2>/dev/null || true
+              "${APP_DIR}/Contents/MacOS/lumina-video-demo"
           done
-          # Fix dylib cross-references
+
+          # Recursively resolve dylib dependencies until no new libs are added
+          CHANGED=true
+          while $CHANGED; do
+            CHANGED=false
+            for fw in "$LIBS_DIR"/*.dylib; do
+              [ -f "$fw" ] || continue
+              for dep in $(otool -L "$fw" | grep '/opt/homebrew\|/usr/local' | awk '{print $1}'); do
+                DEP_NAME=$(basename "$dep")
+                if [ ! -f "$LIBS_DIR/$DEP_NAME" ]; then
+                  cp "$dep" "$LIBS_DIR/"
+                  CHANGED=true
+                fi
+              done
+            done
+          done
+
+          # Fix all dylib install names and cross-references
           for fw in "$LIBS_DIR"/*.dylib; do
             [ -f "$fw" ] || continue
-            install_name_tool -id "@executable_path/../Frameworks/$(basename "$fw")" "$fw" 2>/dev/null || true
+            install_name_tool -id "@executable_path/../Frameworks/$(basename "$fw")" "$fw"
             for dep in $(otool -L "$fw" | grep '/opt/homebrew\|/usr/local' | awk '{print $1}'); do
               DEP_NAME=$(basename "$dep")
-              if [ -f "$LIBS_DIR/$DEP_NAME" ]; then
-                install_name_tool -change "$dep" "@executable_path/../Frameworks/$DEP_NAME" "$fw" 2>/dev/null || true
-              fi
+              install_name_tool -change "$dep" "@executable_path/../Frameworks/$DEP_NAME" "$fw"
             done
           done
 
           # Create Info.plist
-          cat > "${APP_DIR}/Contents/Info.plist" << PLIST
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleName</key>
-            <string>${APP_NAME}</string>
-            <key>CFBundleDisplayName</key>
-            <string>${APP_NAME}</string>
-            <key>CFBundleIdentifier</key>
-            <string>com.luminavideo.demo</string>
-            <key>CFBundleVersion</key>
-            <string>${VERSION}</string>
-            <key>CFBundleShortVersionString</key>
-            <string>${VERSION}</string>
-            <key>CFBundleExecutable</key>
-            <string>lumina-video-demo</string>
-            <key>CFBundlePackageType</key>
-            <string>APPL</string>
-            <key>LSMinimumSystemVersion</key>
-            <string>10.13</string>
-            <key>NSHighResolutionCapable</key>
-            <true/>
-          </dict>
-          </plist>
-          PLIST
+          cat > "${APP_DIR}/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>
+  <string>${APP_NAME}</string>
+  <key>CFBundleDisplayName</key>
+  <string>${APP_NAME}</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.luminavideo.demo</string>
+  <key>CFBundleVersion</key>
+  <string>${VERSION}</string>
+  <key>CFBundleShortVersionString</key>
+  <string>${VERSION}</string>
+  <key>CFBundleExecutable</key>
+  <string>lumina-video-demo</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>10.13</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+</dict>
+</plist>
+PLIST
+
+          # Copy icon if available
+          if [ -f "crates/lumina-video-demo/assets/lumina-video-icon-ferris-hybrid.png" ]; then
+            cp "crates/lumina-video-demo/assets/lumina-video-icon-ferris-hybrid.png" \
+               "${APP_DIR}/Contents/Resources/AppIcon.png"
+          fi
 
       - name: Create DMG
         env:
@@ -188,6 +214,7 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
+          set -euo pipefail
           APP_NAME="Lumina Video Demo"
           DMG_NAME="lumina-video-demo-${VERSION}-macos-universal"
 
@@ -204,7 +231,7 @@ jobs:
             "/tmp/x86_64-mount/${APP_NAME}.app/Contents/MacOS/lumina-video-demo" \
             -output "./${APP_NAME}.app/Contents/MacOS/lumina-video-demo"
 
-          # Lipo any bundled dylibs
+          # Lipo dylibs present in both architectures
           for arm_lib in "/tmp/arm64-mount/${APP_NAME}.app/Contents/Frameworks/"*.dylib; do
             [ -f "$arm_lib" ] || continue
             LIB_NAME=$(basename "$arm_lib")
@@ -212,6 +239,15 @@ jobs:
             if [ -f "$INTEL_LIB" ]; then
               lipo -create "$arm_lib" "$INTEL_LIB" \
                 -output "./${APP_NAME}.app/Contents/Frameworks/$LIB_NAME"
+            fi
+          done
+
+          # Copy any x86_64-only dylibs not present in arm64 build
+          for intel_lib in "/tmp/x86_64-mount/${APP_NAME}.app/Contents/Frameworks/"*.dylib; do
+            [ -f "$intel_lib" ] || continue
+            LIB_NAME=$(basename "$intel_lib")
+            if [ ! -f "./${APP_NAME}.app/Contents/Frameworks/$LIB_NAME" ]; then
+              cp "$intel_lib" "./${APP_NAME}.app/Contents/Frameworks/$LIB_NAME"
             fi
           done
 
