@@ -9,6 +9,7 @@ rusty-tags.vi
 *.so
 *.swp
 *.jar
+!android/gradle/wrapper/gradle-wrapper.jar
 target
 .gradle
 .git
