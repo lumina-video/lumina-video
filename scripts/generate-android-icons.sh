@@ -5,7 +5,7 @@
 # Output: android/app/src/main/res/mipmap-*/ic_launcher*.png
 #         android/app/src/main/res/drawable/ic_launcher_foreground.png
 #
-# Requires: sips (macOS built-in)
+# Requires: sips (macOS built-in), magick (ImageMagick 7+ for round icons)
 #
 # Usage:
 #   ./scripts/generate-android-icons.sh
@@ -22,6 +22,12 @@ if [ ! -f "$ICON" ]; then
     exit 1
 fi
 
+if ! command -v magick &>/dev/null; then
+    echo "Error: ImageMagick 7+ (magick) is required for round icon generation"
+    echo "Install: brew install imagemagick"
+    exit 1
+fi
+
 echo "=== Generating Android launcher icons ==="
 echo "Source: $ICON"
 echo ""
@@ -33,7 +39,11 @@ for DENSITY_SIZE in "mdpi:48" "hdpi:72" "xhdpi:96" "xxhdpi:144" "xxxhdpi:192"; d
     SIZE="${DENSITY_SIZE##*:}"
     mkdir -p "$RES/mipmap-$DENSITY"
     sips -z "$SIZE" "$SIZE" "$ICON" --out "$RES/mipmap-$DENSITY/ic_launcher.png" >/dev/null
-    sips -z "$SIZE" "$SIZE" "$ICON" --out "$RES/mipmap-$DENSITY/ic_launcher_round.png" >/dev/null
+    # Create circular-masked round icon
+    magick "$ICON" -resize "${SIZE}x${SIZE}" \
+        \( -size "${SIZE}x${SIZE}" xc:none -fill white -draw "circle $((SIZE/2)),$((SIZE/2)) $((SIZE/2)),0" \) \
+        -compose CopyOpacity -composite \
+        "PNG32:$RES/mipmap-$DENSITY/ic_launcher_round.png"
     echo "  mipmap-$DENSITY: ${SIZE}x${SIZE}"
 done
 
