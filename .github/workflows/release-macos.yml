@@ -1,0 +1,257 @@
+name: Release macOS DMG
+
+on:
+  release:
+    types: [published]
+  # Allow manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g., 0.2.1)'
+        required: true
+        default: '0.2.1'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-dmg:
+    name: Build macOS DMG (${{ matrix.target }})
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: arm64
+          - target: x86_64-apple-darwin
+            arch: x86_64
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$EVENT_NAME" = "release" ]; then
+            VERSION="${TAG_NAME#v}"
+          else
+            VERSION="$INPUT_VERSION"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-release-${{ matrix.arch }}
+
+      - name: Install FFmpeg via Homebrew
+        run: brew install ffmpeg
+
+      - name: Build release binary
+        env:
+          SDKROOT: /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk
+        run: cargo build --release --locked --package lumina-video-demo --target ${{ matrix.target }}
+
+      - name: Create .app bundle
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          APP_NAME="Lumina Video Demo"
+          APP_DIR="${APP_NAME}.app"
+          BINARY="target/${{ matrix.target }}/release/lumina-video-demo"
+
+          # Create .app structure
+          mkdir -p "${APP_DIR}/Contents/MacOS"
+          mkdir -p "${APP_DIR}/Contents/Resources"
+
+          # Copy binary
+          cp "$BINARY" "${APP_DIR}/Contents/MacOS/lumina-video-demo"
+          chmod 755 "${APP_DIR}/Contents/MacOS/lumina-video-demo"
+
+          # Bundle FFmpeg dylibs the binary links against
+          LIBS_DIR="${APP_DIR}/Contents/Frameworks"
+          mkdir -p "$LIBS_DIR"
+          for lib in $(otool -L "${APP_DIR}/Contents/MacOS/lumina-video-demo" \
+                       | grep '/opt/homebrew\|/usr/local' \
+                       | awk '{print $1}'); do
+            cp "$lib" "$LIBS_DIR/" 2>/dev/null || true
+            LIB_NAME=$(basename "$lib")
+            install_name_tool -change "$lib" "@executable_path/../Frameworks/$LIB_NAME" \
+              "${APP_DIR}/Contents/MacOS/lumina-video-demo" 2>/dev/null || true
+          done
+          # Fix dylib cross-references
+          for fw in "$LIBS_DIR"/*.dylib; do
+            [ -f "$fw" ] || continue
+            install_name_tool -id "@executable_path/../Frameworks/$(basename "$fw")" "$fw" 2>/dev/null || true
+            for dep in $(otool -L "$fw" | grep '/opt/homebrew\|/usr/local' | awk '{print $1}'); do
+              DEP_NAME=$(basename "$dep")
+              if [ -f "$LIBS_DIR/$DEP_NAME" ]; then
+                install_name_tool -change "$dep" "@executable_path/../Frameworks/$DEP_NAME" "$fw" 2>/dev/null || true
+              fi
+            done
+          done
+
+          # Create Info.plist
+          cat > "${APP_DIR}/Contents/Info.plist" << PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>${APP_NAME}</string>
+            <key>CFBundleDisplayName</key>
+            <string>${APP_NAME}</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.luminavideo.demo</string>
+            <key>CFBundleVersion</key>
+            <string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${VERSION}</string>
+            <key>CFBundleExecutable</key>
+            <string>lumina-video-demo</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>10.13</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+
+      - name: Create DMG
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          APP_NAME="Lumina Video Demo"
+          DMG_NAME="lumina-video-demo-${VERSION}-macos-${{ matrix.arch }}"
+
+          # Create DMG with Applications symlink
+          mkdir -p dmg-staging
+          cp -R "${APP_NAME}.app" dmg-staging/
+          ln -s /Applications dmg-staging/Applications
+
+          hdiutil create -volname "${APP_NAME}" \
+            -srcfolder dmg-staging \
+            -ov -format UDZO \
+            "${DMG_NAME}.dmg"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg-${{ matrix.arch }}
+          path: "*.dmg"
+
+  build-universal:
+    name: Build Universal DMG
+    needs: build-dmg
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$EVENT_NAME" = "release" ]; then
+            VERSION="${TAG_NAME#v}"
+          else
+            VERSION="$INPUT_VERSION"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download arm64 DMG
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-dmg-arm64
+          path: ./arm64
+
+      - name: Download x86_64 DMG
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-dmg-x86_64
+          path: ./x86_64
+
+      - name: Create universal binary DMG
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          APP_NAME="Lumina Video Demo"
+          DMG_NAME="lumina-video-demo-${VERSION}-macos-universal"
+
+          # Mount both DMGs
+          hdiutil attach arm64/*.dmg -mountpoint /tmp/arm64-mount -nobrowse
+          hdiutil attach x86_64/*.dmg -mountpoint /tmp/x86_64-mount -nobrowse
+
+          # Copy arm64 app as base
+          cp -R "/tmp/arm64-mount/${APP_NAME}.app" "./${APP_NAME}.app"
+
+          # Create universal binary with lipo
+          lipo -create \
+            "/tmp/arm64-mount/${APP_NAME}.app/Contents/MacOS/lumina-video-demo" \
+            "/tmp/x86_64-mount/${APP_NAME}.app/Contents/MacOS/lumina-video-demo" \
+            -output "./${APP_NAME}.app/Contents/MacOS/lumina-video-demo"
+
+          # Lipo any bundled dylibs
+          for arm_lib in "/tmp/arm64-mount/${APP_NAME}.app/Contents/Frameworks/"*.dylib; do
+            [ -f "$arm_lib" ] || continue
+            LIB_NAME=$(basename "$arm_lib")
+            INTEL_LIB="/tmp/x86_64-mount/${APP_NAME}.app/Contents/Frameworks/$LIB_NAME"
+            if [ -f "$INTEL_LIB" ]; then
+              lipo -create "$arm_lib" "$INTEL_LIB" \
+                -output "./${APP_NAME}.app/Contents/Frameworks/$LIB_NAME"
+            fi
+          done
+
+          # Unmount
+          hdiutil detach /tmp/arm64-mount
+          hdiutil detach /tmp/x86_64-mount
+
+          # Create universal DMG
+          mkdir -p dmg-staging
+          cp -R "${APP_NAME}.app" dmg-staging/
+          ln -s /Applications dmg-staging/Applications
+
+          hdiutil create -volname "${APP_NAME}" \
+            -srcfolder dmg-staging \
+            -ov -format UDZO \
+            "${DMG_NAME}.dmg"
+
+      - name: Upload universal DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg-universal
+          path: "*.dmg"
+
+  upload-release:
+    name: Upload to Release
+    needs: [build-dmg, build-universal]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/macos-dmg-arm64/*.dmg
+            artifacts/macos-dmg-x86_64/*.dmg
+            artifacts/macos-dmg-universal/*.dmg
