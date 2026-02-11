@@ -18,8 +18,8 @@ android {
         applicationId = "com.luminavideo.demo"
         minSdk = 26      // Required for HardwareBuffer API
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

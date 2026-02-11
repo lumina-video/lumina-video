@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-package.version = "0.1.0"
+package.version = "0.2.1"
 members = [
     "crates/lumina-video",
     "crates/lumina-video-demo",
