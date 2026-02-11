@@ -25,12 +25,15 @@ jobs:
 
       - name: Get version
         id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            VERSION="${{ github.event.release.tag_name }}"
-            VERSION="${VERSION#v}"
+          if [ "$EVENT_NAME" = "release" ]; then
+            VERSION="${TAG_NAME#v}"
           else
-            VERSION="${{ inputs.version }}"
+            VERSION="$INPUT_VERSION"
           fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Building version: $VERSION"
@@ -57,7 +60,7 @@ jobs:
         run: rustup target add aarch64-linux-android
 
       - name: Install cargo-ndk
-        run: cargo install cargo-ndk
+        run: cargo install cargo-ndk --version 4.1.2
 
       - name: Build native library (arm64)
         env:
@@ -71,8 +74,9 @@ jobs:
              android/app/src/main/jniLibs/arm64-v8a/
 
       - name: Update version in build.gradle.kts
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
           sed -i "s/versionName = \".*\"/versionName = \"$VERSION\"/" android/app/build.gradle.kts
 
       - name: Build release APK
@@ -84,8 +88,9 @@ jobs:
         run: ./gradlew assembleDebug
 
       - name: Rename APKs
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
           cp android/app/build/outputs/apk/release/app-release-unsigned.apk \
              "lumina-video-demo-${VERSION}-release-unsigned.apk"
           cp android/app/build/outputs/apk/debug/app-debug.apk \
