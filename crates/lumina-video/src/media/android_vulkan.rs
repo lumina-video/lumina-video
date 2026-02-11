@@ -11,6 +11,15 @@
 //! - Use dedicated allocation for imported memory
 //! - Set up VkSamplerYcbcrConversion for YUV to RGB conversion
 //!
+//! # Vulkan Specification References
+//!
+//! - [VK_ANDROID_external_memory_android_hardware_buffer](https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_ANDROID_external_memory_android_hardware_buffer.html)
+//! - [VK_KHR_sampler_ycbcr_conversion](https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_KHR_sampler_ycbcr_conversion.html)
+//! - [VK_KHR_external_memory](https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_KHR_external_memory.html)
+//! - [VK_EXT_queue_family_foreign](https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_EXT_queue_family_foreign.html)
+//!
+//! See `docs/VULKAN-REFERENCE.md` for detailed extension usage and troubleshooting.
+//!
 //! # Threading
 //!
 //! All Vulkan calls must happen on the render thread, not the AImageReader callback thread.
