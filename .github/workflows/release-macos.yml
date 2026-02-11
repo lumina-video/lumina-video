@@ -154,6 +154,26 @@ PLIST
                "${APP_DIR}/Contents/Resources/AppIcon.png"
           fi
 
+      - name: Verify app bundle
+        run: |
+          set -euo pipefail
+          APP_NAME="Lumina Video Demo"
+          echo "=== Checking for leftover Homebrew paths ==="
+          if otool -L "${APP_NAME}.app/Contents/MacOS/lumina-video-demo" | grep -q '/opt/homebrew\|/usr/local'; then
+            echo "ERROR: Binary still references Homebrew paths:"
+            otool -L "${APP_NAME}.app/Contents/MacOS/lumina-video-demo" | grep '/opt/homebrew\|/usr/local'
+            exit 1
+          fi
+          for fw in "${APP_NAME}.app/Contents/Frameworks/"*.dylib; do
+            [ -f "$fw" ] || continue
+            if otool -L "$fw" | grep -q '/opt/homebrew\|/usr/local'; then
+              echo "ERROR: $(basename "$fw") still references Homebrew paths:"
+              otool -L "$fw" | grep '/opt/homebrew\|/usr/local'
+              exit 1
+            fi
+          done
+          echo "OK: No Homebrew paths remain in bundle"
+
       - name: Create DMG
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -171,11 +191,16 @@ PLIST
             -ov -format UDZO \
             "${DMG_NAME}.dmg"
 
+      - name: Generate checksums
+        run: shasum -a 256 *.dmg > checksums-${{ matrix.arch }}.txt
+
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
           name: macos-dmg-${{ matrix.arch }}
-          path: "*.dmg"
+          path: |
+            *.dmg
+            checksums-*.txt
 
   build-universal:
     name: Build Universal DMG
@@ -265,11 +290,16 @@ PLIST
             -ov -format UDZO \
             "${DMG_NAME}.dmg"
 
+      - name: Generate checksums
+        run: shasum -a 256 *.dmg > checksums-universal.txt
+
       - name: Upload universal DMG artifact
         uses: actions/upload-artifact@v4
         with:
           name: macos-dmg-universal
-          path: "*.dmg"
+          path: |
+            *.dmg
+            checksums-*.txt
 
   upload-release:
     name: Upload to Release
@@ -284,6 +314,9 @@ PLIST
         with:
           path: artifacts
 
+      - name: Combine checksums
+        run: cat artifacts/*/checksums-*.txt > checksums-macos.txt
+
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
@@ -291,3 +324,4 @@ PLIST
             artifacts/macos-dmg-arm64/*.dmg
             artifacts/macos-dmg-x86_64/*.dmg
             artifacts/macos-dmg-universal/*.dmg
+            checksums-macos.txt
