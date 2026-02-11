@@ -77,7 +77,10 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          sed -i "s/versionName = \".*\"/versionName = \"$VERSION\"/" android/app/build.gradle.kts
+          # Derive versionCode from version string: 0.2.1 -> 201, 1.0.0 -> 10000
+          VERSION_CODE=$(echo "$VERSION" | awk -F. '{ printf "%d", $1*10000 + $2*100 + $3 }')
+          sed -i "s|versionCode = [0-9]*|versionCode = $VERSION_CODE|" android/app/build.gradle.kts
+          sed -i "s|versionName = \".*\"|versionName = \"$VERSION\"|" android/app/build.gradle.kts
 
       - name: Build release APK
         working-directory: android
