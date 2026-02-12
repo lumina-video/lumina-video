@@ -38,7 +38,7 @@
 //!
 //! Tracking: lumina-video-5hd
 
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -107,7 +107,12 @@ fn fetch_android_api_level() -> Option<i32> {
         "unknown".to_string()
     };
 
-    tracing::debug!("Android device: API {}, {} {}", sdk_int, manufacturer, model);
+    tracing::debug!(
+        "Android device: API {}, {} {}",
+        sdk_int,
+        manufacturer,
+        model
+    );
     Some(sdk_int)
 }
 
@@ -473,7 +478,6 @@ impl AndroidVideoDecoder {
 
         Ok(false)
     }
-
 }
 
 impl Drop for AndroidVideoDecoder {
@@ -765,33 +769,28 @@ impl PerPlayerStats {
     }
 }
 
-/// Per-player stats map, keyed by player_id.
-/// Cleaned up alongside frame queues in `release_player_queue()`.
-static PLAYER_STATS: OnceLock<parking_lot::RwLock<HashMap<u64, PerPlayerStats>>> = OnceLock::new();
-
-/// Initializes the per-player stats map.
-fn init_player_stats() {
-    let _ = PLAYER_STATS.get_or_init(|| parking_lot::RwLock::new(HashMap::new()));
-}
-
 /// Gets or creates per-player stats entry, then applies the given function.
+/// Stats are co-located with the per-player frame queue in `PlayerState`.
 fn with_player_stats(player_id: u64, f: impl FnOnce(&PerPlayerStats)) {
-    init_player_stats();
-    let Some(stats_map) = PLAYER_STATS.get() else {
+    init_player_queues();
+    let Some(queues) = PLAYER_QUEUES.get() else {
         return;
     };
     // Try read lock first (common path)
     {
-        let guard = stats_map.read();
-        if let Some(stats) = guard.get(&player_id) {
-            f(stats);
+        let guard = queues.read();
+        if let Some(state) = guard.get(&player_id) {
+            f(&state.stats);
             return;
         }
     }
     // Create entry under write lock
-    let mut guard = stats_map.write();
-    let stats = guard.entry(player_id).or_insert_with(PerPlayerStats::new);
-    f(stats);
+    let mut guard = queues.write();
+    let state = guard.entry(player_id).or_insert_with(|| PlayerState {
+        queue: VecDeque::new(),
+        stats: PerPlayerStats::new(),
+    });
+    f(&state.stats);
 }
 
 /// Current zero-copy status based on the most recent frame.
@@ -839,7 +838,7 @@ impl AndroidZeroCopySnapshot {
             ZeroCopyStatus::Waiting => "Waiting",
             ZeroCopyStatus::ZeroCopy => "Zero-Copy",
             ZeroCopyStatus::CpuAssisted => "CPU Fallback",
-            ZeroCopyStatus::Failed => "Failed"
+            ZeroCopyStatus::Failed => "Failed",
         }
     }
 }
@@ -857,8 +856,8 @@ fn last_result_to_status(v: u8) -> ZeroCopyStatus {
 ///
 /// Use `player_id=0` for aggregate stats across all players (demo/single-player mode).
 pub fn android_zero_copy_snapshot(player_id: u64) -> AndroidZeroCopySnapshot {
-    init_player_stats();
-    let Some(stats_map) = PLAYER_STATS.get() else {
+    init_player_queues();
+    let Some(queues) = PLAYER_QUEUES.get() else {
         return AndroidZeroCopySnapshot {
             true_zero_copy_frames: 0,
             cpu_assisted_frames: 0,
@@ -866,7 +865,7 @@ pub fn android_zero_copy_snapshot(player_id: u64) -> AndroidZeroCopySnapshot {
             current_status: ZeroCopyStatus::Waiting,
         };
     };
-    let guard = stats_map.read();
+    let guard = queues.read();
 
     if player_id == 0 {
         // Aggregate across all players
@@ -876,24 +875,24 @@ pub fn android_zero_copy_snapshot(player_id: u64) -> AndroidZeroCopySnapshot {
             failed_frames: 0,
             current_status: ZeroCopyStatus::Waiting,
         };
-        for stats in guard.values() {
-            snap.true_zero_copy_frames += stats.true_zero_copy.load(Ordering::Relaxed);
-            snap.cpu_assisted_frames += stats.cpu_assisted.load(Ordering::Relaxed);
-            snap.failed_frames += stats.failed.load(Ordering::Relaxed);
+        for state in guard.values() {
+            snap.true_zero_copy_frames += state.stats.true_zero_copy.load(Ordering::Relaxed);
+            snap.cpu_assisted_frames += state.stats.cpu_assisted.load(Ordering::Relaxed);
+            snap.failed_frames += state.stats.failed.load(Ordering::Relaxed);
             // Pick the most concerning status across all players:
             // Failed > CpuAssisted > ZeroCopy > Waiting
-            let status = last_result_to_status(stats.last_result.load(Ordering::Relaxed));
+            let status = last_result_to_status(state.stats.last_result.load(Ordering::Relaxed));
             if status > snap.current_status {
                 snap.current_status = status;
             }
         }
         snap
-    } else if let Some(stats) = guard.get(&player_id) {
+    } else if let Some(state) = guard.get(&player_id) {
         AndroidZeroCopySnapshot {
-            true_zero_copy_frames: stats.true_zero_copy.load(Ordering::Relaxed),
-            cpu_assisted_frames: stats.cpu_assisted.load(Ordering::Relaxed),
-            failed_frames: stats.failed.load(Ordering::Relaxed),
-            current_status: last_result_to_status(stats.last_result.load(Ordering::Relaxed)),
+            true_zero_copy_frames: state.stats.true_zero_copy.load(Ordering::Relaxed),
+            cpu_assisted_frames: state.stats.cpu_assisted.load(Ordering::Relaxed),
+            failed_frames: state.stats.failed.load(Ordering::Relaxed),
+            current_status: last_result_to_status(state.stats.last_result.load(Ordering::Relaxed)),
         }
     } else {
         AndroidZeroCopySnapshot {
@@ -909,7 +908,8 @@ pub fn android_zero_copy_snapshot(player_id: u64) -> AndroidZeroCopySnapshot {
 pub fn record_true_zero_copy(player_id: u64) {
     with_player_stats(player_id, |s| {
         s.true_zero_copy.fetch_add(1, Ordering::Relaxed);
-        s.last_result.store(FRAME_RESULT_ZERO_COPY, Ordering::Relaxed);
+        s.last_result
+            .store(FRAME_RESULT_ZERO_COPY, Ordering::Relaxed);
     });
 }
 
@@ -917,7 +917,8 @@ pub fn record_true_zero_copy(player_id: u64) {
 pub fn record_cpu_assisted(player_id: u64) {
     with_player_stats(player_id, |s| {
         s.cpu_assisted.fetch_add(1, Ordering::Relaxed);
-        s.last_result.store(FRAME_RESULT_CPU_ASSISTED, Ordering::Relaxed);
+        s.last_result
+            .store(FRAME_RESULT_CPU_ASSISTED, Ordering::Relaxed);
     });
 }
 
@@ -946,10 +947,16 @@ use std::sync::OnceLock;
 /// Max queue size per player to prevent unbounded memory growth.
 const MAX_QUEUE_SIZE_PER_PLAYER: usize = 8;
 
+/// Per-player state combining the frame queue and zero-copy stats.
+/// Co-locating these avoids the need for a separate global stats map.
+struct PlayerState {
+    queue: VecDeque<AndroidVideoFrame>,
+    stats: PerPlayerStats,
+}
+
 /// Per-player queues for multi-player isolation.
 /// Uses parking_lot::RwLock for efficient concurrent access.
-static PLAYER_QUEUES: OnceLock<parking_lot::RwLock<HashMap<u64, VecDeque<AndroidVideoFrame>>>> =
-    OnceLock::new();
+static PLAYER_QUEUES: OnceLock<parking_lot::RwLock<HashMap<u64, PlayerState>>> = OnceLock::new();
 
 /// Legacy single-player queue for backward compatibility (player_id = 0).
 /// The rendering thread reads from this queue to get zero-copy frames.
@@ -1215,7 +1222,7 @@ pub fn try_receive_hardware_buffer_for_player(player_id: u64) -> Option<AndroidV
     // Per-player mode: pop from this player's dedicated queue
     let queues = PLAYER_QUEUES.get()?;
     let mut queues_guard = queues.write();
-    queues_guard.get_mut(&player_id)?.pop_front()
+    queues_guard.get_mut(&player_id)?.queue.pop_front()
 }
 
 /// Gets the next available HardwareBuffer frame, if any (legacy single-player mode).
@@ -1239,7 +1246,7 @@ pub fn has_pending_hardware_buffer(player_id: u64) -> bool {
                 queues
                     .read()
                     .get(&player_id)
-                    .map(|q| !q.is_empty())
+                    .map(|s| !s.queue.is_empty())
                     .unwrap_or(false)
             })
             .unwrap_or(false)
@@ -1259,8 +1266,8 @@ pub fn release_player_queue(player_id: u64) {
     }
     if let Some(queues) = PLAYER_QUEUES.get() {
         let mut queues_guard = queues.write();
-        if let Some(removed_queue) = queues_guard.remove(&player_id) {
-            let frame_count = removed_queue.len();
+        if let Some(removed_state) = queues_guard.remove(&player_id) {
+            let frame_count = removed_state.queue.len();
             if frame_count > 0 {
                 tracing::debug!(
                     "Released player {} queue with {} pending frames",
@@ -1268,13 +1275,8 @@ pub fn release_player_queue(player_id: u64) {
                     frame_count
                 );
             }
-            // Frames are dropped here, releasing their AHardwareBuffers
+            // Frames and stats are dropped here, releasing AHardwareBuffers
         }
-    }
-    // Clean up per-player stats
-    if let Some(stats_map) = PLAYER_STATS.get() {
-        let mut guard = stats_map.write();
-        guard.remove(&player_id);
     }
 }
 
@@ -1515,14 +1517,17 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwa
         // Per-player mode: route to player's dedicated queue
         if let Some(queues) = PLAYER_QUEUES.get() {
             let mut queues_guard = queues.write();
-            let queue = queues_guard
+            let state = queues_guard
                 .entry(player_id_u64)
-                .or_insert_with(VecDeque::new);
+                .or_insert_with(|| PlayerState {
+                    queue: VecDeque::new(),
+                    stats: PerPlayerStats::new(),
+                });
 
             // Enforce max queue size per player
-            if queue.len() >= MAX_QUEUE_SIZE_PER_PLAYER {
+            if state.queue.len() >= MAX_QUEUE_SIZE_PER_PLAYER {
                 // Drop oldest frame to make room
-                if let Some(old_frame) = queue.pop_front() {
+                if let Some(old_frame) = state.queue.pop_front() {
                     tracing::debug!(
                         "Player {} queue full, dropping oldest frame (ts={})",
                         player_id_u64,
@@ -1531,7 +1536,7 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwa
                     // old_frame is dropped here, releasing AHardwareBuffer
                 }
             }
-            queue.push_back(frame);
+            state.queue.push_back(frame);
         }
     }
 }

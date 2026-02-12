@@ -1272,6 +1272,10 @@ impl VideoDecoderBackend for Box<dyn VideoDecoderBackend + Send> {
     fn current_time(&self) -> Option<Duration> {
         (**self).current_time()
     }
+
+    fn android_player_id(&self) -> u64 {
+        (**self).android_player_id()
+    }
 }
 
 /// Handle to a video player instance for use in the job system.
