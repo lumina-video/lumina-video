@@ -193,7 +193,7 @@ struct HalViabilityResult {
 /// VideoPlayer::with_wgpu() creates an AndroidVideoDecoder which calls
 /// LuminaVideo.createPlayer() to get a self-contained ExoPlayer instance.
 const SAMPLE_VIDEO_URL: &str =
-    "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4";
+    "https://storage.googleapis.com/exoplayer-test-media-0/BigBuckBunny_320x180.mp4";
 
 /// Android entry point
 ///
