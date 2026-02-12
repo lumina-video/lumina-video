@@ -1146,6 +1146,76 @@ pub extern "C" fn Java_io_lumina_1video_video_ExoPlayerBridge_nativeOnDurationCh
 }
 
 // ============================================================================
+// Android Zero-Copy Stats
+// ============================================================================
+
+/// Global counters for Android zero-copy rendering status.
+/// Incremented in video_texture.rs render callback, read from demo UI.
+static ANDROID_ZC_TRUE_FRAMES: AtomicU64 = AtomicU64::new(0);
+static ANDROID_ZC_CPU_ASSISTED_FRAMES: AtomicU64 = AtomicU64::new(0);
+static ANDROID_ZC_FAILED_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of Android zero-copy rendering statistics.
+#[derive(Debug, Clone)]
+pub struct AndroidZeroCopySnapshot {
+    /// Frames imported via true Vulkan zero-copy (0 CPU copies)
+    pub true_zero_copy_frames: u64,
+    /// Frames imported via CPU-assisted path (lockPlanes → memcpy → GPU)
+    pub cpu_assisted_frames: u64,
+    /// Frames that failed import entirely
+    pub failed_frames: u64,
+}
+
+impl AndroidZeroCopySnapshot {
+    /// Total frames processed
+    pub fn total(&self) -> u64 {
+        self.true_zero_copy_frames + self.cpu_assisted_frames + self.failed_frames
+    }
+
+    /// True if real zero-copy is active (no CPU copies at all)
+    pub fn is_true_zero_copy(&self) -> bool {
+        self.true_zero_copy_frames > 0 && self.cpu_assisted_frames == 0
+    }
+
+    /// Returns a human-readable status label
+    pub fn status_label(&self) -> &'static str {
+        if self.total() == 0 {
+            "No frames"
+        } else if self.is_true_zero_copy() {
+            "Zero-Copy"
+        } else if self.cpu_assisted_frames > 0 {
+            "CPU Fallback"
+        } else {
+            "Failed"
+        }
+    }
+}
+
+/// Returns a snapshot of Android zero-copy stats.
+pub fn android_zero_copy_snapshot() -> AndroidZeroCopySnapshot {
+    AndroidZeroCopySnapshot {
+        true_zero_copy_frames: ANDROID_ZC_TRUE_FRAMES.load(Ordering::Relaxed),
+        cpu_assisted_frames: ANDROID_ZC_CPU_ASSISTED_FRAMES.load(Ordering::Relaxed),
+        failed_frames: ANDROID_ZC_FAILED_FRAMES.load(Ordering::Relaxed),
+    }
+}
+
+/// Increment true zero-copy frame count (called from video_texture.rs)
+pub fn record_true_zero_copy() {
+    ANDROID_ZC_TRUE_FRAMES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment CPU-assisted frame count (called from video_texture.rs)
+pub fn record_cpu_assisted() {
+    ANDROID_ZC_CPU_ASSISTED_FRAMES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment failed frame count (called from video_texture.rs)
+pub fn record_import_failed() {
+    ANDROID_ZC_FAILED_FRAMES.fetch_add(1, Ordering::Relaxed);
+}
+
+// ============================================================================
 // lumina-video Bridge JNI Entry Points
 // ============================================================================
 //

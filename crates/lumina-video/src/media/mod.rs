@@ -103,7 +103,7 @@ pub use video_decoder::{FfmpegDecoder, FfmpegDecoderBuilder, HwAccelConfig};
 pub use video_player::{VideoPlayer, VideoPlayerExt, VideoPlayerResponse};
 
 #[cfg(target_os = "android")]
-pub use android_video::AndroidVideoDecoder;
+pub use android_video::{AndroidVideoDecoder, AndroidZeroCopySnapshot};
 
 #[cfg(target_os = "macos")]
 pub use macos_video::{MacOSVideoDecoder, MacOSZeroCopyStatsSnapshot};

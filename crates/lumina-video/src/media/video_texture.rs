@@ -1222,6 +1222,7 @@ mod native_render_callback {
                 {
                     use crate::media::android_video::{
                         is_yuv_hardware_buffer_format, is_yv12_format,
+                        record_cpu_assisted, record_import_failed, record_true_zero_copy,
                         AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
                     };
 
@@ -1298,6 +1299,7 @@ mod native_render_callback {
                                     video_texture._android_owner = Some(frame);
                                     *texture_guard = Some(video_texture);
                                     imported_ok = true;
+                                    record_true_zero_copy();
                                     tracing::trace!(
                                         "Zero-copy: imported RGBA HardwareBuffer {}x{}",
                                         frame_width,
@@ -1340,6 +1342,7 @@ mod native_render_callback {
                                 video_texture._android_owner = Some(frame);
                                 *texture_guard = Some(video_texture);
                                 imported_ok = true;
+                                record_true_zero_copy();
                                 tracing::trace!(
                                 "True zero-copy: imported YUV HardwareBuffer via Vulkan YUV pipeline {}x{}",
                                 frame_width,
@@ -1385,6 +1388,7 @@ mod native_render_callback {
                                                 video_texture._android_owner = Some(frame);
                                                 *texture_guard = Some(video_texture);
                                                 imported_ok = true;
+                                                record_cpu_assisted();
                                                 tracing::info!(
                                                 "CPU-assisted: imported YUV HardwareBuffer as multi-plane {}x{} format={:?}",
                                                 frame_width,
@@ -1426,7 +1430,7 @@ mod native_render_callback {
                     }
 
                     if imported_ok {
-                        tracing::info!(
+                        tracing::trace!(
                             "Android frame import successful, texture ready for rendering"
                         );
                         let transform = [1.0f32, 1.0f32, 0.0f32, 0.0f32];
@@ -1437,6 +1441,7 @@ mod native_render_callback {
                         );
                         return Vec::new();
                     } else {
+                        record_import_failed();
                         tracing::warn!("Android frame import failed, frame will be dropped");
                     }
                     // frame is dropped here if not imported, calling AHardwareBuffer_release

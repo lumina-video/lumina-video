@@ -543,6 +543,50 @@ impl DemoApp {
 
         ui.add_space(8.0);
 
+        // --- Rendering section ---
+        ui.heading("Rendering");
+        ui.separator();
+        egui::Grid::new("rendering_grid")
+            .num_columns(2)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                let zc = lumina_video::android_zero_copy_snapshot();
+                let total = zc.total();
+
+                ui.label("Zero-Copy:");
+                if total == 0 {
+                    ui.colored_label(egui::Color32::GRAY, "Waiting...");
+                } else if zc.is_true_zero_copy() {
+                    ui.colored_label(egui::Color32::GREEN, "YES");
+                } else if zc.cpu_assisted_frames > 0 {
+                    ui.colored_label(egui::Color32::RED, "CPU FALLBACK");
+                } else {
+                    ui.colored_label(egui::Color32::RED, "FAILED");
+                }
+                ui.end_row();
+
+                if total > 0 {
+                    ui.label("Frames:");
+                    if zc.true_zero_copy_frames > 0 {
+                        ui.label(format!("{} zero-copy", zc.true_zero_copy_frames));
+                    } else {
+                        ui.label(format!("{} cpu-assisted", zc.cpu_assisted_frames));
+                    }
+                    ui.end_row();
+
+                    if zc.failed_frames > 0 {
+                        ui.label("Failed:");
+                        ui.colored_label(
+                            egui::Color32::RED,
+                            format!("{}", zc.failed_frames),
+                        );
+                        ui.end_row();
+                    }
+                }
+            });
+
+        ui.add_space(8.0);
+
         // --- Video / Playback section ---
         ui.heading("Video / Playback");
         ui.separator();
@@ -551,7 +595,6 @@ impl DemoApp {
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
                 if let Some(ref player) = self.player {
-                    // Resolution + Codec from metadata
                     if let Some(meta) = player.metadata() {
                         ui.label("Resolution:");
                         ui.label(format!("{}x{}", meta.width, meta.height));
@@ -570,21 +613,16 @@ impl DemoApp {
                         ui.end_row();
                     }
 
-                    // State
                     ui.label("State:");
                     ui.label(format!("{:?}", player.state()));
                     ui.end_row();
 
-                    // Position / Duration
                     ui.label("Position:");
                     let pos = player.position();
                     let pos_s = pos.as_secs_f64();
                     if let Some(dur) = player.duration() {
                         let dur_s = dur.as_secs_f64();
-                        ui.label(format!(
-                            "{:.1}s / {:.1}s",
-                            pos_s, dur_s
-                        ));
+                        ui.label(format!("{:.1}s / {:.1}s", pos_s, dur_s));
                     } else {
                         ui.label(format!("{:.1}s / --", pos_s));
                     }
