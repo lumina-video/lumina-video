@@ -117,6 +117,12 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
     // True when Surface is provided by native NDK ImageReader (via setVideoSurfaceFromNative)
     private var ndkMode = false
 
+    // Cached position/duration — updated on player thread, read from any thread.
+    // ExoPlayer with setLooper() enforces thread access, so we can't call getters directly
+    // from Rust's decode thread. These volatile fields provide stale-but-safe reads.
+    @Volatile private var cachedPositionMs: Long = 0L
+    @Volatile private var cachedDurationMs: Long = -1L
+
     /**
      * Creates ExoPlayer on a dedicated HandlerThread and sets up ImageReader.
      *
@@ -181,7 +187,7 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
      * Must be called on the player's Looper thread.
      */
     private fun setupListenersAndSurface(exoPlayer: ExoPlayer) {
-        // Listen for video size changes
+        // Listen for video size changes and playback events
         playerListener = object : Player.Listener {
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 Log.d(TAG, "onVideoSizeChanged: ${videoSize.width}x${videoSize.height}")
@@ -196,8 +202,20 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
                     }
                 }
             }
+
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                updateCachedValues()
+            }
+
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                updateCachedValues()
+            }
         }
         exoPlayer.addListener(playerListener!!)
+
+        // Periodically update cached position/duration on the player thread
+        // so Rust can read them from any thread via volatile fields
+        startPositionUpdater()
 
         // Create initial ImageReader (unless NDK mode is active)
         if (!ndkMode && imageReader == null && surface == null) {
@@ -278,25 +296,55 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
     }
 
     /**
+     * Updates cached position/duration from the player.
+     * Must be called on the player's Looper thread.
+     */
+    private fun updateCachedValues() {
+        player?.let { p ->
+            cachedPositionMs = p.currentPosition
+            val dur = p.duration
+            cachedDurationMs = if (dur == androidx.media3.common.C.TIME_UNSET) -1L else dur
+        }
+    }
+
+    /**
+     * Starts a periodic Runnable on the handler thread to update cached position.
+     * Runs every 250ms while the player is alive.
+     */
+    private fun startPositionUpdater() {
+        val updater = object : Runnable {
+            override fun run() {
+                if (!isReleased.get()) {
+                    updateCachedValues()
+                    handler?.postDelayed(this, 250)
+                }
+            }
+        }
+        handler?.postDelayed(updater, 250)
+    }
+
+    /**
      * Gets the current playback position in milliseconds.
      *
-     * Synchronous getter — ExoPlayer position getters are safe for stale reads
-     * from any thread.
+     * Returns a cached value updated every ~250ms on the player thread.
+     * Safe to call from any thread (Rust decode thread, main thread, etc.).
      *
      * @return Current position in ms, or 0 if not playing
      */
     fun getCurrentPosition(): Long {
-        return player?.currentPosition ?: 0L
+        return cachedPositionMs
     }
 
     /**
      * Gets the total duration of the video in milliseconds.
      *
+     * Returns a cached value updated on playback state changes and periodically.
+     * Safe to call from any thread.
+     *
      * @return Duration in ms, or -1 if unknown
      */
     fun getDuration(): Long {
-        val duration = player?.duration ?: -1L
-        return if (duration == androidx.media3.common.C.TIME_UNSET) -1L else duration
+        return cachedDurationMs
     }
 
     /**
