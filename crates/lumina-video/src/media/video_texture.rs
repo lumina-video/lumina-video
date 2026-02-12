@@ -1190,7 +1190,6 @@ mod native_render_callback {
                 // - YUV: true zero-copy via VkSamplerYcbcrConversion, with CPU-assisted
                 //   lockPlanes fallback when Vulkan YUV import fails
                 //
-                //
                 // NOTE: Android timing limitation (lumina-video-m07)
                 //
                 // This path bypasses FrameScheduler and displays frames immediately upon receipt.
@@ -1213,7 +1212,7 @@ mod native_render_callback {
                     )
                 {
                     use crate::media::android_video::{
-                        is_yuv_hardware_buffer_format, is_yv12_format,
+                        is_yuv_candidate_hardware_buffer_format, is_yv12_format,
                         record_cpu_assisted, record_import_failed, record_true_zero_copy,
                         AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
                     };
@@ -1228,6 +1227,7 @@ mod native_render_callback {
 
                     let mut texture_guard = self.texture.lock();
                     let mut imported_ok = false;
+                    let mut fence_dropped = false;
 
                     // Capture dimensions before frame is moved into _android_owner
                     let (frame_width, frame_height) = (frame.width, frame.height);
@@ -1259,6 +1259,7 @@ mod native_render_callback {
                                 tracing::debug!(
                                     "RGBA fence not ready, dropping frame to avoid blocking"
                                 );
+                                fence_dropped = true;
                                 false
                             } else {
                                 true
@@ -1304,7 +1305,7 @@ mod native_render_callback {
                                 }
                             }
                         }
-                    } else if is_yuv_hardware_buffer_format(frame.format) {
+                    } else if is_yuv_candidate_hardware_buffer_format(frame.format) {
                         // YUV path - try true zero-copy first, fall back to CPU-assisted path
                         //
                         // True zero-copy: Uses raw Vulkan to import YUV planes and do GPU-side
@@ -1433,7 +1434,7 @@ mod native_render_callback {
                             bytemuck::bytes_of(&transform),
                         );
                         return Vec::new();
-                    } else {
+                    } else if !fence_dropped {
                         record_import_failed(pid);
                         tracing::warn!("Android frame import failed, frame will be dropped");
                     }
