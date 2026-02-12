@@ -68,9 +68,9 @@ pub use media::{
 pub use media::{FfmpegDecoder, FfmpegDecoderBuilder, HwAccelConfig};
 
 #[cfg(target_os = "android")]
-pub use media::AndroidVideoDecoder;
+pub use media::android_video::{android_zero_copy_snapshot, AndroidZeroCopySnapshot, ZeroCopyStatus};
 #[cfg(target_os = "android")]
-pub use media::android_video::{android_zero_copy_snapshot, AndroidZeroCopySnapshot};
+pub use media::AndroidVideoDecoder;
 
 #[cfg(target_arch = "wasm32")]
 pub use media::{HlsBufferInfo, HlsQualityLevel, WebVideoPlayer};

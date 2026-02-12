@@ -72,9 +72,7 @@ fn test_hal_viability(render_state: &egui_wgpu::RenderState) -> HalViabilityResu
                     info!("Got VkPhysicalDevice: {:?}", physical_device);
 
                     // Query device extensions using ash
-                    match raw_instance
-                        .enumerate_device_extension_properties(physical_device)
-                    {
+                    match raw_instance.enumerate_device_extension_properties(physical_device) {
                         Ok(extension_props) => {
                             let has_ext = |name: &str| -> bool {
                                 extension_props.iter().any(|ext| {
@@ -85,17 +83,17 @@ fn test_hal_viability(render_state: &egui_wgpu::RenderState) -> HalViabilityResu
                                 })
                             };
 
-                            let ext_memory_ahb = has_ext(
-                                "VK_ANDROID_external_memory_android_hardware_buffer",
-                            );
+                            let ext_memory_ahb =
+                                has_ext("VK_ANDROID_external_memory_android_hardware_buffer");
                             let ext_memory = has_ext("VK_KHR_external_memory");
-                            let ext_semaphore =
-                                has_ext("VK_KHR_external_semaphore_fd");
-                            let ycbcr_conv =
-                                has_ext("VK_KHR_sampler_ycbcr_conversion");
+                            let ext_semaphore = has_ext("VK_KHR_external_semaphore_fd");
+                            let ycbcr_conv = has_ext("VK_KHR_sampler_ycbcr_conversion");
 
                             for (name, present) in [
-                                ("VK_ANDROID_external_memory_android_hardware_buffer", ext_memory_ahb),
+                                (
+                                    "VK_ANDROID_external_memory_android_hardware_buffer",
+                                    ext_memory_ahb,
+                                ),
                                 ("VK_KHR_external_memory", ext_memory),
                                 ("VK_KHR_external_semaphore_fd", ext_semaphore),
                                 ("VK_KHR_sampler_ycbcr_conversion", ycbcr_conv),
@@ -107,10 +105,7 @@ fn test_hal_viability(render_state: &egui_wgpu::RenderState) -> HalViabilityResu
                                 }
                             }
 
-                            let all = ext_memory_ahb
-                                && ext_memory
-                                && ext_semaphore
-                                && ycbcr_conv;
+                            let all = ext_memory_ahb && ext_memory && ext_semaphore && ycbcr_conv;
 
                             if all {
                                 info!("=== HAL VIABILITY: SUCCESS ===");
@@ -129,10 +124,7 @@ fn test_hal_viability(render_state: &egui_wgpu::RenderState) -> HalViabilityResu
                             )
                         }
                         Err(e) => {
-                            error!(
-                                "Failed to enumerate Vulkan device extensions: {:?}",
-                                e
-                            );
+                            error!("Failed to enumerate Vulkan device extensions: {:?}", e);
                             (
                                 true, // HAL access worked, query didn't
                                 false,
@@ -278,9 +270,7 @@ fn fetch_device_info() -> (String, i32) {
             .ok()?
             .l()
             .ok()?;
-        env.get_string((&model_obj).into())
-            .map(|s| s.into())
-            .ok()
+        env.get_string((&model_obj).into()).map(|s| s.into()).ok()
     })()
     .unwrap_or_else(|| "Unknown".to_string());
 
@@ -413,7 +403,13 @@ impl eframe::App for DemoApp {
             }
         });
 
-        ctx.request_repaint();
+        // Only spin the render loop when video is active — avoids burning CPU/GPU when idle
+        if self.player.as_ref().is_some_and(|p| p.is_playing()) {
+            ctx.request_repaint();
+        } else {
+            // Repaint at reduced rate for UI responsiveness (debug panel updates, state changes)
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
     }
 }
 
@@ -550,38 +546,34 @@ impl DemoApp {
             .num_columns(2)
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
-                let zc = lumina_video::android_zero_copy_snapshot();
+                let zc = lumina_video::android_zero_copy_snapshot(0);
                 let total = zc.total();
 
+                // Status based on most recent frame, not lifetime totals
                 ui.label("Zero-Copy:");
-                if total == 0 {
-                    ui.colored_label(egui::Color32::GRAY, "Waiting...");
-                } else if zc.is_true_zero_copy() {
-                    ui.colored_label(egui::Color32::GREEN, "YES");
-                } else if zc.cpu_assisted_frames > 0 {
-                    ui.colored_label(egui::Color32::RED, "CPU FALLBACK");
-                } else {
-                    ui.colored_label(egui::Color32::RED, "FAILED");
+                match zc.current_status {
+                    lumina_video::ZeroCopyStatus::Waiting => {
+                        ui.colored_label(egui::Color32::GRAY, "Waiting...");
+                    }
+                    lumina_video::ZeroCopyStatus::ZeroCopy => {
+                        ui.colored_label(egui::Color32::GREEN, "YES");
+                    }
+                    lumina_video::ZeroCopyStatus::CpuAssisted => {
+                        ui.colored_label(egui::Color32::YELLOW, "CPU FALLBACK");
+                    }
+                    lumina_video::ZeroCopyStatus::Failed => {
+                        ui.colored_label(egui::Color32::RED, "FAILED");
+                    }
                 }
                 ui.end_row();
 
                 if total > 0 {
                     ui.label("Frames:");
-                    if zc.true_zero_copy_frames > 0 {
-                        ui.label(format!("{} zero-copy", zc.true_zero_copy_frames));
-                    } else {
-                        ui.label(format!("{} cpu-assisted", zc.cpu_assisted_frames));
-                    }
+                    ui.label(format!(
+                        "{} zero-copy, {} cpu, {} failed",
+                        zc.true_zero_copy_frames, zc.cpu_assisted_frames, zc.failed_frames
+                    ));
                     ui.end_row();
-
-                    if zc.failed_frames > 0 {
-                        ui.label("Failed:");
-                        ui.colored_label(
-                            egui::Color32::RED,
-                            format!("{}", zc.failed_frames),
-                        );
-                        ui.end_row();
-                    }
                 }
             });
 

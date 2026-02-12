@@ -38,7 +38,7 @@
 //!
 //! Tracking: lumina-video-5hd
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -730,14 +730,84 @@ impl AndroidVideoDecoder {
 // Called from com.luminavideo.bridge.ExoPlayerBridge
 
 // ============================================================================
-// Android Zero-Copy Stats
+// Android Zero-Copy Stats (Per-Player)
 // ============================================================================
 
-/// Global counters for Android zero-copy rendering status.
-/// Incremented in video_texture.rs render callback, read from demo UI.
-static ANDROID_ZC_TRUE_FRAMES: AtomicU64 = AtomicU64::new(0);
-static ANDROID_ZC_CPU_ASSISTED_FRAMES: AtomicU64 = AtomicU64::new(0);
-static ANDROID_ZC_FAILED_FRAMES: AtomicU64 = AtomicU64::new(0);
+/// Per-player zero-copy rendering counters.
+/// Stored in the per-player state map and cleaned up when the player is released.
+/// Last frame import result, stored as atomic for lock-free reads.
+/// 0 = no frames yet, 1 = true zero-copy, 2 = cpu-assisted, 3 = failed
+type AtomicFrameResult = AtomicU8;
+const FRAME_RESULT_NONE: u8 = 0;
+const FRAME_RESULT_ZERO_COPY: u8 = 1;
+const FRAME_RESULT_CPU_ASSISTED: u8 = 2;
+const FRAME_RESULT_FAILED: u8 = 3;
+
+struct PerPlayerStats {
+    /// Frames imported via true Vulkan zero-copy (0 CPU copies)
+    true_zero_copy: AtomicU64,
+    /// Frames imported via CPU-assisted path (lockPlanes → memcpy → GPU)
+    cpu_assisted: AtomicU64,
+    /// Frames that failed import entirely
+    failed: AtomicU64,
+    /// Result of the most recent frame (for non-sticky UI status)
+    last_result: AtomicFrameResult,
+}
+
+impl PerPlayerStats {
+    fn new() -> Self {
+        Self {
+            true_zero_copy: AtomicU64::new(0),
+            cpu_assisted: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+            last_result: AtomicFrameResult::new(FRAME_RESULT_NONE),
+        }
+    }
+}
+
+/// Per-player stats map, keyed by player_id.
+/// Cleaned up alongside frame queues in `release_player_queue()`.
+static PLAYER_STATS: OnceLock<parking_lot::RwLock<HashMap<u64, PerPlayerStats>>> = OnceLock::new();
+
+/// Initializes the per-player stats map.
+fn init_player_stats() {
+    let _ = PLAYER_STATS.get_or_init(|| parking_lot::RwLock::new(HashMap::new()));
+}
+
+/// Gets or creates per-player stats entry, then applies the given function.
+fn with_player_stats(player_id: u64, f: impl FnOnce(&PerPlayerStats)) {
+    init_player_stats();
+    let Some(stats_map) = PLAYER_STATS.get() else {
+        return;
+    };
+    // Try read lock first (common path)
+    {
+        let guard = stats_map.read();
+        if let Some(stats) = guard.get(&player_id) {
+            f(stats);
+            return;
+        }
+    }
+    // Create entry under write lock
+    let mut guard = stats_map.write();
+    let stats = guard.entry(player_id).or_insert_with(PerPlayerStats::new);
+    f(stats);
+}
+
+/// Current zero-copy status based on the most recent frame.
+/// Variants ordered by severity (higher = more concerning) for aggregate comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum ZeroCopyStatus {
+    /// No frames processed yet
+    Waiting = 0,
+    /// Most recent frame used true zero-copy
+    ZeroCopy = 1,
+    /// Most recent frame used CPU-assisted path
+    CpuAssisted = 2,
+    /// Most recent frame failed import
+    Failed = 3,
+}
 
 /// Snapshot of Android zero-copy rendering statistics.
 #[derive(Debug, Clone)]
@@ -748,6 +818,8 @@ pub struct AndroidZeroCopySnapshot {
     pub cpu_assisted_frames: u64,
     /// Frames that failed import entirely
     pub failed_frames: u64,
+    /// Status of the most recent frame (non-sticky)
+    pub current_status: ZeroCopyStatus,
 }
 
 impl AndroidZeroCopySnapshot {
@@ -756,47 +828,105 @@ impl AndroidZeroCopySnapshot {
         self.true_zero_copy_frames + self.cpu_assisted_frames + self.failed_frames
     }
 
-    /// True if real zero-copy is active (no CPU copies at all)
+    /// True if most recent frame used true zero-copy
     pub fn is_true_zero_copy(&self) -> bool {
-        self.true_zero_copy_frames > 0 && self.cpu_assisted_frames == 0
+        self.current_status == ZeroCopyStatus::ZeroCopy
     }
 
-    /// Returns a human-readable status label
+    /// Returns a human-readable status label based on most recent frame
     pub fn status_label(&self) -> &'static str {
-        if self.total() == 0 {
-            "No frames"
-        } else if self.is_true_zero_copy() {
-            "Zero-Copy"
-        } else if self.cpu_assisted_frames > 0 {
-            "CPU Fallback"
-        } else {
-            "Failed"
+        match self.current_status {
+            ZeroCopyStatus::Waiting => "Waiting",
+            ZeroCopyStatus::ZeroCopy => "Zero-Copy",
+            ZeroCopyStatus::CpuAssisted => "CPU Fallback",
+            ZeroCopyStatus::Failed => "Failed"
         }
     }
 }
 
-/// Returns a snapshot of Android zero-copy stats.
-pub fn android_zero_copy_snapshot() -> AndroidZeroCopySnapshot {
-    AndroidZeroCopySnapshot {
-        true_zero_copy_frames: ANDROID_ZC_TRUE_FRAMES.load(Ordering::Relaxed),
-        cpu_assisted_frames: ANDROID_ZC_CPU_ASSISTED_FRAMES.load(Ordering::Relaxed),
-        failed_frames: ANDROID_ZC_FAILED_FRAMES.load(Ordering::Relaxed),
+fn last_result_to_status(v: u8) -> ZeroCopyStatus {
+    match v {
+        FRAME_RESULT_ZERO_COPY => ZeroCopyStatus::ZeroCopy,
+        FRAME_RESULT_CPU_ASSISTED => ZeroCopyStatus::CpuAssisted,
+        FRAME_RESULT_FAILED => ZeroCopyStatus::Failed,
+        _ => ZeroCopyStatus::Waiting,
     }
 }
 
-/// Increment true zero-copy frame count (called from video_texture.rs)
-pub fn record_true_zero_copy() {
-    ANDROID_ZC_TRUE_FRAMES.fetch_add(1, Ordering::Relaxed);
+/// Returns a snapshot of zero-copy stats for the given player.
+///
+/// Use `player_id=0` for aggregate stats across all players (demo/single-player mode).
+pub fn android_zero_copy_snapshot(player_id: u64) -> AndroidZeroCopySnapshot {
+    init_player_stats();
+    let Some(stats_map) = PLAYER_STATS.get() else {
+        return AndroidZeroCopySnapshot {
+            true_zero_copy_frames: 0,
+            cpu_assisted_frames: 0,
+            failed_frames: 0,
+            current_status: ZeroCopyStatus::Waiting,
+        };
+    };
+    let guard = stats_map.read();
+
+    if player_id == 0 {
+        // Aggregate across all players
+        let mut snap = AndroidZeroCopySnapshot {
+            true_zero_copy_frames: 0,
+            cpu_assisted_frames: 0,
+            failed_frames: 0,
+            current_status: ZeroCopyStatus::Waiting,
+        };
+        for stats in guard.values() {
+            snap.true_zero_copy_frames += stats.true_zero_copy.load(Ordering::Relaxed);
+            snap.cpu_assisted_frames += stats.cpu_assisted.load(Ordering::Relaxed);
+            snap.failed_frames += stats.failed.load(Ordering::Relaxed);
+            // Pick the most concerning status across all players:
+            // Failed > CpuAssisted > ZeroCopy > Waiting
+            let status = last_result_to_status(stats.last_result.load(Ordering::Relaxed));
+            if status > snap.current_status {
+                snap.current_status = status;
+            }
+        }
+        snap
+    } else if let Some(stats) = guard.get(&player_id) {
+        AndroidZeroCopySnapshot {
+            true_zero_copy_frames: stats.true_zero_copy.load(Ordering::Relaxed),
+            cpu_assisted_frames: stats.cpu_assisted.load(Ordering::Relaxed),
+            failed_frames: stats.failed.load(Ordering::Relaxed),
+            current_status: last_result_to_status(stats.last_result.load(Ordering::Relaxed)),
+        }
+    } else {
+        AndroidZeroCopySnapshot {
+            true_zero_copy_frames: 0,
+            cpu_assisted_frames: 0,
+            failed_frames: 0,
+            current_status: ZeroCopyStatus::Waiting,
+        }
+    }
 }
 
-/// Increment CPU-assisted frame count (called from video_texture.rs)
-pub fn record_cpu_assisted() {
-    ANDROID_ZC_CPU_ASSISTED_FRAMES.fetch_add(1, Ordering::Relaxed);
+/// Increment true zero-copy frame count for a player (called from video_texture.rs)
+pub fn record_true_zero_copy(player_id: u64) {
+    with_player_stats(player_id, |s| {
+        s.true_zero_copy.fetch_add(1, Ordering::Relaxed);
+        s.last_result.store(FRAME_RESULT_ZERO_COPY, Ordering::Relaxed);
+    });
 }
 
-/// Increment failed frame count (called from video_texture.rs)
-pub fn record_import_failed() {
-    ANDROID_ZC_FAILED_FRAMES.fetch_add(1, Ordering::Relaxed);
+/// Increment CPU-assisted frame count for a player (called from video_texture.rs)
+pub fn record_cpu_assisted(player_id: u64) {
+    with_player_stats(player_id, |s| {
+        s.cpu_assisted.fetch_add(1, Ordering::Relaxed);
+        s.last_result.store(FRAME_RESULT_CPU_ASSISTED, Ordering::Relaxed);
+    });
+}
+
+/// Increment failed frame count for a player (called from video_texture.rs)
+pub fn record_import_failed(player_id: u64) {
+    with_player_stats(player_id, |s| {
+        s.failed.fetch_add(1, Ordering::Relaxed);
+        s.last_result.store(FRAME_RESULT_FAILED, Ordering::Relaxed);
+    });
 }
 
 // ============================================================================
@@ -879,6 +1009,7 @@ pub fn is_yuv_hardware_buffer_format(format: u32) -> bool {
 pub fn is_yv12_format(format: u32) -> bool {
     format == AHARDWAREBUFFER_FORMAT_YV12
 }
+
 
 /// Counter for generating unique player IDs
 static NEXT_PLAYER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -1025,6 +1156,11 @@ pub fn release_player_queue(player_id: u64) {
             }
             // Frames are dropped here, releasing their AHardwareBuffers
         }
+    }
+    // Clean up per-player stats
+    if let Some(stats_map) = PLAYER_STATS.get() {
+        let mut guard = stats_map.write();
+        guard.remove(&player_id);
     }
 }
 
