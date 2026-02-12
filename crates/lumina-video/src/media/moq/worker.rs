@@ -78,22 +78,23 @@ pub(crate) async fn run_moq_worker(
     shared.buffering_percent.store(50, Ordering::Relaxed);
 
     // -- Phase 3: Fetch and validate catalog --
-    let hang_consumer: hang::BroadcastConsumer = moq_broadcast.into();
-
     let (video_track_name, max_latency, catalog) =
-        fetch_and_validate_catalog(&hang_consumer, &shared, &config, label).await?;
+        fetch_and_validate_catalog(&moq_broadcast, &shared, &config, label).await?;
 
     // -- Phase 4: Subscribe to video track --
     let video_track = moq_lite::Track {
         name: video_track_name.clone(),
         priority: 1,
     };
-    let mut video_consumer = hang_consumer.subscribe(&video_track, max_latency);
+    let mut video_consumer = hang::container::OrderedConsumer::new(
+        moq_broadcast.subscribe_track(&video_track),
+        max_latency,
+    );
 
     // -- Phase 5: Audio setup --
     let (mut audio_consumer_opt, audio_sender_opt, mut moq_audio_thread_opt) = setup_audio(
         &catalog,
-        &hang_consumer,
+        &moq_broadcast,
         max_latency,
         &config,
         &shared,
@@ -118,7 +119,7 @@ pub(crate) async fn run_moq_worker(
     loop {
         tokio::select! {
             // No biased — fair scheduling prevents audio starvation
-            video_result = video_consumer.read_frame() => {
+            video_result = video_consumer.read() => {
                 match video_result {
                     Ok(Some(frame)) => {
                         let recv_count =
@@ -168,7 +169,7 @@ pub(crate) async fn run_moq_worker(
             }
             audio_result = async {
                 if let Some(consumer) = audio_consumer_opt.as_mut() {
-                    consumer.read_frame().await
+                    consumer.read().await
                 } else {
                     std::future::pending().await
                 }
@@ -436,12 +437,13 @@ async fn discover_broadcast(
 ///
 /// Returns `(video_track_name, max_latency, catalog)`.
 async fn fetch_and_validate_catalog(
-    hang_consumer: &hang::BroadcastConsumer,
+    moq_broadcast: &moq_lite::BroadcastConsumer,
     shared: &Arc<MoqSharedState>,
     config: &MoqDecoderConfig,
     label: &str,
 ) -> Result<(String, Duration, hang::catalog::Catalog), Box<dyn std::error::Error + Send + Sync>> {
-    let mut catalog_consumer = hang_consumer.catalog.clone();
+    let mut catalog_consumer =
+        hang::CatalogConsumer::new(moq_broadcast.subscribe_track(&hang::Catalog::default_track()));
     let catalog_timeout = Duration::from_secs(5);
     let catalog = match tokio::time::timeout(catalog_timeout, catalog_consumer.next()).await {
         Ok(Ok(Some(catalog))) => catalog,
@@ -461,13 +463,13 @@ async fn fetch_and_validate_catalog(
     tracing::info!("MoQ {}: Received catalog", label);
 
     // Log full catalog contents for debugging
-    if let Some(ref video) = catalog.video {
+    if !catalog.video.renditions.is_empty() {
         tracing::info!(
             "MoQ {} catalog: {} video rendition(s)",
             label,
-            video.renditions.len()
+            catalog.video.renditions.len()
         );
-        for (name, cfg) in &video.renditions {
+        for (name, cfg) in &catalog.video.renditions {
             tracing::info!(
                 "  video '{}': codec={:?}, {}x{}, {:.1}fps, bitrate={:?}, description={} bytes, container={:?}, jitter={:?}",
                 name,
@@ -484,13 +486,13 @@ async fn fetch_and_validate_catalog(
     } else {
         tracing::warn!("MoQ {} catalog: no video section", label);
     }
-    if let Some(ref audio) = catalog.audio {
+    if !catalog.audio.renditions.is_empty() {
         tracing::info!(
             "MoQ {} catalog: {} audio rendition(s)",
             label,
-            audio.renditions.len()
+            catalog.audio.renditions.len()
         );
-        for (name, cfg) in &audio.renditions {
+        for (name, cfg) in &catalog.audio.renditions {
             tracing::info!(
                 "  audio '{}': codec={:?}, sample_rate={}, channels={}, bitrate={:?}, description={} bytes",
                 name,
@@ -508,8 +510,9 @@ async fn fetch_and_validate_catalog(
     // Find the first video rendition in the catalog
     let (video_track_name, video_config) = catalog
         .video
-        .as_ref()
-        .and_then(|v| v.renditions.iter().next())
+        .renditions
+        .iter()
+        .next()
         .ok_or("No video track in catalog")?;
 
     // Validate container format — we only support Legacy (raw NAL units)
@@ -580,13 +583,13 @@ async fn fetch_and_validate_catalog(
 /// Set up audio track subscription and spawn decode/playback thread.
 fn setup_audio(
     catalog: &hang::catalog::Catalog,
-    hang_consumer: &hang::BroadcastConsumer,
+    moq_broadcast: &moq_lite::BroadcastConsumer,
     max_latency: Duration,
     config: &MoqDecoderConfig,
     shared: &Arc<MoqSharedState>,
     label: &str,
 ) -> (
-    Option<hang::TrackConsumer>,
+    Option<hang::container::OrderedConsumer>,
     Option<LiveEdgeSender<MoqAudioFrame>>,
     Option<MoqAudioThread>,
 ) {
@@ -609,7 +612,10 @@ fn setup_audio(
         name: track_name.to_string(),
         priority: 2,
     };
-    let audio_consumer = hang_consumer.subscribe(&audio_track, max_latency);
+    let audio_consumer = hang::container::OrderedConsumer::new(
+        moq_broadcast.subscribe_track(&audio_track),
+        max_latency,
+    );
 
     let (tx, rx) = crossbeam_channel::bounded(config.audio_buffer_capacity);
     let live_sender = LiveEdgeSender::new(tx, rx.clone());
@@ -648,7 +654,7 @@ fn setup_audio(
 /// reusing `buf` to avoid per-frame allocation.
 ///
 /// After `split().freeze()`, the `BytesMut` retains its allocation for reuse.
-fn assemble_payload(payload: &hang::BufList, buf: &mut BytesMut) -> bytes::Bytes {
+fn assemble_payload(payload: &hang::container::BufList, buf: &mut BytesMut) -> bytes::Bytes {
     buf.clear();
     let needed = payload.remaining();
     buf.reserve(needed);

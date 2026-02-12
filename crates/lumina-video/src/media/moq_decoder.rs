@@ -13,8 +13,9 @@
 //! ## macOS (VideoToolbox Zero-Copy)
 //! ```text
 //! moq:// URL -> moq-native Client (QUIC connection)
-//!            -> hang::BroadcastConsumer (catalog + track subscription)
-//!            -> hang::TrackConsumer (frame receipt)
+//!            -> moq_lite::BroadcastConsumer (broadcast discovery)
+//!            -> hang::CatalogConsumer (catalog fetch)
+//!            -> hang::container::OrderedConsumer (frame receipt)
 //!            -> VTDecompressionSession (decode H.264/H.265)
 //!            -> CVPixelBuffer -> IOSurface -> MacOSGpuSurface
 //!            -> zero_copy::macos::import_iosurface() -> wgpu::Texture
@@ -23,8 +24,9 @@
 //! ## Android (MediaCodec Zero-Copy)
 //! ```text
 //! moq:// URL -> moq-native Client (QUIC connection)
-//!            -> hang::BroadcastConsumer (catalog + track subscription)
-//!            -> hang::TrackConsumer (NAL unit receipt)
+//!            -> moq_lite::BroadcastConsumer (broadcast discovery)
+//!            -> hang::CatalogConsumer (catalog fetch)
+//!            -> hang::container::OrderedConsumer (NAL unit receipt)
 //!            -> MoqMediaCodecBridge.submitNalUnit() (JNI)
 //!            -> MediaCodec (hardware decode)
 //!            -> ImageReader (GPU_SAMPLED_IMAGE usage)
@@ -36,8 +38,9 @@
 //! ## Other Platforms (FFmpeg fallback)
 //! ```text
 //! moq:// URL -> moq-native Client (QUIC connection)
-//!            -> hang::BroadcastConsumer (catalog + track subscription)
-//!            -> hang::TrackConsumer (frame receipt)
+//!            -> moq_lite::BroadcastConsumer (broadcast discovery)
+//!            -> hang::CatalogConsumer (catalog fetch)
+//!            -> hang::container::OrderedConsumer (frame receipt)
 //!            -> FFmpeg (decode H.264/H.265/AV1 frames)
 //!            -> VideoFrame -> FrameQueue -> Rendering
 //! ```

@@ -326,7 +326,6 @@ pub(crate) fn select_preferred_audio_rendition(
 
     catalog
         .audio
-        .as_ref()?
         .renditions
         .iter()
         .filter(|(_, cfg)| matches!(cfg.codec, AudioCodec::AAC(_)))
@@ -397,6 +396,52 @@ mod tests {
         // Drain remaining items first
         while rx.try_recv().is_ok() {}
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_select_audio_empty_renditions() {
+        let catalog = hang::catalog::Catalog::default();
+        assert!(select_preferred_audio_rendition(&catalog).is_none());
+    }
+
+    #[test]
+    fn test_select_audio_prefers_highest_sample_rate() {
+        use std::collections::BTreeMap;
+
+        let mut renditions = BTreeMap::new();
+        renditions.insert(
+            "audio0".to_string(),
+            hang::catalog::AudioConfig {
+                codec: hang::catalog::AudioCodec::AAC(hang::catalog::AAC { profile: 2 }),
+                sample_rate: 44100,
+                channel_count: 2,
+                bitrate: None,
+                description: None,
+                container: hang::catalog::Container::Legacy,
+                jitter: None,
+            },
+        );
+        renditions.insert(
+            "audio1".to_string(),
+            hang::catalog::AudioConfig {
+                codec: hang::catalog::AudioCodec::AAC(hang::catalog::AAC { profile: 2 }),
+                sample_rate: 48000,
+                channel_count: 2,
+                bitrate: None,
+                description: None,
+                container: hang::catalog::Container::Legacy,
+                jitter: None,
+            },
+        );
+
+        let catalog = hang::catalog::Catalog {
+            audio: hang::catalog::Audio { renditions },
+            ..Default::default()
+        };
+
+        let (name, cfg) = select_preferred_audio_rendition(&catalog).unwrap();
+        assert_eq!(name, "audio1");
+        assert_eq!(cfg.sample_rate, 48000);
     }
 
     #[test]
