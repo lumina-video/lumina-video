@@ -70,9 +70,7 @@ strip = true
 
 # Patches for zero-copy video rendering
 [patch.crates-io]
-# Patched wgpu workspace crates for zero-copy video rendering:
-# - Linux: DMABuf external memory extensions
-# - Android: AHardwareBuffer import + YCbCr conversion + fence sync extensions
+# Patched wgpu workspace crates to enable Linux DMABuf external memory extensions for zero-copy video
 # All interdependent wgpu crates must be patched together to avoid type mismatches
 naga = { git = "https://github.com/lumina-video/wgpu.git", branch = "linux-dmabuf-extensions" }
 wgpu-types = { git = "https://github.com/lumina-video/wgpu.git", branch = "linux-dmabuf-extensions" }
