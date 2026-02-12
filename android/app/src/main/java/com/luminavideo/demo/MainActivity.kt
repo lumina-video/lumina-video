@@ -57,9 +57,9 @@ class MainActivity : GameActivity() {
         private const val TAG = "LuminaVideoDemo"
 
         // Sample video URL for testing
-        // Big Buck Bunny - Creative Commons licensed
+        // Big Buck Bunny - Creative Commons licensed, H.264 720p
         private const val SAMPLE_VIDEO_URL =
-            "https://storage.googleapis.com/exoplayer-test-media-1/mp4/android-screens-10s.mp4"
+            "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
 
         init {
             // Load the native library
