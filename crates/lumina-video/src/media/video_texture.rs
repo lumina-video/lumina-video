@@ -1182,22 +1182,14 @@ mod native_render_callback {
                 //
                 // ## Known Limitation: ImageFormat.PRIVATE yields YUV, not RGBA
                 //
-                // ExoPlayer's ImageReader with ImageFormat.PRIVATE typically provides YUV data
-                // (usually NV12), NOT RGBA. The HardwareBuffer format will be something like
-                // AHARDWAREBUFFER_FORMAT_Y8Cb8Cr8_420 rather than R8G8B8A8_UNORM.
+                // Android HardwareBuffer zero-copy import.
                 //
-                // The format check below correctly rejects non-RGBA buffers, but this means
-                // zero-copy will almost always fall back to the CPU path on Android. This is
-                // expected behavior given current implementation constraints.
+                // ExoPlayer produces YUV (NV12/Y8Cb8Cr8_420) via ImageFormat.PRIVATE.
+                // Both RGBA and YUV paths are handled:
+                // - RGBA: direct single-plane Vulkan import
+                // - YUV: true zero-copy via VkSamplerYcbcrConversion, with CPU-assisted
+                //   lockPlanes fallback when Vulkan YUV import fails
                 //
-                // Future work: Implement YUV multi-plane import using VkSamplerYcbcrConversion
-                // to handle NV12/YUV420p HardwareBuffers directly on the GPU. This would require:
-                // 1. Detecting YUV format from HardwareBuffer
-                // 2. Creating Vulkan YCbCr sampler with appropriate format
-                // 3. Importing each plane as a separate texture
-                // 4. Using the existing YUV shader pipeline for conversion
-                //
-                // See: https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VkSamplerYcbcrConversion.html
                 //
                 // NOTE: Android timing limitation (lumina-video-m07)
                 //

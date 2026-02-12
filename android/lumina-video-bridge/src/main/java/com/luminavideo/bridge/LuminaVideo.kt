@@ -71,7 +71,8 @@ object LuminaVideo {
         customBuilder = builder
         Log.i(TAG, "Initialized with context=${activity.applicationContext}")
 
-        // Register lifecycle observer for cleanup on Activity destroy
+        // Register lifecycle observer for cleanup on Activity destroy.
+        // On destroy, reset initialized so a recreated Activity can re-register.
         if (activity is LifecycleOwner) {
             activity.lifecycle.addObserver(LifecycleEventObserver { _, event ->
                 if (event == Lifecycle.Event.ON_DESTROY) {
@@ -82,6 +83,11 @@ object LuminaVideo {
                         }
                         activeBridges.clear()
                     }
+                    // Reset so a recreated Activity can call init() again
+                    // and register a fresh lifecycle observer
+                    appContext = null
+                    customBuilder = null
+                    initialized.set(false)
                 }
             })
         } else {

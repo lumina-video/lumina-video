@@ -246,9 +246,7 @@ impl VideoPlayer {
             audio_thread: None,
             init_thread: None,
             init_promise: None,
-            // Use player_id=0 (legacy mode) to receive frames from any ExoPlayerBridge.
-            // This is needed because the Kotlin-side bridge creates its own player_id,
-            // and we want to receive those frames regardless of which bridge sent them.
+            // Updated from decoder.android_player_id() once init completes.
             #[cfg(target_os = "android")]
             android_player_id: 0,
             #[cfg(any(
@@ -355,9 +353,7 @@ impl VideoPlayer {
             audio_thread: None,
             init_thread: None,
             init_promise: None,
-            // Use player_id=0 (legacy mode) to receive frames from any ExoPlayerBridge.
-            // This is needed because the Kotlin-side bridge creates its own player_id,
-            // and we want to receive those frames regardless of which bridge sent them.
+            // Updated from decoder.android_player_id() once init completes.
             #[cfg(target_os = "android")]
             android_player_id: 0,
             #[cfg(any(
@@ -585,6 +581,12 @@ impl VideoPlayer {
                 // This allows FFmpeg fallback on macOS/Linux to still get FFmpeg audio
                 let uses_native_audio = decoder.handles_audio_internally();
 
+                // Extract Android player ID for per-player frame queue routing
+                #[cfg(target_os = "android")]
+                {
+                    self.android_player_id = decoder.android_player_id();
+                }
+
                 // Extract MoQ audio handle (if any) before boxing the decoder
                 let decoder_audio_handle = decoder.audio_handle();
 
@@ -700,7 +702,9 @@ impl VideoPlayer {
         #[cfg(target_os = "android")]
         let decoder: Box<dyn VideoDecoderBackend + Send> = {
             tracing::info!("Using Android ExoPlayer decoder for {}", self.url);
-            Box::new(AndroidVideoDecoder::new(&self.url)?)
+            let d = AndroidVideoDecoder::new(&self.url)?;
+            self.android_player_id = d.android_player_id();
+            Box::new(d)
         };
 
         // Linux: GStreamer is the only supported backend (no FFmpeg fallback)

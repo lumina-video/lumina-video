@@ -65,12 +65,14 @@ class MainActivity : GameActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Initialize lumina-video BEFORE super.onCreate() — GameActivity's super
+        // may trigger native startup which creates AndroidVideoDecoder, and that
+        // calls LuminaVideo.createPlayer() via JNI. Init must be complete first.
+        LuminaVideo.init(this)
+
         super.onCreate(savedInstanceState)
 
-        Log.i(TAG, "onCreate: Initializing lumina-video demo")
-
-        // Initialize lumina-video — enables self-contained VideoPlayer from Rust
-        LuminaVideo.init(this)
+        Log.i(TAG, "onCreate: lumina-video demo initialized")
 
         // Enable immersive fullscreen mode
         enableImmersiveMode()

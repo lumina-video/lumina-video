@@ -38,16 +38,15 @@
 //!
 //! Tracking: lumina-video-5hd
 
-use crossbeam_channel::{Receiver, Sender};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::{info, warn};
+use tracing::info;
 
 use parking_lot::Mutex;
 
-use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JValue};
+use jni::objects::{GlobalRef, JClass, JObject, JValue};
 use jni::sys::{jint, jlong};
 use jni::{JNIEnv, JavaVM};
 
@@ -55,8 +54,6 @@ use super::video::{
     CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend, VideoError,
     VideoFrame, VideoMetadata,
 };
-
-use super::video::AndroidGpuSurface;
 
 /// Gets the Java VM from the Android context.
 ///
@@ -71,91 +68,51 @@ fn get_jvm() -> Result<JavaVM, VideoError> {
         .map_err(|e| VideoError::DecoderInit(format!("Failed to get JavaVM: {}", e)))
 }
 
-/// Gets the Android application context as a JNI object.
-///
-/// # Safety
-///
-/// Must be called from a thread attached to the JVM.
-#[allow(dead_code)]
-unsafe fn get_android_context() -> JObject<'static> {
-    JObject::from_raw(ndk_context::android_context().context().cast())
-}
-
-/// Cached Android device information for diagnostics.
-#[derive(Debug, Clone)]
-struct AndroidDeviceInfo {
-    /// API level (SDK_INT), e.g., 29 for Android 10
-    sdk_int: i32,
-    /// Device model (Build.MODEL), e.g., "Pixel 6"
-    model: String,
-    /// Device manufacturer (Build.MANUFACTURER), e.g., "Google"
-    manufacturer: String,
-}
-
-/// Fetches Android device info via JNI.
-///
-/// Queries JNI for:
-/// - `android.os.Build.VERSION.SDK_INT`
-/// - `android.os.Build.MODEL`
-/// - `android.os.Build.MANUFACTURER`
-fn fetch_android_device_info() -> Option<AndroidDeviceInfo> {
+/// Fetches the Android SDK API level via JNI and logs device info for diagnostics.
+fn fetch_android_api_level() -> Option<i32> {
     let vm = get_jvm().ok()?;
-
     let mut env = vm.attach_current_thread().ok()?;
 
-    // Get SDK_INT from android.os.Build.VERSION
     let version_class = env.find_class("android/os/Build$VERSION").ok()?;
-
     let sdk_int = env
         .get_static_field(&version_class, "SDK_INT", "I")
         .ok()?
         .i()
         .ok()?;
 
-    // Get MODEL and MANUFACTURER from android.os.Build
+    // Log device model/manufacturer for diagnostics
     let build_class = env.find_class("android/os/Build").ok()?;
 
     let model_obj = env
         .get_static_field(&build_class, "MODEL", "Ljava/lang/String;")
-        .ok()?
-        .l()
-        .ok()?;
+        .ok()
+        .and_then(|v| v.l().ok());
+    let model: String = if let Some(ref obj) = model_obj {
+        env.get_string(obj.into())
+            .map(|s| s.into())
+            .unwrap_or_else(|_| "unknown".to_string())
+    } else {
+        "unknown".to_string()
+    };
 
-    let model: String = env
-        .get_string((&model_obj).into())
-        .map(|s| s.into())
-        .unwrap_or_else(|_| "unknown".to_string());
-
-    let manufacturer_obj = env
+    let mfr_obj = env
         .get_static_field(&build_class, "MANUFACTURER", "Ljava/lang/String;")
-        .ok()?
-        .l()
-        .ok()?;
+        .ok()
+        .and_then(|v| v.l().ok());
+    let manufacturer: String = if let Some(ref obj) = mfr_obj {
+        env.get_string(obj.into())
+            .map(|s| s.into())
+            .unwrap_or_else(|_| "unknown".to_string())
+    } else {
+        "unknown".to_string()
+    };
 
-    let manufacturer: String = env
-        .get_string((&manufacturer_obj).into())
-        .map(|s| s.into())
-        .unwrap_or_else(|_| "unknown".to_string());
-
-    tracing::debug!(
-        "Android device info: API {}, {} {}",
-        sdk_int,
-        manufacturer,
-        model
-    );
-
-    Some(AndroidDeviceInfo {
-        sdk_int,
-        model,
-        manufacturer,
-    })
+    tracing::debug!("Android device: API {}, {} {}", sdk_int, manufacturer, model);
+    Some(sdk_int)
 }
 
 /// State shared between Rust and JNI callbacks.
-#[allow(dead_code)]
 struct SharedState {
-    /// Channel for receiving frames from JNI callbacks (wired to JNI on frame submit)
-    frame_sender: Sender<AndroidFrame>,
     /// Current video width
     width: u32,
     /// Current video height
@@ -166,64 +123,33 @@ struct SharedState {
     playback_state: i32,
     /// Last error message
     last_error: Option<String>,
-    /// Whether a new frame is available
-    frame_available: bool,
 }
 
-/// Frame data received from Android.
-pub struct AndroidFrame {
-    /// RGBA pixel data
-    pub pixels: Vec<u8>,
-    /// Frame width
-    pub width: u32,
-    /// Frame height
-    pub height: u32,
-    /// Timestamp in nanoseconds
-    pub timestamp_ns: i64,
-}
-
-/// Android video decoder using ExoPlayer.
+/// Android video decoder using ExoPlayer via JNI.
 ///
-/// # Current State
+/// # Architecture
 ///
-/// **All frames currently use CPU fallback (ByteBuffer extraction).**
+/// `LuminaVideo.init(activity)` in Kotlin stores the application context. When Rust
+/// calls `AndroidVideoDecoder::new(url)`, it invokes `LuminaVideo.createPlayer()` via
+/// JNI, which creates ExoPlayer on a dedicated HandlerThread with a Looper. ExoPlayer
+/// decodes to an ImageReader, and decoded frames arrive as HardwareBuffers via JNI
+/// callbacks (`nativeSubmitHardwareBuffer`).
 ///
-/// MediaCodec performs hardware-accelerated decoding, but decoded frames are copied
-/// to CPU memory via ExoPlayer's `extractCurrentFrame()` before upload to wgpu.
-/// This works but involves a GPU→CPU→GPU copy path.
+/// # Zero-Copy Rendering
 ///
-/// # Zero-Copy Infrastructure (Ready, Blocked on Java)
-///
-/// The Rust-side infrastructure for zero-copy is complete:
-/// - `AndroidGpuSurface` type exists for AHardwareBuffer references
-/// - Vulkan import path is implemented
-/// - `try_extract_ahardwarebuffer()` method is stubbed and ready
-///
-/// **Blocked on:** Java/Kotlin ExoPlayerBridge (not in this repo) implementing:
-/// 1. AImageReader as output surface with `AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE`
-/// 2. `getHardwareBuffer()` JNI method to expose native AHardwareBuffer pointer
-/// 3. AImage lifecycle management
+/// HardwareBuffers are imported into Vulkan via `VK_ANDROID_external_memory_android_hardware_buffer`
+/// with GPU-side YCbCr→RGB conversion (`VkSamplerYcbcrConversion`). No CPU pixel copies
+/// in steady-state playback. See `video_texture.rs` for the import path and `zero_copy.rs`
+/// for the Vulkan YUV pipeline.
 ///
 /// Tracking: lumina-video-5hd
-/// See `zero-copy-android.md` for the full implementation plan.
 pub struct AndroidVideoDecoder {
     /// JNI reference to ExoPlayerBridge instance
     bridge: GlobalRef,
     /// Shared state between Rust and JNI
     state: Arc<Mutex<SharedState>>,
-    /// Frame receiver channel (reserved for future async frame delivery).
-    /// Currently unused as frame extraction uses synchronous JNI calls and callback-based
-    /// state updates. Kept for potential future migration to event-driven frame reception
-    /// from the ExoPlayer bridge. Tracking: lumina-video-5hd
-    #[allow(dead_code)]
-    frame_receiver: Receiver<AndroidFrame>,
     /// Video metadata
     metadata: VideoMetadata,
-    /// Whether the decoder is initialized (reserved for future state tracking).
-    /// Currently always set to true and never read. Kept as placeholder for potential
-    /// future use in state machine or lifecycle tracking. Tracking: lumina-video-5hd
-    #[allow(dead_code)]
-    initialized: bool,
     /// Native handle for JNI callback lookup
     native_handle: i64,
     /// Last known playback position (for placeholder frames)
@@ -232,16 +158,12 @@ pub struct AndroidVideoDecoder {
     url: String,
     /// Whether playback has been started
     started: bool,
-    /// Count of frames using CPU fallback (ByteBuffer extraction).
-    /// Incremented each frame since zero-copy to wgpu is not yet available.
-    cpu_fallback_count: AtomicU64,
-    /// Whether the CPU fallback warning has been logged (avoid spam).
-    fallback_logged: AtomicBool,
-    /// Cached Android device info for diagnostics (fetched once per decoder instance).
-    device_info: Option<AndroidDeviceInfo>,
-    /// Whether AHardwareBuffer zero-copy is available (API 29+ and ExoPlayer configured for it).
-    /// This is checked once during initialization.
+    /// Whether AHardwareBuffer zero-copy is available (Android API 29+).
+    /// Checked once during initialization.
     ahardwarebuffer_available: bool,
+    /// Player ID for per-player frame queue routing.
+    /// Generated by `nativeGeneratePlayerId()` on the Kotlin side.
+    player_id: u64,
 }
 
 /// Converts an Arc<Mutex<SharedState>> into a raw pointer handle for JNI.
@@ -296,18 +218,13 @@ impl AndroidVideoDecoder {
         // Get Android context
         let context = unsafe { JObject::from_raw(ndk_context::android_context().context().cast()) };
 
-        // Create frame channel (crossbeam for better performance)
-        let (frame_sender, frame_receiver) = crossbeam_channel::unbounded();
-
-        // Create shared state
+        // Create shared state for JNI callbacks
         let state = Arc::new(Mutex::new(SharedState {
-            frame_sender,
             width: 0,
             height: 0,
             duration_ms: 0,
             playback_state: 0,
             last_error: None,
-            frame_available: false,
         }));
 
         // Create native handle (stores raw pointer to Arc for JNI callbacks)
@@ -407,8 +324,14 @@ impl AndroidVideoDecoder {
             )))
         })?;
 
-        // Don't call play() here - playback will start when decode_next() is first called
-        // This prevents auto-play on app start
+        // Query player ID from bridge (generated by nativeGeneratePlayerId in Kotlin)
+        let player_id = env
+            .call_method(&bridge_ref, "getPlayerId", "()J", &[])
+            .ok()
+            .and_then(|v| v.j().ok())
+            .unwrap_or(0) as u64;
+
+        info!("AndroidVideoDecoder: player_id={}", player_id);
 
         // Initial metadata (will be updated by callbacks)
         let metadata = VideoMetadata {
@@ -421,12 +344,9 @@ impl AndroidVideoDecoder {
             start_time: None, // MediaCodec doesn't expose stream start time
         };
 
-        // Fetch device info once per decoder instance for diagnostics
-        let device_info = fetch_android_device_info();
-
         // Check if AHardwareBuffer zero-copy is available (API 29+ required)
         let ahardwarebuffer_available = {
-            let api_level = device_info.as_ref().map(|i| i.sdk_int).unwrap_or(0);
+            let api_level = fetch_android_api_level().unwrap_or(0);
             let available = api_level >= 29;
             if available {
                 info!(
@@ -448,84 +368,14 @@ impl AndroidVideoDecoder {
         Ok(Self {
             bridge: bridge_ref,
             state,
-            frame_receiver,
             metadata,
-            initialized: true,
             native_handle,
             last_position: Duration::ZERO,
             url: url.to_string(),
             started: false,
-            cpu_fallback_count: AtomicU64::new(0),
-            fallback_logged: AtomicBool::new(false),
-            device_info,
             ahardwarebuffer_available,
+            player_id,
         })
-    }
-
-    /// Extracts the current frame from ExoPlayer.
-    fn extract_frame(&self) -> Result<Option<AndroidFrame>, VideoError> {
-        let vm = get_jvm()?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| VideoError::DecodeFailed(format!("Failed to attach JNI thread: {}", e)))?;
-
-        // Call extractCurrentFrame
-        let result = env
-            .call_method(&self.bridge, "extractCurrentFrame", "()[B", &[])
-            .map_err(|e| VideoError::DecodeFailed(format!("Failed to extract frame: {}", e)))?;
-
-        let bytes_obj = result
-            .l()
-            .map_err(|e| VideoError::DecodeFailed(format!("Failed to get frame bytes: {}", e)))?;
-
-        if bytes_obj.is_null() {
-            tracing::debug!("extractCurrentFrame returned null");
-            return Ok(None);
-        }
-
-        let bytes_array = JByteArray::from(bytes_obj);
-        let len = env
-            .get_array_length(&bytes_array)
-            .map_err(|e| VideoError::DecodeFailed(format!("Failed to get array length: {}", e)))?
-            as usize;
-
-        let mut pixels: Vec<i8> = vec![0; len];
-        env.get_byte_array_region(&bytes_array, 0, &mut pixels)
-            .map_err(|e| VideoError::DecodeFailed(format!("Failed to get array data: {}", e)))?;
-
-        // Convert i8 to u8
-        let pixels: Vec<u8> = pixels.into_iter().map(|b| b as u8).collect();
-
-        // Get current dimensions from state
-        let state = self.state.lock();
-        let width = state.width;
-        let height = state.height;
-
-        if width == 0 || height == 0 {
-            tracing::debug!("Frame dimensions are 0x0");
-            return Ok(None);
-        }
-
-        // Debug: Check if we got actual pixel data
-        let non_zero_count = pixels.iter().filter(|&&b| b != 0).count();
-        tracing::trace!(
-            "Extracted frame: {}x{}, {} bytes, {} non-zero bytes",
-            width,
-            height,
-            len,
-            non_zero_count
-        );
-
-        // Use last_position for timestamp - don't call getCurrentPosition() here
-        // because ExoPlayer requires main thread access and we're on a decode thread
-        let position_ms = self.last_position.as_millis() as i64;
-
-        Ok(Some(AndroidFrame {
-            pixels,
-            width,
-            height,
-            timestamp_ns: position_ms * 1_000_000, // ms to ns
-        }))
     }
 
     /// Creates a minimal placeholder frame with the last known playback position.
@@ -591,6 +441,10 @@ impl AndroidVideoDecoder {
 
     /// Waits for a frame to be available with timeout.
     /// Returns true if a frame is ready, false on timeout.
+    ///
+    /// Checks the HardwareBuffer queue directly — frames arrive via
+    /// `nativeSubmitHardwareBuffer` and are consumed by the render thread
+    /// in `video_texture.rs::prepare()`.
     fn wait_for_frame(&self, max_wait_ms: u64) -> Result<bool, VideoError> {
         const STATE_ENDED: i32 = 4;
 
@@ -598,12 +452,7 @@ impl AndroidVideoDecoder {
 
         while start.elapsed().as_millis() < max_wait_ms as u128 {
             {
-                let mut state = self.state.lock();
-
-                if state.frame_available {
-                    state.frame_available = false;
-                    return Ok(true);
-                }
+                let state = self.state.lock();
 
                 if let Some(ref error) = state.last_error {
                     return Err(VideoError::DecodeFailed(error.clone()));
@@ -614,85 +463,21 @@ impl AndroidVideoDecoder {
                 }
             }
 
+            // Check HardwareBuffer queue (frames arrive from ExoPlayerBridge)
+            if has_pending_hardware_buffer(self.player_id) {
+                return Ok(true);
+            }
+
             std::thread::sleep(Duration::from_millis(5));
         }
 
         Ok(false)
     }
 
-    /// Converts an AndroidFrame to a VideoFrame, updating last_position.
-    ///
-    /// This tracks CPU fallback since we're using ByteBuffer extraction instead
-    /// of zero-copy AHardwareBuffer → Vulkan.
-    fn android_frame_to_video_frame(&mut self, android_frame: AndroidFrame) -> VideoFrame {
-        // Track CPU fallback for zero-copy visibility
-        // TODO(e): When AHardwareBuffer → Vulkan integration is complete,
-        // this counter should only increment on actual fallbacks, not every frame.
-        let fallback_count = self.cpu_fallback_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if !self.fallback_logged.swap(true, Ordering::Relaxed) {
-            // Use cached device info for diagnostics
-            let (api_level, device_info_str) = match &self.device_info {
-                Some(info) => (
-                    format!("{}", info.sdk_int),
-                    format!("{} {}", info.manufacturer, info.model),
-                ),
-                None => ("unknown".to_string(), "unknown".to_string()),
-            };
-
-            warn!(
-                "Android zero-copy: CPU fallback active (ByteBuffer extraction). \
-                 AHardwareBuffer → Vulkan → wgpu not yet integrated. \
-                 Frame: {}x{}, format: RGBA, device: {}, API level: {} (requires 29+)",
-                android_frame.width, android_frame.height, device_info_str, api_level
-            );
-        }
-
-        if fallback_count % 1000 == 0 {
-            tracing::debug!(
-                "Android CPU fallback frame #{} ({}x{})",
-                fallback_count,
-                android_frame.width,
-                android_frame.height
-            );
-        }
-
-        let cpu_frame = CpuFrame::new(
-            PixelFormat::Rgba,
-            android_frame.width,
-            android_frame.height,
-            vec![Plane {
-                data: android_frame.pixels,
-                stride: android_frame.width as usize * 4,
-            }],
-        );
-
-        let pts = Duration::from_nanos(android_frame.timestamp_ns as u64);
-        self.last_position = pts;
-
-        VideoFrame::new(pts, DecodedFrame::Cpu(cpu_frame))
-    }
-
-    /// Checks if playback has ended.
-    fn is_playback_ended(&self) -> bool {
-        const STATE_ENDED: i32 = 4;
-        let state = self.state.lock();
-        state.playback_state == STATE_ENDED
-    }
 }
 
 impl Drop for AndroidVideoDecoder {
     fn drop(&mut self) {
-        // Log zero-copy stats before cleanup
-        let fallback_count = self.cpu_fallback_count.load(Ordering::Relaxed);
-        if fallback_count > 0 {
-            info!(
-                "AndroidVideoDecoder zero-copy stats: {} frames used CPU fallback \
-                 (ByteBuffer extraction). Zero-copy via AHardwareBuffer → Vulkan → wgpu \
-                 awaits integration.",
-                fallback_count
-            );
-        }
-
         // Release ExoPlayer resources FIRST to stop all callbacks
         // before invalidating the native handle
         if let Ok(vm) = get_jvm() {
@@ -712,6 +497,10 @@ impl VideoDecoderBackend for AndroidVideoDecoder {
         Self: Sized,
     {
         Self::new(url)
+    }
+
+    fn android_player_id(&self) -> u64 {
+        self.player_id
     }
 
     fn pause(&mut self) -> Result<(), VideoError> {
@@ -751,34 +540,38 @@ impl VideoDecoderBackend for AndroidVideoDecoder {
     fn decode_next(&mut self) -> Result<Option<VideoFrame>, VideoError> {
         // Start playback on first decode_next call
         self.start_playback()?;
-        tracing::debug!("decode_next called, started={}", self.started);
 
         // Check for errors or EOS from callbacks
         if let Some(result) = self.check_state_for_early_return() {
             return result;
         }
 
-        // Wait for a frame to be available (with timeout)
+        // Wait for a HardwareBuffer frame or error/EOS.
+        // Actual frame delivery to the render thread happens independently via
+        // try_receive_hardware_buffer_for_player() in video_texture.rs::prepare().
+        // This loop serves as a heartbeat for error/EOS detection and position updates.
         let frame_ready = self.wait_for_frame(100)?;
 
         if !frame_ready {
-            // EOS check is handled in wait_for_frame, this is just timeout
-            tracing::debug!("No frame ready, returning placeholder");
             return Ok(Some(self.create_placeholder_frame()));
         }
 
-        tracing::debug!("Frame ready, extracting...");
-        let frame = self.extract_frame()?;
-
-        let Some(android_frame) = frame else {
-            // Frame extraction failed - check if EOS or return placeholder
-            if self.is_playback_ended() {
-                return Ok(None);
+        // Update position from cached bridge state
+        let vm = get_jvm();
+        if let Ok(vm) = vm {
+            if let Ok(mut env) = vm.attach_current_thread() {
+                if let Ok(pos) = env.call_method(&self.bridge, "getCurrentPosition", "()J", &[]) {
+                    if let Ok(pos_ms) = pos.j() {
+                        if pos_ms >= 0 {
+                            self.last_position = Duration::from_millis(pos_ms as u64);
+                        }
+                    }
+                }
             }
-            return Ok(Some(self.create_placeholder_frame()));
-        };
+        }
 
-        Ok(Some(self.android_frame_to_video_frame(android_frame)))
+        // Return placeholder — the real frame is delivered via HardwareBuffer queue
+        Ok(Some(self.create_placeholder_frame()))
     }
 
     fn seek(&mut self, position: Duration) -> Result<(), VideoError> {
@@ -927,223 +720,14 @@ impl AndroidVideoDecoder {
         }
     }
 
-    /// Returns the number of frames that used CPU fallback instead of zero-copy.
-    ///
-    /// Currently, ALL frames use CPU fallback (ByteBuffer extraction) since
-    /// AHardwareBuffer → Vulkan → wgpu integration is not yet complete.
-    pub fn cpu_fallback_count(&self) -> u64 {
-        self.cpu_fallback_count.load(Ordering::Relaxed)
-    }
-
-    /// Returns true if AHardwareBuffer zero-copy is available.
-    ///
-    /// Requirements:
-    /// - Android API 29+ (Android 10)
-    /// - `zero-copy` and `android-zero-copy` features enabled
-    /// - ExoPlayerBridge Java side configured to expose AHardwareBuffer
-    ///
-    /// Returns the cached availability status set during initialization.
-    /// When all requirements are met, this returns true and zero-copy
-    /// frame submission via [`submit_hardware_buffer_frame`] is available.
+    /// Returns true if AHardwareBuffer zero-copy is available (Android API 29+).
     pub fn is_ahardwarebuffer_available(&self) -> bool {
         self.ahardwarebuffer_available
-    }
-
-    /// Attempts to extract an AHardwareBuffer from ExoPlayer for zero-copy rendering.
-    ///
-    /// # Current Status
-    ///
-    /// **Rust-side infrastructure: READY** - This method is a stub awaiting Java/Kotlin
-    /// implementation. The AndroidGpuSurface type and Vulkan import path are complete.
-    ///
-    /// **Blocked on Java/Kotlin side** - The ExoPlayerBridge class must expose AHardwareBuffer
-    /// before this method can be activated. See `zero-copy-android.md` and tracking issue
-    /// lumina-video-5hd for the full implementation plan.
-    ///
-    /// # Returns
-    /// - `Some(AndroidGpuSurface)` if AHardwareBuffer was successfully obtained
-    /// - `None` if zero-copy is not available (falls back to CPU extraction)
-    ///
-    /// # Java Side Requirements
-    ///
-    /// For this to work, the Java/Kotlin ExoPlayerBridge needs to:
-    /// 1. Configure MediaCodec to output to an AImageReader surface
-    /// 2. Create AImageReader with flags: `AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE`
-    /// 3. Provide a JNI method `getHardwareBuffer()` that returns the AHardwareBuffer pointer
-    ///
-    /// Example Java implementation needed in ExoPlayerBridge.kt:
-    /// ```java
-    /// // In ExoPlayerBridge.kt
-    /// private var imageReader: ImageReader? = null
-    ///
-    /// fun setupImageReader(width: Int, height: Int) {
-    ///     imageReader = ImageReader.newInstance(
-    ///         width, height,
-    ///         ImageFormat.PRIVATE,  // or RGBA_8888
-    ///         3,  // maxImages
-    ///         HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
-    ///     )
-    ///     player.setVideoSurface(imageReader!!.surface)
-    /// }
-    ///
-    /// fun getHardwareBuffer(): Long {
-    ///     val image = imageReader?.acquireLatestImage() ?: return 0
-    ///     val buffer = image.hardwareBuffer ?: return 0
-    ///     // Return the native AHardwareBuffer pointer
-    ///     // Note: Need to use NDK to get the pointer from HardwareBuffer
-    ///     return nativeGetHardwareBufferPointer(buffer)
-    /// }
-    /// ```
-    #[allow(dead_code)]
-    fn try_extract_ahardwarebuffer(&self) -> Option<AndroidGpuSurface> {
-        if !self.ahardwarebuffer_available {
-            return None;
-        }
-
-        // TODO(lumina-video-5hd): Android zero-copy AHardwareBuffer integration
-        //
-        // STATUS: Rust-side infrastructure is READY. The AndroidGpuSurface type and
-        // wgpu-hal Vulkan import path are implemented. Blocked on Java/Kotlin side.
-        //
-        // Required Java/Kotlin work (in ExoPlayerBridge, not in this repo):
-        // 1. Configure ExoPlayer to output to ImageReader with USAGE_GPU_SAMPLED_IMAGE
-        // 2. Implement getHardwareBuffer() JNI method returning native AHardwareBuffer ptr
-        // 3. Use NDK's AHardwareBuffer_fromHardwareBuffer() to get native pointer
-        // 4. Handle AImage lifecycle (release after GPU is done with the buffer)
-        //
-        // Once Java side is ready, uncomment and adapt the JNI call below:
-        //
-        // let vm = get_jvm().ok()?;
-        // let mut env = vm.attach_current_thread().ok()?;
-        //
-        // // Call Java method to get AHardwareBuffer pointer
-        // let result = env.call_method(&self.bridge, "getHardwareBuffer", "()J", &[]).ok()?;
-        // let ahb_ptr = result.j().ok()?;
-        //
-        // if ahb_ptr == 0 {
-        //     return None;
-        // }
-        //
-        // // Get dimensions from shared state
-        // let (width, height) = {
-        //     let state = self.state.lock();
-        //     (state.width, state.height)
-        // };
-        //
-        // // Create an owner to keep the AImage alive
-        // // (In real impl, this would be a wrapper around the AImage)
-        // struct AImageOwner { /* ... */ }
-        // let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(AImageOwner { /* ... */ });
-        //
-        // Some(unsafe {
-        //     AndroidGpuSurface::new(
-        //         ahb_ptr as *mut std::ffi::c_void,
-        //         width,
-        //         height,
-        //         PixelFormat::Rgba, // or Nv12 depending on decoder output
-        //         owner,
-        //     )
-        // })
-
-        None // Not implemented yet
     }
 }
 
 // JNI callback implementations
-// These are called from Java when events occur
-
-#[no_mangle]
-pub extern "C" fn Java_io_lumina_1video_video_ExoPlayerBridge_nativeOnFrameAvailable(
-    _env: JNIEnv,
-    _class: JClass,
-    handle: jlong,
-    width: jint,
-    height: jint,
-    _timestamp_ns: jlong,
-) {
-    if let Some(state) = get_native_state(handle) {
-        let mut state = state.lock();
-        state.width = width as u32;
-        state.height = height as u32;
-        state.frame_available = true;
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn Java_io_lumina_1video_video_ExoPlayerBridge_nativeOnPlaybackStateChanged(
-    _env: JNIEnv,
-    _class: JClass,
-    handle: jlong,
-    state_value: jint,
-) {
-    if let Some(state) = get_native_state(handle) {
-        let mut state = state.lock();
-        state.playback_state = state_value;
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn Java_io_lumina_1video_video_ExoPlayerBridge_nativeOnError(
-    mut env: JNIEnv,
-    _class: JClass,
-    handle: jlong,
-    error_message: jni::objects::JString,
-) {
-    if let Some(state) = get_native_state(handle) {
-        let error: String = env
-            .get_string(&error_message)
-            .map(|s| s.into())
-            .unwrap_or_else(|_| "Unknown error".to_string());
-
-        let mut state = state.lock();
-        state.last_error = Some(error);
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn Java_io_lumina_1video_video_ExoPlayerBridge_nativeOnVideoSizeChanged(
-    _env: JNIEnv,
-    _class: JClass,
-    handle: jlong,
-    width: jint,
-    height: jint,
-) {
-    tracing::info!(
-        "nativeOnVideoSizeChanged: handle={}, {}x{}",
-        handle,
-        width,
-        height
-    );
-    if let Some(state) = get_native_state(handle) {
-        let mut state = state.lock();
-        state.width = width as u32;
-        state.height = height as u32;
-        tracing::info!("Video size updated in SharedState: {}x{}", width, height);
-    } else {
-        tracing::warn!("nativeOnVideoSizeChanged: handle {} not found!", handle);
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn Java_io_lumina_1video_video_ExoPlayerBridge_nativeOnDurationChanged(
-    _env: JNIEnv,
-    _class: JClass,
-    handle: jlong,
-    duration_ms: jlong,
-) {
-    tracing::info!(
-        "nativeOnDurationChanged: handle={}, duration_ms={}",
-        handle,
-        duration_ms
-    );
-    if let Some(state) = get_native_state(handle) {
-        let mut state = state.lock();
-        state.duration_ms = duration_ms;
-        tracing::info!("Duration updated in SharedState: {} ms", duration_ms);
-    } else {
-        tracing::warn!("nativeOnDurationChanged: handle {} not found!", handle);
-    }
-}
+// Called from com.luminavideo.bridge.ExoPlayerBridge
 
 // ============================================================================
 // Android Zero-Copy Stats
@@ -1395,6 +979,28 @@ pub fn try_receive_hardware_buffer() -> Option<AndroidVideoFrame> {
     try_receive_hardware_buffer_for_player(0)
 }
 
+/// Returns true if a HardwareBuffer frame is pending for the given player.
+/// Non-consuming peek used by wait_for_frame to avoid 100ms timeout spin.
+pub fn has_pending_hardware_buffer(player_id: u64) -> bool {
+    if player_id == 0 {
+        HARDWARE_BUFFER_RECEIVER
+            .get()
+            .map(|r| !r.is_empty())
+            .unwrap_or(false)
+    } else {
+        PLAYER_QUEUES
+            .get()
+            .map(|queues| {
+                queues
+                    .read()
+                    .get(&player_id)
+                    .map(|q| !q.is_empty())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+}
+
 /// Releases a player's frame queue, freeing any pending frames.
 ///
 /// Call this when an ExoPlayerBridge is released to prevent memory leaks
@@ -1424,13 +1030,12 @@ pub fn release_player_queue(player_id: u64) {
 
 /// JNI entry point for generating a unique player ID.
 ///
-/// Called by ExoPlayerBridge constructor to get a unique ID for multi-player isolation.
-/// Each ExoPlayerBridge instance should call this once and use the returned ID
-/// for all frame submissions.
+/// Called by ExoPlayerBridge.initializeWithPlayer() to get a per-player ID.
+/// IDs start from 1; 0 is reserved for legacy shared queue fallback.
 #[no_mangle]
 pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeGeneratePlayerId(
     _env: JNIEnv,
-    _class: JClass,
+    _this: JObject,
 ) -> jlong {
     generate_player_id() as jlong
 }
@@ -1447,7 +1052,7 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeGeneratePlay
 #[no_mangle]
 pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeReleasePlayer(
     _env: JNIEnv,
-    _class: JClass,
+    _this: JObject,
     player_id: jlong,
 ) {
     release_player_queue(player_id as u64);
@@ -1493,6 +1098,71 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeOnVideoSizeC
     }
 }
 
+/// JNI entry point for playback state change notification.
+///
+/// Called by ExoPlayerBridge when ExoPlayer's playback state changes.
+/// Maps to ExoPlayer's Player.STATE_* constants (1=IDLE, 2=BUFFERING, 3=READY, 4=ENDED).
+#[no_mangle]
+pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeOnPlaybackStateChanged(
+    _env: JNIEnv,
+    _this: JObject,
+    native_handle: jlong,
+    state_value: jint,
+) {
+    tracing::debug!(
+        "nativeOnPlaybackStateChanged: handle={}, state={}",
+        native_handle,
+        state_value
+    );
+    if let Some(state) = get_native_state(native_handle) {
+        let mut state = state.lock();
+        state.playback_state = state_value;
+    }
+}
+
+/// JNI entry point for ExoPlayer error notification.
+///
+/// Called by ExoPlayerBridge when ExoPlayer encounters a playback error.
+#[no_mangle]
+pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeOnError(
+    mut env: JNIEnv,
+    _this: JObject,
+    native_handle: jlong,
+    error_message: jni::objects::JString,
+) {
+    let error: String = env
+        .get_string(&error_message)
+        .map(|s| s.into())
+        .unwrap_or_else(|_| "Unknown error".to_string());
+
+    tracing::error!("nativeOnError: handle={}, error={}", native_handle, error);
+    if let Some(state) = get_native_state(native_handle) {
+        let mut state = state.lock();
+        state.last_error = Some(error);
+    }
+}
+
+/// JNI entry point for duration change notification.
+///
+/// Called by ExoPlayerBridge when the video duration becomes known.
+#[no_mangle]
+pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeOnDurationChanged(
+    _env: JNIEnv,
+    _this: JObject,
+    native_handle: jlong,
+    duration_ms: jlong,
+) {
+    tracing::info!(
+        "nativeOnDurationChanged: handle={}, duration_ms={}",
+        native_handle,
+        duration_ms
+    );
+    if let Some(state) = get_native_state(native_handle) {
+        let mut state = state.lock();
+        state.duration_ms = duration_ms;
+    }
+}
+
 /// JNI entry point for HardwareBuffer submission from Kotlin.
 ///
 /// Called by ExoPlayerBridge.nativeSubmitHardwareBuffer().
@@ -1508,7 +1178,7 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeOnVideoSizeC
 #[no_mangle]
 pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwareBuffer(
     env: JNIEnv,
-    _class: JClass,
+    _this: JObject,
     buffer: JObject,
     timestamp_ns: jlong,
     width: jint,
