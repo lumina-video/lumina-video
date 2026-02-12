@@ -3,37 +3,25 @@
 //! This module provides video decoding on Android using ExoPlayer,
 //! which automatically handles hardware acceleration via MediaCodec.
 //!
-//! # Current Implementation
+//! # Self-Contained API
 //!
-//! With the `zero-copy` feature enabled and `ExoPlayerBridge` attached:
+//! Call `LuminaVideo.init(activity)` once in your Activity's `onCreate()`, then
+//! `VideoPlayer::with_wgpu(url)` works self-contained — no Kotlin ExoPlayer setup needed.
+//!
+//! `AndroidVideoDecoder::new()` calls `LuminaVideo.createPlayer(nativeHandle)` via JNI,
+//! which creates ExoPlayer on a dedicated HandlerThread with a Looper.
+//!
+//! # Zero-Copy GPU Rendering
+//!
+//! ```text
+//! LuminaVideo.createPlayer() → ExoPlayer → ImageReader → HardwareBuffer → JNI → Vulkan Import
+//! ```
+//!
+//! With the `zero-copy` feature enabled:
 //! - YUV HardwareBuffers are imported directly into Vulkan via `VulkanYuvPipeline`
 //! - GPU-side YUV→RGB conversion eliminates CPU copies
 //!
 //! Without zero-copy or when import fails, frames use CPU fallback (ByteBuffer extraction).
-//!
-//! # Zero-Copy GPU Rendering
-//!
-//! Zero-copy rendering is available via the Kotlin `ExoPlayerBridge` class.
-//!
-//! ## Architecture
-//!
-//! ```text
-//! ExoPlayer → ImageReader → HardwareBuffer → JNI → Rust Queue → Vulkan Import
-//! ```
-//!
-//! ## Usage
-//!
-//! 1. Add the `lumina-video-bridge` Android library to your app
-//! 2. Create an `ExoPlayerBridge` and attach it to your player:
-//!    ```kotlin
-//!    val bridge = ExoPlayerBridge()
-//!    bridge.attachToPlayer(exoPlayer)
-//!    ```
-//! 3. The bridge automatically:
-//!    - Waits for video dimensions (onVideoSizeChanged)
-//!    - Creates ImageReader with GPU_SAMPLED_IMAGE usage
-//!    - Extracts HardwareBuffer from each decoded frame
-//!    - Submits to Rust via `nativeSubmitHardwareBuffer()`
 //!
 //! ## Requirements
 //!
@@ -43,6 +31,7 @@
 //!
 //! ## Implementation Files
 //!
+//! - `android/lumina-video-bridge/LuminaVideo.kt` - Static init + createPlayer()
 //! - `android/lumina-video-bridge/ExoPlayerBridge.kt` - Kotlin bridge
 //! - `android_video.rs` - JNI entry points and frame queue
 //! - `zero_copy.rs` - Vulkan AHardwareBuffer import
@@ -330,8 +319,11 @@ impl AndroidVideoDecoder {
             e
         };
 
-        // Get the app's class loader from the context (needed for native threads)
-        // Native threads don't have access to app classes via env.find_class()
+        // Use LuminaVideo.createPlayer() for self-contained ExoPlayer creation.
+        // This creates a dedicated HandlerThread, builds ExoPlayer on it, and sets up
+        // ImageReader — all blocking until ready via CountDownLatch.
+
+        // Get the app's class loader (native threads can't use find_class for app classes)
         let class_loader = env
             .call_method(&context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
             .map_err(|e| {
@@ -348,9 +340,9 @@ impl AndroidVideoDecoder {
                 )))
             })?;
 
-        // Load ExoPlayerBridge class using the app's class loader
+        // Load LuminaVideo class via app classloader
         let class_name = env
-            .new_string("com.luminavideo.bridge.ExoPlayerBridge")
+            .new_string("com.luminavideo.bridge.LuminaVideo")
             .map_err(|e| {
                 release_on_error(VideoError::DecoderInit(format!(
                     "Failed to create class name string: {}",
@@ -358,7 +350,7 @@ impl AndroidVideoDecoder {
                 )))
             })?;
 
-        let bridge_class = env
+        let lumina_class = env
             .call_method(
                 &class_loader,
                 "loadClass",
@@ -367,49 +359,53 @@ impl AndroidVideoDecoder {
             )
             .map_err(|e| {
                 release_on_error(VideoError::DecoderInit(format!(
-                    "Failed to load ExoPlayerBridge class: {}",
+                    "Failed to load LuminaVideo class: {}",
                     e
                 )))
             })?
             .l()
             .map_err(|e| {
                 release_on_error(VideoError::DecoderInit(format!(
-                    "Failed to get ExoPlayerBridge class: {}",
+                    "Failed to get LuminaVideo class: {}",
                     e
                 )))
             })?;
 
-        let bridge_class = JClass::from(bridge_class);
-
-        let bridge = env
-            .new_object(
-                bridge_class,
-                "(Landroid/content/Context;J)V",
-                &[JValue::Object(&context), JValue::Long(native_handle)],
+        // Call LuminaVideo.createPlayer(nativeHandle) — blocks until ExoPlayer is ready
+        let bridge_obj = env
+            .call_static_method(
+                JClass::from(lumina_class),
+                "createPlayer",
+                "(J)Lcom/luminavideo/bridge/ExoPlayerBridge;",
+                &[JValue::Long(native_handle)],
             )
             .map_err(|e| {
                 release_on_error(VideoError::DecoderInit(format!(
-                    "Failed to create ExoPlayerBridge: {}",
+                    "LuminaVideo.createPlayer() failed: {}",
+                    e
+                )))
+            })?
+            .l()
+            .map_err(|e| {
+                release_on_error(VideoError::DecoderInit(format!(
+                    "Failed to get bridge object: {}",
                     e
                 )))
             })?;
 
+        if bridge_obj.is_null() {
+            return Err(release_on_error(VideoError::DecoderInit(
+                "LuminaVideo not initialized. Call LuminaVideo.init(activity) in your Activity.onCreate().".into()
+            )));
+        }
+
         // Create global reference
-        let bridge_ref = env.new_global_ref(bridge).map_err(|e| {
+        let bridge_ref = env.new_global_ref(bridge_obj).map_err(|e| {
             release_on_error(VideoError::DecoderInit(format!(
                 "Failed to create global ref: {}",
                 e
             )))
         })?;
-
-        // Initialize the bridge (but don't start playback yet)
-        env.call_method(&bridge_ref, "initialize", "()V", &[])
-            .map_err(|e| {
-                release_on_error(VideoError::DecoderInit(format!(
-                    "Failed to initialize bridge: {}",
-                    e
-                )))
-            })?;
 
         // Don't call play() here - playback will start when decode_next() is first called
         // This prevents auto-play on app start

@@ -198,9 +198,8 @@ struct HalViabilityResult {
 }
 
 /// Sample video URL for testing.
-/// NOTE: Actual playback is controlled by MainActivity.kt's SAMPLE_VIDEO_URL.
-/// The Rust VideoPlayer creates an AndroidVideoDecoder but its play(url) is a no-op
-/// because no ExoPlayer is attached from the Rust side.
+/// VideoPlayer::with_wgpu() creates an AndroidVideoDecoder which calls
+/// LuminaVideo.createPlayer() to get a self-contained ExoPlayer instance.
 const SAMPLE_VIDEO_URL: &str =
     "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4";
 
