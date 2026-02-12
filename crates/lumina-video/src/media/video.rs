@@ -1140,6 +1140,14 @@ pub trait VideoDecoderBackend: Send {
         None
     }
 
+    /// Returns the Android player ID for frame queue routing.
+    ///
+    /// Non-zero IDs route frames to per-player queues for multi-player isolation.
+    /// Returns 0 (legacy shared queue) by default. Only `AndroidVideoDecoder` overrides this.
+    fn android_player_id(&self) -> u64 {
+        0
+    }
+
     /// Returns the video dimensions.
     fn dimensions(&self) -> (u32, u32) {
         let meta = self.metadata();
@@ -1263,6 +1271,10 @@ impl VideoDecoderBackend for Box<dyn VideoDecoderBackend + Send> {
 
     fn current_time(&self) -> Option<Duration> {
         (**self).current_time()
+    }
+
+    fn android_player_id(&self) -> u64 {
+        (**self).android_player_id()
     }
 }
 

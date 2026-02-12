@@ -1182,22 +1182,13 @@ mod native_render_callback {
                 //
                 // ## Known Limitation: ImageFormat.PRIVATE yields YUV, not RGBA
                 //
-                // ExoPlayer's ImageReader with ImageFormat.PRIVATE typically provides YUV data
-                // (usually NV12), NOT RGBA. The HardwareBuffer format will be something like
-                // AHARDWAREBUFFER_FORMAT_Y8Cb8Cr8_420 rather than R8G8B8A8_UNORM.
+                // Android HardwareBuffer zero-copy import.
                 //
-                // The format check below correctly rejects non-RGBA buffers, but this means
-                // zero-copy will almost always fall back to the CPU path on Android. This is
-                // expected behavior given current implementation constraints.
-                //
-                // Future work: Implement YUV multi-plane import using VkSamplerYcbcrConversion
-                // to handle NV12/YUV420p HardwareBuffers directly on the GPU. This would require:
-                // 1. Detecting YUV format from HardwareBuffer
-                // 2. Creating Vulkan YCbCr sampler with appropriate format
-                // 3. Importing each plane as a separate texture
-                // 4. Using the existing YUV shader pipeline for conversion
-                //
-                // See: https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VkSamplerYcbcrConversion.html
+                // ExoPlayer produces YUV (NV12/Y8Cb8Cr8_420) via ImageFormat.PRIVATE.
+                // Both RGBA and YUV paths are handled:
+                // - RGBA: direct single-plane Vulkan import
+                // - YUV: true zero-copy via VkSamplerYcbcrConversion, with CPU-assisted
+                //   lockPlanes fallback when Vulkan YUV import fails
                 //
                 // NOTE: Android timing limitation (lumina-video-m07)
                 //
@@ -1221,9 +1212,11 @@ mod native_render_callback {
                     )
                 {
                     use crate::media::android_video::{
-                        is_yuv_hardware_buffer_format, is_yv12_format,
+                        is_yuv_candidate_hardware_buffer_format, is_yv12_format,
+                        record_cpu_assisted, record_import_failed, record_true_zero_copy,
                         AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
                     };
+                    let pid = self.player_id;
 
                     tracing::info!(
                         "Received HardwareBuffer frame: {}x{} format=0x{:x}",
@@ -1234,6 +1227,7 @@ mod native_render_callback {
 
                     let mut texture_guard = self.texture.lock();
                     let mut imported_ok = false;
+                    let mut fence_dropped = false;
 
                     // Capture dimensions before frame is moved into _android_owner
                     let (frame_width, frame_height) = (frame.width, frame.height);
@@ -1265,6 +1259,7 @@ mod native_render_callback {
                                 tracing::debug!(
                                     "RGBA fence not ready, dropping frame to avoid blocking"
                                 );
+                                fence_dropped = true;
                                 false
                             } else {
                                 true
@@ -1298,6 +1293,7 @@ mod native_render_callback {
                                     video_texture._android_owner = Some(frame);
                                     *texture_guard = Some(video_texture);
                                     imported_ok = true;
+                                    record_true_zero_copy(pid);
                                     tracing::trace!(
                                         "Zero-copy: imported RGBA HardwareBuffer {}x{}",
                                         frame_width,
@@ -1309,7 +1305,7 @@ mod native_render_callback {
                                 }
                             }
                         }
-                    } else if is_yuv_hardware_buffer_format(frame.format) {
+                    } else if is_yuv_candidate_hardware_buffer_format(frame.format) {
                         // YUV path - try true zero-copy first, fall back to CPU-assisted path
                         //
                         // True zero-copy: Uses raw Vulkan to import YUV planes and do GPU-side
@@ -1340,6 +1336,7 @@ mod native_render_callback {
                                 video_texture._android_owner = Some(frame);
                                 *texture_guard = Some(video_texture);
                                 imported_ok = true;
+                                record_true_zero_copy(pid);
                                 tracing::trace!(
                                 "True zero-copy: imported YUV HardwareBuffer via Vulkan YUV pipeline {}x{}",
                                 frame_width,
@@ -1385,6 +1382,7 @@ mod native_render_callback {
                                                 video_texture._android_owner = Some(frame);
                                                 *texture_guard = Some(video_texture);
                                                 imported_ok = true;
+                                                record_cpu_assisted(pid);
                                                 tracing::info!(
                                                 "CPU-assisted: imported YUV HardwareBuffer as multi-plane {}x{} format={:?}",
                                                 frame_width,
@@ -1426,7 +1424,7 @@ mod native_render_callback {
                     }
 
                     if imported_ok {
-                        tracing::info!(
+                        tracing::trace!(
                             "Android frame import successful, texture ready for rendering"
                         );
                         let transform = [1.0f32, 1.0f32, 0.0f32, 0.0f32];
@@ -1436,7 +1434,8 @@ mod native_render_callback {
                             bytemuck::bytes_of(&transform),
                         );
                         return Vec::new();
-                    } else {
+                    } else if !fence_dropped {
+                        record_import_failed(pid);
                         tracing::warn!("Android frame import failed, frame will be dropped");
                     }
                     // frame is dropped here if not imported, calling AHardwareBuffer_release

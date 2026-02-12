@@ -85,36 +85,71 @@ adb logcat -s "lumina-video:*" "LuminaVideoDemo:*" "ExoPlayerBridge:*"
 | `unable to find library -laaudio` | API level too low | Pass `-P 26` (or higher) to `cargo ndk` |
 | `sdk.dir` not set / wrong path | `local.properties` misconfigured | Run `echo "sdk.dir=$ANDROID_HOME" > android/local.properties` |
 
+## App Integration
+
+To integrate lumina-video into your own Android app, call `LuminaVideo.init()` once
+in your Activity's `onCreate()`, before any native startup:
+
+```kotlin
+import com.luminavideo.bridge.LuminaVideo
+
+class MyActivity : GameActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        LuminaVideo.init(this)  // Must be BEFORE super.onCreate()
+        super.onCreate(savedInstanceState)
+    }
+}
+```
+
+From Rust, `VideoPlayer::with_wgpu(url, render_state)` works automatically -- the bridge
+creates ExoPlayer, extracts HardwareBuffers, and submits them to Vulkan with no additional setup.
+
+See [`android/README.md`](../android/README.md) for the full API reference, multi-player support,
+YUV/RGBA import paths, and troubleshooting.
+
 ## ExoPlayer Bridge Architecture
 
-The Kotlin bridge connects ExoPlayer to the Rust rendering pipeline:
-
 ```text
-ExoPlayer → ImageReader → HardwareBuffer → JNI → Rust Queue → Vulkan
+LuminaVideo.init(activity)
+    -> Rust: AndroidVideoDecoder::new()
+        -> JNI: LuminaVideo.createPlayer(nativeHandle)
+            -> ExoPlayer [on dedicated HandlerThread]
+                -> ImageReader (PRIVATE) -> HardwareBuffer
+                    -> nativeSubmitHardwareBuffer(buffer, ts, w, h, playerId, fenceFd)
+                        -> Per-player Rust queue (PlayerState) -> Vulkan import -> wgpu -> egui
 ```
 
 Key requirements:
 - API 26+ (HardwareBuffer support)
-- `VK_ANDROID_external_memory_android_hardware_buffer` extension
+- `VK_ANDROID_external_memory_android_hardware_buffer` Vulkan extension
 - ImageReader configured with `ImageFormat.PRIVATE` and GPU usage flags
 
-See `android/README.md` for detailed integration instructions.
+Zero-copy is always-on -- no feature flags needed. The Vulkan import path handles:
+- **RGBA buffers**: direct single-plane import
+- **YUV buffers**: `VkSamplerYcbcrConversion` (GPU-side YUV-to-RGBA, no CPU copies)
+- **Vendor formats** (UBWC, SBWC, AFBC): treated as YUV candidates for external-format import
+- **Fallback**: CPU-assisted `lockPlanes` + memcpy when Vulkan YUV is unavailable
 
 ## Testing Checklist
 
 | Component | Validation |
 |-----------|------------|
-| ExoPlayerBridge.kt | Real device with ExoPlayer integration |
-| JNI entry point | Frame submission from Kotlin to Rust |
-| HardwareBuffer queue | Throughput at 30/60fps |
+| LuminaVideo.init() + createPlayer() | ExoPlayer creation on HandlerThread |
+| JNI frame submission | nativeSubmitHardwareBuffer with per-player routing |
+| Per-player queues | Multi-player isolation, no frame stealing |
 | AHardwareBuffer → Vulkan (RGBA) | Various device GPU drivers |
-| AHardwareBuffer YUV extraction | NV12 buffers from MediaCodec |
+| AHardwareBuffer → VkSamplerYcbcrConversion (YUV) | NV12/vendor formats from MediaCodec |
+| CPU-assisted fallback | lockPlanes path when YUV import unavailable |
+| Zero-copy debug panel | Demo app shows per-frame import results in real-time |
 | Reference counting | Memory leak testing under load |
+| Lifecycle cleanup | Activity destroy releases all bridges and queues |
 
 ## Test Plan
 
-1. Build Android app with ExoPlayer and lumina-video-bridge dependency
-2. Play various video formats (H.264, HEVC, VP9)
-3. Verify frames render correctly (no black frames, correct colors)
-4. Monitor memory usage during extended playback
-5. Test device rotation and lifecycle events
+1. Build Android app with lumina-video-bridge dependency
+2. Call `LuminaVideo.init(this)` in `onCreate()` before `super.onCreate()`
+3. Play various video formats (H.264, HEVC, VP9)
+4. Check the zero-copy debug panel for import path (Zero-Copy / CPU Fallback / Failed)
+5. Verify frames render correctly (no black frames, correct colors)
+6. Monitor memory usage during extended playback
+7. Test device rotation and lifecycle events (bridges should auto-release)

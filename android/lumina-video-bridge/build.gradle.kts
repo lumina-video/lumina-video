@@ -49,6 +49,9 @@ dependencies {
     // Core Android
     implementation("androidx.core:core-ktx:1.12.0")
 
+    // Lifecycle (for LuminaVideo lifecycle observer)
+    implementation("androidx.lifecycle:lifecycle-common:2.7.0")
+
     // Testing
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
