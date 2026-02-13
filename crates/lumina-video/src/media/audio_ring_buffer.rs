@@ -122,48 +122,73 @@ impl RingBufferProducer {
     ///
     /// On overflow (buffer full), advances the read pointer to drop oldest samples
     /// (live-edge policy — stay near real-time, never block).
+    ///
+    /// Uses bulk copy with a single atomic position update (not per-sample atomics).
     pub fn write(&self, samples: &[f32]) {
-        let s = &self.shared;
-        let cap = s.capacity;
-
-        for &sample in samples {
-            let wp = s.write_pos.load(Ordering::Relaxed);
-            let rp = s.read_pos.load(Ordering::Relaxed);
-
-            // Check if buffer is full
-            let next_wp = wp.wrapping_add(1);
-            if next_wp.wrapping_sub(rp) > cap {
-                // Overflow: advance read pointer (drop oldest sample)
-                s.read_pos.store(rp.wrapping_add(1), Ordering::Release);
-                s.overflow_count.fetch_add(1, Ordering::Relaxed);
-            }
-
-            // Write sample
-            // SAFETY: We use modulo to index within bounds. The buffer is fixed-size
-            // and we're the only writer (SPSC guarantee).
-            let idx = wp % cap;
-            // Safety: single producer, so no concurrent writes to the same index.
-            // The consumer only reads indices behind read_pos, which we've already passed.
-            unsafe {
-                let ptr = s.buffer.as_ptr() as *mut f32;
-                ptr.add(idx).write(sample);
-            }
-            s.write_pos.store(next_wp, Ordering::Release);
+        if samples.is_empty() {
+            return;
         }
 
+        let s = &self.shared;
+        let cap = s.capacity;
+        let len = samples.len();
+
+        // Snapshot positions once (we are the only writer)
+        let wp = s.write_pos.load(Ordering::Relaxed);
+        let rp = s.read_pos.load(Ordering::Relaxed);
+
+        let fill = wp.wrapping_sub(rp);
+        let available = cap - fill;
+
+        // If not enough space, advance read pointer to make room (drop oldest)
+        if len > available {
+            let overflow = len - available;
+            s.read_pos
+                .store(rp.wrapping_add(overflow), Ordering::Release);
+            s.overflow_count
+                .fetch_add(overflow as u64, Ordering::Relaxed);
+        }
+
+        // Bulk copy samples into the circular buffer
+        // SAFETY: single producer (SPSC), consumer only reads behind read_pos.
+        let ptr = s.buffer.as_ptr() as *mut f32;
+        let start_idx = wp % cap;
+        let first_chunk = (cap - start_idx).min(len);
+
+        // Copy first contiguous segment (up to end of buffer)
+        unsafe {
+            std::ptr::copy_nonoverlapping(samples.as_ptr(), ptr.add(start_idx), first_chunk);
+        }
+
+        // Copy wraparound segment (from start of buffer) if needed
+        if first_chunk < len {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    samples.as_ptr().add(first_chunk),
+                    ptr,
+                    len - first_chunk,
+                );
+            }
+        }
+
+        // Single atomic update — makes all written samples visible to consumer
+        s.write_pos
+            .store(wp.wrapping_add(len), Ordering::Release);
+
         s.total_written
-            .fetch_add(samples.len() as u64, Ordering::Relaxed);
+            .fetch_add(len as u64, Ordering::Relaxed);
 
         // Check prefill threshold
         if !s.prefilled.load(Ordering::Relaxed) {
-            let wp = s.write_pos.load(Ordering::Relaxed);
-            let rp = s.read_pos.load(Ordering::Relaxed);
-            let fill = wp.wrapping_sub(rp);
-            if fill >= s.prefill_threshold {
+            let new_fill = s
+                .write_pos
+                .load(Ordering::Relaxed)
+                .wrapping_sub(s.read_pos.load(Ordering::Relaxed));
+            if new_fill >= s.prefill_threshold {
                 s.prefilled.store(true, Ordering::Release);
                 tracing::debug!(
                     "Ring buffer prefilled: {} samples (threshold: {})",
-                    fill,
+                    new_fill,
                     s.prefill_threshold
                 );
             }
@@ -197,14 +222,17 @@ impl Drop for RingBufferProducer {
 impl RingBufferConsumer {
     /// Reads a single sample from the ring buffer.
     ///
-    /// Returns `Some(sample)` if data is available, or `None` if in stall mode
-    /// (prefill not yet reached) or buffer is empty.
+    /// Returns `Some(sample)` if data is available, or `None` only during
+    /// initial prefill (before buffer first reaches threshold).
+    ///
+    /// After initial prefill, underruns return `None` but do NOT re-enter
+    /// stall mode — the caller (`RingBufferSource`) returns silence. This
+    /// avoids 240ms rebuffering pauses on brief transport gaps.
     pub fn read_sample(&self) -> Option<f32> {
         let s = &self.shared;
 
-        // Stall mode: return None until prefill threshold is reached
+        // Initial stall: return None until prefill threshold is reached for the first time
         if !s.prefilled.load(Ordering::Acquire) {
-            s.stall_count.fetch_add(1, Ordering::Relaxed);
             return None;
         }
 
@@ -212,12 +240,9 @@ impl RingBufferConsumer {
         let wp = s.write_pos.load(Ordering::Acquire);
 
         if rp == wp {
-            // Buffer empty — enter stall mode again if producer is alive
-            if s.alive.load(Ordering::Relaxed) {
-                s.prefilled.store(false, Ordering::Release);
-                s.stall_count.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!("Ring buffer underrun, entering stall mode");
-            }
+            // Buffer empty — just return None, caller plays silence.
+            // Do NOT re-enter stall mode; live streams should play through gaps.
+            s.stall_count.fetch_add(1, Ordering::Relaxed);
             return None;
         }
 
@@ -268,7 +293,7 @@ mod tests {
         };
         let (producer, consumer) = audio_ring_buffer(config);
 
-        // Write some samples
+        // Write some samples (>= prefill threshold of 4)
         producer.write(&[1.0, 2.0, 3.0, 4.0, 5.0]);
 
         // Read them back
@@ -277,8 +302,13 @@ mod tests {
         assert_eq!(consumer.read_sample(), Some(3.0));
         assert_eq!(consumer.read_sample(), Some(4.0));
         assert_eq!(consumer.read_sample(), Some(5.0));
-        // Empty
+        // Empty — returns None but does NOT re-enter stall mode
         assert_eq!(consumer.read_sample(), None);
+
+        // Writing more should be immediately readable (no re-prefill needed)
+        producer.write(&[6.0, 7.0]);
+        assert_eq!(consumer.read_sample(), Some(6.0));
+        assert_eq!(consumer.read_sample(), Some(7.0));
     }
 
     #[test]
@@ -334,13 +364,13 @@ mod tests {
     #[test]
     fn test_wraparound() {
         let config = RingBufferConfig {
-            capacity_samples: 8,
-            prefill_samples: 2,
+            capacity_samples: 1024,
+            prefill_samples: 4,
         };
         let (producer, consumer) = audio_ring_buffer(config);
 
-        // Write and read multiple rounds to force wraparound
-        for round in 0..10 {
+        // Write and read many rounds to force multiple wraparounds of the 1024-sample buffer
+        for round in 0..300 {
             let base = round as f32 * 4.0;
             producer.write(&[base, base + 1.0, base + 2.0, base + 3.0]);
             assert_eq!(consumer.read_sample(), Some(base));
