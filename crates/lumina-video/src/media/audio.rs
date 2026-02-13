@@ -7,7 +7,7 @@
 //!
 //! The audio system consists of:
 //! - `AudioDecoder`: Extracts audio frames from video stream via FFmpeg
-//! - `AudioPlayer`: Handles audio output via rodio
+//! - `AudioPlayer`: Handles audio output via cpal with a lock-free ring buffer
 //! - `AudioSync`: Synchronizes audio playback with video presentation
 //!
 //! Audio serves as the master clock for A/V sync - video frames are
@@ -150,7 +150,7 @@ impl AudioHandle {
     /// Returns the current playback position.
     ///
     /// For native platforms (macOS AVPlayer, GStreamer), uses directly set position.
-    /// For FFmpeg+rodio path, computes as: base_pts + samples_played_duration.
+    /// For FFmpeg+cpal path, computes as: base_pts + samples_played_duration.
     /// Returns Duration::ZERO if playback epoch hasn't started (video not ready)
     /// or if base PTS hasn't been set yet.
     pub fn position(&self) -> Duration {
@@ -356,6 +356,11 @@ impl AudioHandle {
         self.inner.channels.store(channels, Ordering::Relaxed);
     }
 
+    /// Returns the current audio channel count used for sample accounting.
+    pub fn channels(&self) -> u32 {
+        self.inner.channels.load(Ordering::Relaxed)
+    }
+
     /// Increments the samples-played counter (called by audio callback).
     /// This should be called for each sample consumed by the audio device.
     #[inline]
@@ -468,190 +473,162 @@ impl std::fmt::Debug for AudioSamples {
 }
 
 // ============================================================================
-// Rodio-based audio player (when ffmpeg feature is enabled)
+// cpal-based audio player (macOS, Linux, Android)
 // ============================================================================
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
-mod rodio_impl {
+mod cpal_impl {
     use super::*;
-    use parking_lot::Mutex;
-    use rodio::Source;
-    use rodio::{buffer::SamplesBuffer, OutputStream, OutputStreamBuilder, Sink};
-
-    // ========================================================================
-    // Sample-counting source wrapper for accurate position tracking
-    // ========================================================================
+    use crate::media::audio_ring_buffer::{
+        audio_ring_buffer, ReadSample, RingBufferConfig, RingBufferConsumer, RingBufferProducer,
+    };
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::{FromSample, SampleFormat, SizedSample, I24};
 
     /// Number of samples to accumulate before flushing to atomic counter.
     /// Batching avoids per-sample atomic ops which can cause glitches at 48-96kHz.
     const FLUSH_SAMPLES: u64 = 256;
 
-    /// A Source wrapper that counts samples as they're consumed by the audio device.
-    /// This provides accurate playback position tracking by counting actual samples
-    /// that have been sent to the DAC, rather than relying on wall-clock time.
-    ///
-    /// Uses batched counting (flushes every FLUSH_SAMPLES) to avoid per-sample
-    /// atomic operations which can cause audio glitches on the real-time thread.
-    struct SampleCountingSource<S> {
-        inner: S,
-        handle: AudioHandle,
-        /// Pending samples not yet flushed to atomic counter
-        pending: u64,
-    }
-
-    impl<S> SampleCountingSource<S> {
-        fn new(source: S, handle: AudioHandle) -> Self {
-            Self {
-                inner: source,
-                handle,
-                pending: 0,
-            }
-        }
-
-        /// Flush pending samples to the atomic counter if threshold reached.
-        #[inline]
-        fn flush_if_needed(&mut self) {
-            if self.pending >= FLUSH_SAMPLES {
-                let n = self.pending;
-                self.pending = 0;
-                self.handle.add_samples_played(n);
-            }
-        }
-    }
-
-    impl<S: Source<Item = f32>> Iterator for SampleCountingSource<S> {
-        type Item = f32;
-
-        #[inline]
-        fn next(&mut self) -> Option<Self::Item> {
-            let sample = self.inner.next();
-            if sample.is_some() {
-                self.pending += 1;
-                self.flush_if_needed();
-            } else if self.pending != 0 {
-                // Source exhausted - flush remaining samples
-                let n = self.pending;
-                self.pending = 0;
-                self.handle.add_samples_played(n);
-            }
-            sample
-        }
-
-        #[inline]
-        fn size_hint(&self) -> (usize, Option<usize>) {
-            self.inner.size_hint()
-        }
-    }
-
-    impl<S: Source<Item = f32>> Source for SampleCountingSource<S> {
-        #[inline]
-        fn current_span_len(&self) -> Option<usize> {
-            self.inner.current_span_len()
-        }
-
-        #[inline]
-        fn channels(&self) -> u16 {
-            self.inner.channels()
-        }
-
-        #[inline]
-        fn sample_rate(&self) -> u32 {
-            self.inner.sample_rate()
-        }
-
-        #[inline]
-        fn total_duration(&self) -> Option<Duration> {
-            self.inner.total_duration()
-        }
-    }
-
-    impl<S> Drop for SampleCountingSource<S> {
-        fn drop(&mut self) {
-            // Flush any remaining samples on drop
-            if self.pending != 0 {
-                self.handle.add_samples_played(self.pending);
-                self.pending = 0;
-            }
-        }
-    }
-
-    // ========================================================================
-    // AudioPlayer implementation
-    // ========================================================================
-
-    /// Rodio-based audio player.
+    /// cpal-based audio player backed by a ring buffer.
     pub struct AudioPlayer {
-        /// Audio handle for control
+        /// Shared audio handle for volume/mute/position control.
         handle: AudioHandle,
-        /// Rodio output stream (must be kept alive)
-        _stream: OutputStream,
-        /// Rodio sink for playback control
-        sink: Arc<Mutex<Sink>>,
-        /// Current state
-        state: AudioState,
-        /// Device sample rate
+        /// The cpal output stream (kept alive; audio stops when dropped).
+        _stream: cpal::Stream,
+        /// Device output sample rate in Hz.
         device_sample_rate: u32,
-        /// PTS of first audio sample queued (for position calculation)
-        initial_pts: Option<Duration>,
+        /// Current playback state.
+        state: AudioState,
+        /// Shared flag: true while playback is active (read by cpal callback).
+        playing: Arc<AtomicBool>,
     }
 
     impl AudioPlayer {
-        /// Creates a new audio player.
+        /// Creates a new audio player backed by a ring buffer.
         ///
-        /// If `external_handle` is provided, the player will use it for volume/mute control.
-        /// Otherwise, it creates its own handle.
-        pub fn new_with_handle(
-            _config: AudioConfig,
+        /// `output_sample_rate` overrides the stream sample rate. When `Some(rate)`,
+        /// the cpal stream runs at that rate and the OS audio system (CoreAudio,
+        /// PulseAudio) resamples to the device's native rate transparently. Use this
+        /// for MoQ where decoded audio is at the stream's rate. When `None`, the
+        /// device's default rate is used (appropriate for VOD where FFmpeg already
+        /// resamples to the device rate).
+        ///
+        /// Returns `(AudioPlayer, RingBufferProducer)` — the caller writes decoded PCM
+        /// samples to the producer; the cpal callback reads from the consumer.
+        ///
+        /// The callback is dispatched to the device's native sample format at runtime
+        /// (f32/i16/u16/etc.) based on `default_output_config().sample_format()`.
+        pub fn new_ring_buffer(
+            ring_config: RingBufferConfig,
             external_handle: Option<AudioHandle>,
-        ) -> Result<Self, String> {
-            // Create audio output stream (rodio 0.21 API)
-            // On Linux, set explicit ALSA buffer size to avoid extreme default latency (cpal#446).
-            // macOS CoreAudio (512 frames) and Android Oboe have reasonable defaults.
+            output_sample_rate: Option<u32>,
+        ) -> Result<(Self, RingBufferProducer), String> {
+            let host = cpal::default_host();
+            let device = host
+                .default_output_device()
+                .ok_or_else(|| "No audio output device available".to_string())?;
+
+            let supported_config = device
+                .default_output_config()
+                .map_err(|e| format!("Failed to get default output config: {e}"))?;
+
+            let device_sample_rate = supported_config.sample_rate().0;
+            let sample_format = supported_config.sample_format();
+            let device_channels = supported_config.channels().clamp(1, 2);
+            let mut stream_sample_rate = output_sample_rate.unwrap_or(device_sample_rate);
+
+            if stream_sample_rate != device_sample_rate
+                && !is_sample_rate_supported(
+                    &device,
+                    device_channels,
+                    sample_format,
+                    stream_sample_rate,
+                )
+            {
+                tracing::warn!(
+                    "Requested stream sample rate {}Hz not supported for {:?}/{}ch, falling back to device rate {}Hz",
+                    stream_sample_rate,
+                    sample_format,
+                    device_channels,
+                    device_sample_rate,
+                );
+                stream_sample_rate = device_sample_rate;
+            }
+
+            if device_channels < 2 {
+                tracing::warn!(
+                    "Audio device supports only {} channel(s), stereo will be downmixed",
+                    device_channels
+                );
+            }
+
+            // Build stream config: use device channels (clamped to 1-2).
+            // Sample rate is either the caller's override (MoQ content rate) or device native.
+            // cpal/OS audio handles resampling if stream rate != device native rate.
             #[cfg(target_os = "linux")]
-            let stream = OutputStreamBuilder::from_default_device()
-                .map(|b| b.with_buffer_size(rodio::cpal::BufferSize::Fixed(1024)))
-                .and_then(|b| b.open_stream_or_fallback())
-                .or_else(|e| {
-                    tracing::warn!("Audio: explicit buffer setup failed ({e}), trying default");
-                    OutputStreamBuilder::open_default_stream()
-                })
-                .map_err(|e| format!("Failed to create audio output: {e}"))?;
-
+            let stream_config = cpal::StreamConfig {
+                channels: device_channels,
+                sample_rate: cpal::SampleRate(stream_sample_rate),
+                buffer_size: cpal::BufferSize::Fixed(1024),
+            };
             #[cfg(not(target_os = "linux"))]
-            let stream = OutputStreamBuilder::open_default_stream()
-                .map_err(|e| format!("Failed to create audio output: {e}"))?;
+            let stream_config = cpal::StreamConfig {
+                channels: device_channels,
+                sample_rate: cpal::SampleRate(stream_sample_rate),
+                buffer_size: cpal::BufferSize::Default,
+            };
 
-            // Get the device sample rate from the stream config
-            let device_sample_rate = stream.config().sample_rate();
-
-            tracing::info!("Audio device sample rate: {}Hz", device_sample_rate);
-
-            // Use external handle or create our own
             let handle = external_handle.unwrap_or_default();
             handle.set_available(true);
 
-            // Create sink connected to the stream's mixer (rodio 0.21 API)
-            let sink = Sink::connect_new(stream.mixer());
-            sink.pause(); // Start paused
+            let (producer, consumer) = audio_ring_buffer(ring_config);
 
-            tracing::info!(
-                "Audio player initialized at {}Hz stereo",
-                device_sample_rate
-            );
+            let playing = Arc::new(AtomicBool::new(false));
+            let stream = build_cpal_stream(
+                &device,
+                &stream_config,
+                sample_format,
+                consumer,
+                handle.clone(),
+                playing.clone(),
+            )?;
 
-            Ok(Self {
+            if stream_sample_rate != device_sample_rate {
+                tracing::info!(
+                    "Audio player initialized (cpal, stream={}Hz, device={}Hz, {}ch, OS resampling)",
+                    stream_sample_rate,
+                    device_sample_rate,
+                    device_channels,
+                );
+            } else {
+                tracing::info!(
+                    "Audio player initialized (cpal, {}Hz, {}ch)",
+                    device_sample_rate,
+                    device_channels,
+                );
+            }
+
+            let player = Self {
                 handle,
                 _stream: stream,
-                sink: Arc::new(Mutex::new(sink)),
+                device_sample_rate: stream_sample_rate,
                 state: AudioState::Paused,
-                device_sample_rate,
-                initial_pts: None,
-            })
+                playing,
+            };
+
+            Ok((player, producer))
         }
 
-        /// Creates a new audio player with its own handle.
-        pub fn new(config: AudioConfig) -> Result<Self, String> {
-            Self::new_with_handle(config, None)
+        /// Queries the default output device sample rate without creating a stream.
+        pub fn query_device_sample_rate() -> Result<u32, String> {
+            let host = cpal::default_host();
+            let device = host
+                .default_output_device()
+                .ok_or_else(|| "No audio output device available".to_string())?;
+            let config = device
+                .default_output_config()
+                .map_err(|e| format!("Failed to get default output config: {e}"))?;
+            Ok(config.sample_rate().0)
         }
 
         /// Returns the device sample rate.
@@ -664,289 +641,212 @@ mod rodio_impl {
             self.handle.clone()
         }
 
-        /// Queues audio samples for playback using SamplesBuffer.
-        pub fn queue_samples(&mut self, samples: AudioSamples) {
-            if samples.data.is_empty() {
-                return;
-            }
-
-            // Track initial PTS and set audio format for position calculation
-            if self.initial_pts.is_none() {
-                self.initial_pts = Some(samples.pts);
-                // Set audio format and base PTS for position calculation
-                self.handle
-                    .set_audio_format(samples.sample_rate, samples.channels as u32);
-                self.handle.set_audio_base_pts(samples.pts);
-                tracing::debug!(
-                    "Audio: first samples queued, base_pts={:?}, {} samples, {}Hz {}ch",
-                    samples.pts,
-                    samples.data.len(),
-                    samples.sample_rate,
-                    samples.channels
-                );
-            }
-
-            // Create a SamplesBuffer wrapped with sample counting for accurate position
-            let buffer =
-                SamplesBuffer::new(samples.channels, samples.sample_rate, samples.data.clone());
-            let counting_source = SampleCountingSource::new(buffer, self.handle.clone());
-
-            // Append to sink and update volume dynamically
-            let sink = self.sink.lock();
-            // Apply current volume/mute state to sink (dynamic, affects all queued audio)
-            sink.set_volume(self.handle.effective_volume());
-            sink.append(counting_source);
-            // Position is now computed on-demand in AudioHandle::position()
-        }
-
-        /// Starts audio playback.
-        pub fn play(&mut self) {
-            let sink = self.sink.lock();
-            sink.play();
-            self.state = AudioState::Playing;
-        }
-
-        /// Pauses audio playback.
-        pub fn pause(&mut self) {
-            let sink = self.sink.lock();
-            sink.pause();
-            self.state = AudioState::Paused;
-        }
-
         /// Returns the current state.
         pub fn state(&self) -> AudioState {
             self.state
         }
 
-        /// Clears the audio buffer (for seeking).
-        ///
-        /// Note: After clear(), the sink may be paused. Caller should call play()
-        /// if playback should continue (e.g., during seek).
-        pub fn clear(&mut self) {
-            let sink = self.sink.lock();
-            sink.clear();
-            drop(sink);
-            // Reset all position tracking so next queued samples establish new timeline
-            self.initial_pts = None;
-            self.handle.clear_playback_epoch();
-            self.handle.reset_samples_played();
-            self.handle.clear_audio_base_pts();
+        /// Starts audio playback.
+        pub fn play(&mut self) {
+            self.playing.store(true, Ordering::Release);
+            if let Err(e) = self._stream.play() {
+                tracing::error!("cpal stream play failed: {e}");
+            }
+            self.state = AudioState::Playing;
         }
 
-        /// Creates a new audio player backed by a ring buffer for continuous MoQ playback.
-        ///
-        /// Returns `(AudioPlayer, RingBufferProducer)` — the caller writes decoded PCM
-        /// samples to the producer; the player's single `RingBufferSource` reads from
-        /// the consumer, never exhausting and never triggering rodio Source transitions.
-        #[cfg(feature = "moq")]
-        pub fn new_ring_buffer(
-            config: AudioConfig,
-            ring_config: crate::media::audio_ring_buffer::RingBufferConfig,
-            external_handle: Option<AudioHandle>,
-        ) -> Result<(Self, crate::media::audio_ring_buffer::RingBufferProducer), String> {
-            // Create audio output stream (same as new_with_handle)
-            #[cfg(target_os = "linux")]
-            let stream = OutputStreamBuilder::from_default_device()
-                .map(|b| b.with_buffer_size(rodio::cpal::BufferSize::Fixed(1024)))
-                .and_then(|b| b.open_stream_or_fallback())
-                .or_else(|e| {
-                    tracing::warn!("Audio: explicit buffer setup failed ({e}), trying default");
-                    OutputStreamBuilder::open_default_stream()
-                })
-                .map_err(|e| format!("Failed to create audio output: {e}"))?;
-
-            #[cfg(not(target_os = "linux"))]
-            let stream = OutputStreamBuilder::open_default_stream()
-                .map_err(|e| format!("Failed to create audio output: {e}"))?;
-
-            let device_sample_rate = stream.config().sample_rate();
-            tracing::info!(
-                "Audio device sample rate: {}Hz (ring buffer mode)",
-                device_sample_rate
-            );
-
-            let handle = external_handle.unwrap_or_default();
-            handle.set_available(true);
-            handle.set_audio_format(config.sample_rate, config.channels as u32);
-
-            let sink = Sink::connect_new(stream.mixer());
-            sink.pause(); // Start paused
-
-            // Create ring buffer and source
-            let (producer, consumer) =
-                crate::media::audio_ring_buffer::audio_ring_buffer(ring_config);
-            let source = RingBufferSource::new(
-                consumer,
-                handle.clone(),
-                config.sample_rate,
-                config.channels,
-            );
-
-            // Append the single continuous source — never exhausts, no transitions
-            sink.append(source);
-
-            tracing::info!(
-                "Audio player initialized in ring buffer mode ({}Hz, {}ch, device={}Hz)",
-                config.sample_rate,
-                config.channels,
-                device_sample_rate,
-            );
-
-            let player = Self {
-                handle,
-                _stream: stream,
-                sink: Arc::new(Mutex::new(sink)),
-                state: AudioState::Paused,
-                device_sample_rate,
-                initial_pts: None,
-            };
-
-            Ok((player, producer))
+        /// Pauses audio playback.
+        pub fn pause(&mut self) {
+            self.playing.store(false, Ordering::Release);
+            // pause() may not be supported on all platforms — the playing atomic
+            // in the callback handles it by filling silence
+            let _ = self._stream.pause();
+            self.state = AudioState::Paused;
         }
     }
 
-    // ========================================================================
-    // Ring buffer rodio Source (continuous, never exhausts)
-    // ========================================================================
-
-    /// A rodio `Source` backed by a ring buffer consumer.
-    ///
-    /// Always returns `Some(f32)` — returns silence (0.0) when the buffer is empty
-    /// or in stall mode. This prevents rodio from treating the source as exhausted,
-    /// which would trigger a Source transition and resampler state reset.
-    #[cfg(feature = "moq")]
-    struct RingBufferSource {
-        consumer: crate::media::audio_ring_buffer::RingBufferConsumer,
+    fn build_cpal_stream(
+        device: &cpal::Device,
+        config: &cpal::StreamConfig,
+        sample_format: SampleFormat,
+        consumer: RingBufferConsumer,
         handle: AudioHandle,
-        sample_rate: u32,
+        playing: Arc<AtomicBool>,
+    ) -> Result<cpal::Stream, String> {
+        match sample_format {
+            SampleFormat::I8 => {
+                build_cpal_stream_typed::<i8>(device, config, consumer, handle, playing)
+            }
+            SampleFormat::I16 => {
+                build_cpal_stream_typed::<i16>(device, config, consumer, handle, playing)
+            }
+            SampleFormat::I24 => {
+                build_cpal_stream_typed::<I24>(device, config, consumer, handle, playing)
+            }
+            SampleFormat::I32 => {
+                build_cpal_stream_typed::<i32>(device, config, consumer, handle, playing)
+            }
+            SampleFormat::I64 => {
+                build_cpal_stream_typed::<i64>(device, config, consumer, handle, playing)
+            }
+            SampleFormat::U8 => {
+                build_cpal_stream_typed::<u8>(device, config, consumer, handle, playing)
+            }
+            SampleFormat::U16 => {
+                build_cpal_stream_typed::<u16>(device, config, consumer, handle, playing)
+            }
+            SampleFormat::U32 => {
+                build_cpal_stream_typed::<u32>(device, config, consumer, handle, playing)
+            }
+            SampleFormat::U64 => {
+                build_cpal_stream_typed::<u64>(device, config, consumer, handle, playing)
+            }
+            SampleFormat::F32 => {
+                build_cpal_stream_typed::<f32>(device, config, consumer, handle, playing)
+            }
+            SampleFormat::F64 => {
+                build_cpal_stream_typed::<f64>(device, config, consumer, handle, playing)
+            }
+            other => Err(format!("Unsupported output sample format: {other:?}")),
+        }
+    }
+
+    fn build_cpal_stream_typed<T>(
+        device: &cpal::Device,
+        config: &cpal::StreamConfig,
+        mut consumer: RingBufferConsumer,
+        handle: AudioHandle,
+        playing: Arc<AtomicBool>,
+    ) -> Result<cpal::Stream, String>
+    where
+        T: SizedSample + FromSample<f32>,
+    {
+        let mut pending: u64 = 0;
+        let output_channels = config.channels as usize;
+
+        let stream = device
+            .build_output_stream(
+                config,
+                move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+                    if !playing.load(Ordering::Acquire) {
+                        let zero = T::from_sample(0.0f32);
+                        data.fill(zero);
+                        return;
+                    }
+
+                    let vol = handle.effective_volume();
+                    let source_channels = handle.channels().clamp(1, 2) as usize;
+                    let zero = T::from_sample(0.0f32);
+
+                    for frame in data.chunks_mut(output_channels) {
+                        let (left, right, valid) = if source_channels == 1 {
+                            match read_source_sample(&mut consumer, &handle, &mut pending) {
+                                Some(mono) => (mono, mono, true),
+                                None => (0.0, 0.0, false),
+                            }
+                        } else {
+                            let left = read_source_sample(&mut consumer, &handle, &mut pending);
+                            let right = read_source_sample(&mut consumer, &handle, &mut pending);
+                            match (left, right) {
+                                (Some(l), Some(r)) => (l, r, true),
+                                _ => (0.0, 0.0, false),
+                            }
+                        };
+
+                        if !valid {
+                            for sample in frame.iter_mut() {
+                                *sample = zero;
+                            }
+                        } else if output_channels == 1 {
+                            // Stereo->mono downmix or mono passthrough.
+                            let mono = if source_channels == 1 {
+                                left
+                            } else {
+                                (left + right) * 0.5
+                            };
+                            frame[0] = T::from_sample(mono * vol);
+                        } else {
+                            // Mono->stereo upmix or stereo passthrough.
+                            frame[0] = T::from_sample(left * vol);
+                            frame[1] = T::from_sample(right * vol);
+                        }
+
+                        if pending >= FLUSH_SAMPLES {
+                            handle.add_samples_played(pending);
+                            pending = 0;
+                        }
+                    }
+                    // Flush residual so position stays accurate across callbacks
+                    if pending > 0 {
+                        handle.add_samples_played(pending);
+                        pending = 0;
+                    }
+                },
+                |err| tracing::error!("cpal audio error: {err}"),
+                None,
+            )
+            .map_err(|e| format!("Failed to build cpal stream: {e}"))?;
+
+        stream.pause().ok(); // Start paused
+        Ok(stream)
+    }
+
+    #[inline]
+    fn read_source_sample(
+        consumer: &mut RingBufferConsumer,
+        handle: &AudioHandle,
+        pending: &mut u64,
+    ) -> Option<f32> {
+        match consumer.read_sample() {
+            ReadSample::Sample(s) => {
+                *pending += 1;
+                Some(s)
+            }
+            ReadSample::Flushed => {
+                // Discard stale pending (don't add to samples_played) and reset counter.
+                *pending = 0;
+                handle.reset_samples_played();
+                None
+            }
+            ReadSample::Empty => None,
+        }
+    }
+
+    fn is_sample_rate_supported(
+        device: &cpal::Device,
         channels: u16,
-        /// Pending samples not yet flushed to atomic counter (batched counting)
-        pending: u64,
-    }
+        sample_format: SampleFormat,
+        sample_rate: u32,
+    ) -> bool {
+        let Ok(configs) = device.supported_output_configs() else {
+            return false;
+        };
 
-    #[cfg(feature = "moq")]
-    impl RingBufferSource {
-        fn new(
-            consumer: crate::media::audio_ring_buffer::RingBufferConsumer,
-            handle: AudioHandle,
-            sample_rate: u32,
-            channels: u16,
-        ) -> Self {
-            Self {
-                consumer,
-                handle,
-                sample_rate,
-                channels,
-                pending: 0,
-            }
-        }
-
-        #[inline]
-        fn flush_if_needed(&mut self) {
-            if self.pending >= FLUSH_SAMPLES {
-                let n = self.pending;
-                self.pending = 0;
-                self.handle.add_samples_played(n);
-            }
-        }
-    }
-
-    #[cfg(feature = "moq")]
-    impl Iterator for RingBufferSource {
-        type Item = f32;
-
-        #[inline]
-        fn next(&mut self) -> Option<f32> {
-            match self.consumer.read_sample() {
-                Some(sample) => {
-                    // Apply volume scaling on the real-time thread
-                    let vol = self.handle.effective_volume();
-                    self.pending += 1;
-                    self.flush_if_needed();
-                    Some(sample * vol)
-                }
-                None => {
-                    // Return silence — never return None (never exhaust)
-                    Some(0.0)
-                }
-            }
-        }
-
-        fn size_hint(&self) -> (usize, Option<usize>) {
-            // Unknown/infinite — (0, None) is the standard "don't know" answer.
-            (0, None)
-        }
-    }
-
-    #[cfg(feature = "moq")]
-    impl rodio::Source for RingBufferSource {
-        fn current_span_len(&self) -> Option<usize> {
-            // No bounded span — rodio won't plan transitions
-            None
-        }
-
-        #[inline]
-        fn channels(&self) -> u16 {
-            self.channels
-        }
-
-        #[inline]
-        fn sample_rate(&self) -> u32 {
-            self.sample_rate
-        }
-
-        #[inline]
-        fn total_duration(&self) -> Option<Duration> {
-            // None = infinite/live source
-            None
-        }
-    }
-
-    #[cfg(feature = "moq")]
-    impl Drop for RingBufferSource {
-        fn drop(&mut self) {
-            if self.pending != 0 {
-                self.handle.add_samples_played(self.pending);
-            }
-        }
+        configs.into_iter().any(|cfg| {
+            cfg.channels() == channels
+                && cfg.sample_format() == sample_format
+                && sample_rate >= cfg.min_sample_rate().0
+                && sample_rate <= cfg.max_sample_rate().0
+        })
     }
 }
 
 // ============================================================================
-// Placeholder implementation (when ffmpeg feature is disabled)
+// Placeholder implementation (platforms without cpal support)
 // ============================================================================
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
 mod placeholder_impl {
     use super::*;
 
-    /// Placeholder audio player.
+    /// Placeholder audio player for unsupported platforms.
     pub struct AudioPlayer {
-        /// Audio handle for control
         handle: AudioHandle,
-        /// Current state (stored for API consistency with the real implementation,
-        /// though unused in this placeholder since audio is not functional)
         #[allow(dead_code)]
         state: AudioState,
     }
 
     impl AudioPlayer {
-        /// Creates a new audio player with optional external handle (placeholder).
-        pub fn new_with_handle(
-            _config: AudioConfig,
-            external_handle: Option<AudioHandle>,
-        ) -> Result<Self, String> {
-            Ok(Self {
-                handle: external_handle.unwrap_or_default(),
-                state: AudioState::Uninitialized,
-            })
-        }
-
-        /// Creates a new audio player (placeholder).
-        pub fn new(config: AudioConfig) -> Result<Self, String> {
-            Self::new_with_handle(config, None)
-        }
-
         /// Returns the device sample rate (placeholder: returns 48000Hz).
         pub fn device_sample_rate(&self) -> u32 {
             48000
@@ -955,11 +855,6 @@ mod placeholder_impl {
         /// Returns the audio handle for control.
         pub fn handle(&self) -> AudioHandle {
             self.handle.clone()
-        }
-
-        /// Queues audio samples for playback (no-op).
-        pub fn queue_samples(&mut self, _samples: AudioSamples) {
-            // No-op
         }
 
         /// Starts audio playback (no-op).
@@ -972,15 +867,12 @@ mod placeholder_impl {
         pub fn state(&self) -> AudioState {
             AudioState::Uninitialized
         }
-
-        /// Clears the audio buffer (no-op).
-        pub fn clear(&mut self) {}
     }
 }
 
 // Re-export the appropriate implementation
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
-pub use rodio_impl::AudioPlayer;
+pub use cpal_impl::AudioPlayer;
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
 pub use placeholder_impl::AudioPlayer;

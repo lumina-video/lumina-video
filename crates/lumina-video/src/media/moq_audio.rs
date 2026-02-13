@@ -1,4 +1,4 @@
-//! MoQ audio pipeline: crossbeam handoff → symphonia AAC decode → rodio playback.
+//! MoQ audio pipeline: crossbeam handoff → symphonia AAC decode → cpal playback.
 //!
 //! This module is gated on `cfg(all(feature = "moq", any(target_os = "macos", target_os = "linux", target_os = "android")))`.
 //! Android uses cpal/Oboe (same pipeline as desktop). Windows has no MoQ decoder yet.
@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use super::audio::{AudioConfig, AudioHandle, AudioPlayer, AudioSamples};
+use super::audio::{AudioHandle, AudioPlayer, AudioSamples};
 use super::audio_ring_buffer::RingBufferConfig;
 use super::moq_decoder::{MoqAudioShared, MoqAudioStatus};
 
@@ -241,9 +241,9 @@ const GAP_THRESHOLD_US: u64 = 32_000; // 32ms
 
 /// Audio thread main loop: receives AAC frames, decodes via symphonia, writes to ring buffer.
 ///
-/// Uses a single continuous `RingBufferSource` appended once to the rodio Sink,
-/// eliminating per-source transitions, resampler state resets, and queue mutex
-/// contention that caused clicks/pops in the previous batch+append approach.
+/// Uses a lock-free ring buffer read by the cpal audio callback,
+/// eliminating per-source transitions and queue mutex contention
+/// that caused clicks/pops in the previous batch+append approach.
 fn moq_audio_thread_main(
     audio_rx: crossbeam_channel::Receiver<MoqAudioFrame>,
     sample_rate: u32,
@@ -254,16 +254,11 @@ fn moq_audio_thread_main(
     audio_shared: Arc<MoqAudioShared>,
 ) {
     let ring_config = RingBufferConfig::for_format(sample_rate, channels.min(2) as u16);
-    let audio_config = AudioConfig {
-        sample_rate,
-        channels: channels.min(2) as u16,
-        ..Default::default()
-    };
 
     let (mut player, producer) = match AudioPlayer::new_ring_buffer(
-        audio_config,
         ring_config,
         Some(audio_handle.clone()),
+        Some(sample_rate),
     ) {
         Ok(pair) => pair,
         Err(e) => {
