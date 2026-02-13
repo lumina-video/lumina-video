@@ -809,6 +809,8 @@ fn process_audio_command(
     cmd: DecodeCommand,
     player: &mut super::audio::AudioPlayer,
     decoder: &mut AudioDecoder,
+    producer: &crate::media::audio_ring_buffer::RingBufferProducer,
+    first_samples: &mut bool,
 ) -> CommandResult {
     match cmd {
         DecodeCommand::Stop => CommandResult::Stop,
@@ -821,12 +823,11 @@ fn process_audio_command(
             CommandResult::Continue(Some(false))
         }
         DecodeCommand::Seek(position) => {
-            player.clear();
-            player.play(); // Re-arm sink after clear (rodio may auto-pause on empty queue)
+            producer.request_flush();
+            *first_samples = true; // Next decoded frame reseeds base PTS
             if let Err(e) = decoder.seek(position) {
                 tracing::error!("Audio seek failed: {}", e);
             }
-            // Return special marker to indicate seeking state
             CommandResult::Seeking
         }
         // SetMuted and SetVolume are handled by the video decoder thread
@@ -842,18 +843,22 @@ fn audio_thread_main(
     command_rx: crossbeam_channel::Receiver<DecodeCommand>,
     stop_flag: Arc<AtomicBool>,
 ) {
-    use super::audio::{AudioConfig, AudioPlayer};
+    use super::audio::AudioPlayer;
+    use crate::media::audio_ring_buffer::RingBufferConfig;
 
-    // Create audio player on this thread (OutputStream is not Send)
-    let mut player =
-        match AudioPlayer::new_with_handle(AudioConfig::default(), Some(handle.clone())) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!("Failed to create audio player: {}", e);
-                handle.set_available(false);
-                return;
-            }
-        };
+    // Create audio player backed by ring buffer
+    let ring_config = RingBufferConfig::for_vod(48000, 2);
+    let (mut player, producer) = match AudioPlayer::new_ring_buffer(
+        ring_config,
+        Some(handle.clone()),
+    ) {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::error!("Failed to create audio player: {}", e);
+            handle.set_available(false);
+            return;
+        }
+    };
 
     // Get device sample rate and create decoder with it
     let device_sample_rate = player.device_sample_rate();
@@ -873,6 +878,7 @@ fn audio_thread_main(
     let mut playing = false;
     let mut seeking = false; // True while seeking - tolerate empty decodes
     let mut empty_decode_count = 0;
+    let mut first_samples = true;
     const MAX_EMPTY_DECODES_SEEKING: u32 = 100; // Allow ~1s of empty decodes during seek
     const MAX_EMPTY_DECODES_NORMAL: u32 = 10; // Only ~100ms for normal EOF detection
 
@@ -883,7 +889,7 @@ fn audio_thread_main(
 
         // Process commands (non-blocking)
         while let Ok(cmd) = command_rx.try_recv() {
-            match process_audio_command(cmd, &mut player, &mut decoder) {
+            match process_audio_command(cmd, &mut player, &mut decoder, &producer, &mut first_samples) {
                 CommandResult::Stop => return,
                 CommandResult::Continue(Some(new_playing)) => playing = new_playing,
                 CommandResult::Continue(None) => {}
@@ -902,7 +908,7 @@ fn audio_thread_main(
                 Ok(cmd) => cmd,
                 Err(_) => continue,
             };
-            match process_audio_command(cmd, &mut player, &mut decoder) {
+            match process_audio_command(cmd, &mut player, &mut decoder, &producer, &mut first_samples) {
                 CommandResult::Stop => return,
                 CommandResult::Continue(Some(new_playing)) => playing = new_playing,
                 CommandResult::Continue(None) => {}
@@ -959,7 +965,13 @@ fn audio_thread_main(
             }
         };
 
-        player.queue_samples(samples);
+        // Write decoded samples to ring buffer
+        if first_samples {
+            first_samples = false;
+            handle.set_audio_format(samples.sample_rate, samples.channels as u32);
+            handle.set_audio_base_pts(samples.pts);
+        }
+        producer.write(&samples.data);
         thread::sleep(Duration::from_millis(5));
     }
 }
@@ -1336,6 +1348,7 @@ impl FrameScheduler {
         );
 
         self.current_position = position;
+        self.playback_start_position = position;
         self.current_frame = None;
         self.stalled = false;
         self.reset_rejection_tracking();
@@ -1356,10 +1369,14 @@ impl FrameScheduler {
             self.last_clock_delta_log = None;
             self.last_clock_delta_values = None;
 
-            // Clear audio epoch and native position so they get re-synchronized
+            // Clear audio epoch and native position so they get re-synchronized.
+            // Also reset samples_played and base PTS — the audio callback will
+            // re-establish these from the flush signal and next decoded frame.
             if let Some(ref audio) = self.audio_handle {
                 audio.clear_playback_epoch();
                 audio.clear_native_position();
+                audio.reset_samples_played();
+                audio.clear_audio_base_pts();
             }
         }
     }

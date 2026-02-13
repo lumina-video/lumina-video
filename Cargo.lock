@@ -2873,6 +2873,7 @@ dependencies = [
  "block2 0.6.2",
  "bytemuck",
  "bytes",
+ "cpal",
  "crossbeam",
  "crossbeam-channel",
  "drm-fourcc",
