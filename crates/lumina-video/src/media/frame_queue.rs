@@ -1661,7 +1661,10 @@ impl FrameScheduler {
         if !self.frame_pacing_interval.is_zero() {
             if let Some(last) = self.last_frame_accept_time {
                 let since_last = last.elapsed();
-                if since_last < self.frame_pacing_interval.saturating_sub(Duration::from_millis(4))
+                if since_last
+                    < self
+                        .frame_pacing_interval
+                        .saturating_sub(Duration::from_millis(4))
                 {
                     return self.current_frame.clone();
                 }

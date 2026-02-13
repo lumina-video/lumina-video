@@ -3069,6 +3069,7 @@ mod macos_vt {
         }
 
         /// Clears queued output and error flag before waiting for a fresh IDR.
+        #[allow(dead_code)]
         pub fn prepare_for_idr_resync(&mut self) {
             // Wait for any pending async frames to complete
             let wait_status =

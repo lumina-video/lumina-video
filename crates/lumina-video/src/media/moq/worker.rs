@@ -248,15 +248,16 @@ struct CatalogResult {
 /// (`waiting_for_idr_after_error`) that filters frames post-channel. Re-enabling
 /// the worker gate would create a double-gate: the worker drops non-IDR frames
 /// before they reach the channel, so the decoder gate starves and cannot clear.
+#[allow(clippy::too_many_arguments)]
 async fn resubscribe_video_track(
     shared: &Arc<MoqSharedState>,
-    hang_consumer: &hang::BroadcastConsumer,
+    moq_broadcast: &moq_lite::BroadcastConsumer,
     video_track: &moq_lite::Track,
     max_latency: Duration,
     audio_track_for_resub: &Option<moq_lite::Track>,
-    audio_consumer_opt: &mut Option<hang::TrackConsumer>,
+    audio_consumer_opt: &mut Option<hang::container::OrderedConsumer>,
     moq_audio_thread_opt: &Option<MoqAudioThread>,
-    video_consumer: &mut hang::TrackConsumer,
+    video_consumer: &mut hang::container::OrderedConsumer,
     idr_gate_enabled: bool,
     waiting_for_valid_idr: &mut bool,
     idr_gate_groups_seen: &mut u8,
@@ -312,12 +313,18 @@ async fn resubscribe_video_track(
         detail,
     );
 
-    *video_consumer = hang_consumer.subscribe(video_track, max_latency);
+    *video_consumer = hang::container::OrderedConsumer::new(
+        moq_broadcast.subscribe_track(video_track),
+        max_latency,
+    );
 
     // Re-subscribe audio only if the audio thread is still alive.
     if audio_consumer_opt.is_none() && moq_audio_thread_opt.is_some() {
         if let Some(at) = audio_track_for_resub.as_ref() {
-            *audio_consumer_opt = Some(hang_consumer.subscribe(at, max_latency));
+            *audio_consumer_opt = Some(hang::container::OrderedConsumer::new(
+                moq_broadcast.subscribe_track(at),
+                max_latency,
+            ));
             tracing::info!("MoQ {}: Audio track re-subscribed", label);
         }
     } else if audio_consumer_opt.is_none() {
@@ -397,7 +404,6 @@ pub(crate) async fn run_moq_worker(
     shared.buffering_percent.store(50, Ordering::Relaxed);
 
     // -- Phase 3: Fetch and validate catalog --
-    let hang_consumer: hang::BroadcastConsumer = moq_broadcast.into();
 
     // Reset session state for audio coordination
     shared.audio.video_started.store(false, Ordering::Relaxed);
@@ -406,19 +412,22 @@ pub(crate) async fn run_moq_worker(
         .audio_live_edge_evictions
         .store(0, Ordering::Relaxed);
 
-    let cat = fetch_and_validate_catalog(&hang_consumer, &shared, &config, label).await?;
+    let cat = fetch_and_validate_catalog(&moq_broadcast, &shared, &config, label).await?;
 
     // -- Phase 4: Subscribe to video track --
     let video_track = moq_lite::Track {
         name: cat.video_track_name.clone(),
         priority: 1,
     };
-    let mut video_consumer = hang_consumer.subscribe(&video_track, cat.max_latency);
+    let mut video_consumer = hang::container::OrderedConsumer::new(
+        moq_broadcast.subscribe_track(&video_track),
+        cat.max_latency,
+    );
 
     // -- Phase 5: Audio setup --
     let (mut audio_consumer_opt, audio_sender_opt, mut moq_audio_thread_opt) = setup_audio(
         &cat.catalog,
-        &hang_consumer,
+        &moq_broadcast,
         cat.max_latency,
         &config,
         &shared,
@@ -502,12 +511,12 @@ pub(crate) async fn run_moq_worker(
     let mut loop_iter: u64 = 0;
     loop {
         loop_iter += 1;
-        if loop_iter <= 50 || loop_iter % 100 == 0 {
+        if loop_iter <= 50 || loop_iter.is_multiple_of(100) {
             tracing::info!("MoQ {}: select loop iter #{}", label, loop_iter);
         }
         tokio::select! {
             // No biased — fair scheduling prevents audio starvation
-            video_result = video_consumer.read_frame() => {
+            video_result = video_consumer.read() => {
                 // NOTE: video_deadline is only reset when a frame is actually
                 // submitted to the decoder (past IDR gate). Frames that arrive
                 // but get skipped at the IDR gate do NOT reset the watchdog.
@@ -520,7 +529,7 @@ pub(crate) async fn run_moq_worker(
                             idr_gate_broken_keyframes = 0;
                             if !resubscribe_video_track(
                                 &shared,
-                                &hang_consumer,
+                                &moq_broadcast,
                                 &video_track,
                                 cat.max_latency,
                                 &audio_track_for_resub,
@@ -653,7 +662,7 @@ pub(crate) async fn run_moq_worker(
                                     idr_gate_broken_keyframes = 0;
                                     if !resubscribe_video_track(
                                         &shared,
-                                        &hang_consumer,
+                                        &moq_broadcast,
                                         &video_track,
                                         cat.max_latency,
                                         &audio_track_for_resub,
@@ -719,7 +728,7 @@ pub(crate) async fn run_moq_worker(
                         idr_gate_broken_keyframes = 0;
                         if !resubscribe_video_track(
                             &shared,
-                            &hang_consumer,
+                            &moq_broadcast,
                             &video_track,
                             cat.max_latency,
                             &audio_track_for_resub,
@@ -766,7 +775,7 @@ pub(crate) async fn run_moq_worker(
                 idr_gate_broken_keyframes = 0;
                 if !resubscribe_video_track(
                     &shared,
-                    &hang_consumer,
+                    &moq_broadcast,
                     &video_track,
                     cat.max_latency,
                     &audio_track_for_resub,
@@ -796,7 +805,7 @@ pub(crate) async fn run_moq_worker(
             }
             audio_result = async {
                 if let Some(consumer) = audio_consumer_opt.as_mut() {
-                    consumer.read_frame().await
+                    consumer.read().await
                 } else {
                     std::future::pending().await
                 }
@@ -1098,12 +1107,13 @@ async fn discover_broadcast(
 ///
 /// Returns `(video_track_name, max_latency, catalog)`.
 async fn fetch_and_validate_catalog(
-    hang_consumer: &hang::BroadcastConsumer,
+    moq_broadcast: &moq_lite::BroadcastConsumer,
     shared: &Arc<MoqSharedState>,
     config: &MoqDecoderConfig,
     label: &str,
 ) -> Result<CatalogResult, Box<dyn std::error::Error + Send + Sync>> {
-    let mut catalog_consumer = hang_consumer.catalog.clone();
+    let mut catalog_consumer =
+        hang::CatalogConsumer::new(moq_broadcast.subscribe_track(&hang::Catalog::default_track()));
     let catalog_timeout = Duration::from_secs(5);
     let catalog = match tokio::time::timeout(catalog_timeout, catalog_consumer.next()).await {
         Ok(Ok(Some(catalog))) => catalog,
@@ -1123,13 +1133,19 @@ async fn fetch_and_validate_catalog(
     tracing::info!("MoQ {}: Received catalog", label);
 
     // Log full catalog contents for debugging
-    if let Some(ref video) = catalog.video {
+    {
+        let video = &catalog.video;
         tracing::info!(
             "MoQ {} catalog: {} video rendition(s)",
             label,
             video.renditions.len()
         );
         for (name, cfg) in &video.renditions {
+            let desc_len = cfg
+                .description
+                .as_ref()
+                .map(|d: &bytes::Bytes| d.len())
+                .unwrap_or(0);
             tracing::info!(
                 "  video '{}': codec={:?}, {}x{}, {:.1}fps, bitrate={:?}, description={} bytes, container={:?}, jitter={:?}",
                 name,
@@ -1138,21 +1154,25 @@ async fn fetch_and_validate_catalog(
                 cfg.coded_height.unwrap_or(0),
                 cfg.framerate.unwrap_or(0.0),
                 cfg.bitrate,
-                cfg.description.as_ref().map(|d| d.len()).unwrap_or(0),
+                desc_len,
                 cfg.container,
                 cfg.jitter,
             );
         }
-    } else {
-        tracing::warn!("MoQ {} catalog: no video section", label);
     }
-    if let Some(ref audio) = catalog.audio {
+    {
+        let audio = &catalog.audio;
         tracing::info!(
             "MoQ {} catalog: {} audio rendition(s)",
             label,
             audio.renditions.len()
         );
         for (name, cfg) in &audio.renditions {
+            let desc_len = cfg
+                .description
+                .as_ref()
+                .map(|d: &bytes::Bytes| d.len())
+                .unwrap_or(0);
             tracing::info!(
                 "  audio '{}': codec={:?}, sample_rate={}, channels={}, bitrate={:?}, description={} bytes",
                 name,
@@ -1160,18 +1180,17 @@ async fn fetch_and_validate_catalog(
                 cfg.sample_rate,
                 cfg.channel_count,
                 cfg.bitrate,
-                cfg.description.as_ref().map(|d| d.len()).unwrap_or(0),
+                desc_len,
             );
         }
-    } else {
-        tracing::info!("MoQ {} catalog: no audio section", label);
     }
 
     // Find the first video rendition in the catalog
-    let (video_track_name, video_config) = catalog
+    let (video_track_name, video_config): (&String, &hang::catalog::VideoConfig) = catalog
         .video
-        .as_ref()
-        .and_then(|v| v.renditions.iter().next())
+        .renditions
+        .iter()
+        .next()
         .ok_or("No video track in catalog")?;
 
     // Validate container format — we only support Legacy (raw NAL units)
@@ -1263,13 +1282,13 @@ async fn fetch_and_validate_catalog(
 /// Set up audio track subscription and spawn decode/playback thread.
 fn setup_audio(
     catalog: &hang::catalog::Catalog,
-    hang_consumer: &hang::BroadcastConsumer,
+    moq_broadcast: &moq_lite::BroadcastConsumer,
     max_latency: Duration,
     config: &MoqDecoderConfig,
     shared: &Arc<MoqSharedState>,
     label: &str,
 ) -> (
-    Option<hang::TrackConsumer>,
+    Option<hang::container::OrderedConsumer>,
     Option<LiveEdgeSender<MoqAudioFrame>>,
     Option<MoqAudioThread>,
 ) {
@@ -1292,7 +1311,10 @@ fn setup_audio(
         name: track_name.to_string(),
         priority: 2,
     };
-    let audio_consumer = hang_consumer.subscribe(&audio_track, max_latency);
+    let audio_consumer = hang::container::OrderedConsumer::new(
+        moq_broadcast.subscribe_track(&audio_track),
+        max_latency,
+    );
 
     let (tx, rx) = crossbeam_channel::bounded(config.audio_buffer_capacity);
     let live_sender = LiveEdgeSender::new(tx, rx.clone());
@@ -1345,7 +1367,7 @@ fn setup_audio(
 /// reusing `buf` to avoid per-frame allocation.
 ///
 /// After `split().freeze()`, the `BytesMut` retains its allocation for reuse.
-fn assemble_payload(payload: &hang::BufList, buf: &mut BytesMut) -> bytes::Bytes {
+fn assemble_payload(payload: &hang::container::BufList, buf: &mut BytesMut) -> bytes::Bytes {
     buf.clear();
     let needed = payload.remaining();
     buf.reserve(needed);

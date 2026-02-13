@@ -414,39 +414,31 @@ fn moq_audio_thread_main(
             let mut fatal_decode_error = false;
 
             // Drain all remaining available frames without blocking.
-            loop {
-                match audio_rx.try_recv() {
-                    Ok(frame) => {
-                        match aac_decoder.decode_frame(&frame.data, frame.timestamp_us) {
-                            Ok(samples) => {
-                                if batch_pts.is_none() {
-                                    batch_pts = Some(Duration::from_micros(frame.timestamp_us));
-                                }
-                                batch_data.extend_from_slice(&samples.data);
-                                consecutive_errors = 0;
-                            }
-                            Err(e) => {
-                                consecutive_errors += 1;
-                                tracing::debug!(
-                                    "MoQ audio: decode error #{}: {e}",
-                                    consecutive_errors
-                                );
-                                if consecutive_errors >= MAX_CONSECUTIVE_DECODE_ERRORS {
-                                    tracing::warn!(
-                                        "MoQ audio: {} consecutive decode errors, likely unsupported AAC profile",
-                                        consecutive_errors
-                                    );
-                                    *audio_shared.audio_status.lock() = MoqAudioStatus::Error;
-                                    audio_shared
-                                        .internal_audio_ready
-                                        .store(false, Ordering::Relaxed);
-                                    fatal_decode_error = true;
-                                    break;
-                                }
-                            }
+            while let Ok(frame) = audio_rx.try_recv() {
+                match aac_decoder.decode_frame(&frame.data, frame.timestamp_us) {
+                    Ok(samples) => {
+                        if batch_pts.is_none() {
+                            batch_pts = Some(Duration::from_micros(frame.timestamp_us));
+                        }
+                        batch_data.extend_from_slice(&samples.data);
+                        consecutive_errors = 0;
+                    }
+                    Err(e) => {
+                        consecutive_errors += 1;
+                        tracing::debug!("MoQ audio: decode error #{}: {e}", consecutive_errors);
+                        if consecutive_errors >= MAX_CONSECUTIVE_DECODE_ERRORS {
+                            tracing::warn!(
+                                "MoQ audio: {} consecutive decode errors, likely unsupported AAC profile",
+                                consecutive_errors
+                            );
+                            *audio_shared.audio_status.lock() = MoqAudioStatus::Error;
+                            audio_shared
+                                .internal_audio_ready
+                                .store(false, Ordering::Relaxed);
+                            fatal_decode_error = true;
+                            break;
                         }
                     }
-                    Err(_) => break, // Channel empty or disconnected
                 }
             }
 
@@ -497,7 +489,6 @@ pub(crate) fn select_preferred_audio_rendition(
 
     catalog
         .audio
-        .as_ref()?
         .renditions
         .iter()
         .filter(|(_, cfg)| matches!(cfg.codec, AudioCodec::AAC(_)))
