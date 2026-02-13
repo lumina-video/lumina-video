@@ -477,6 +477,11 @@ pub(crate) async fn run_moq_worker(
     const RESUBSCRIBE_COOLDOWN: Duration = Duration::from_millis(750);
     const READ_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 
+    // Prevent tight restart loops when audio track has ended or is unstable.
+    const AUDIO_RESUBSCRIBE_RETRY_DELAY: Duration = Duration::from_millis(500);
+    let mut audio_needs_resubscribe = false;
+    let mut next_audio_resubscribe_attempt = Instant::now();
+
     // Persistent video deadline: tracks wall-clock time since last video frame.
     // Unlike wrapping read_frame() in tokio::timeout(), this isn't reset when the
     // audio arm completes — so a video-only stall is detected even while audio
@@ -490,39 +495,52 @@ pub(crate) async fn run_moq_worker(
             tracing::info!("MoQ {}: select loop iter #{}", label, loop_iter);
         }
 
-        // -- Audio re-subscribe: detect when audio task has finished --
-        //
+        // Detect when the dedicated audio task has finished.
         // The dedicated audio task exits on track end (Ok(None)) or read error.
         // Without re-subscribing, looped/recovered streams continue video-only.
-        // Check each iteration and re-setup audio when needed.
         if let Some(ref task) = audio_task {
             if task.is_finished() {
-                // Await the finished task to collect it
                 if let Some(finished) = audio_task.take() {
                     let _ = finished.await;
                 }
                 // Teardown the old audio decode thread (sender was moved into the task,
                 // so the crossbeam channel is already disconnected)
                 teardown_audio(None, moq_audio_thread_opt.take(), &shared, label).await;
+                audio_needs_resubscribe = true;
+            }
+        }
 
-                // Re-subscribe audio if we know the track name
-                if let Some(ref at) = audio_track_for_resub {
-                    tracing::info!(
-                        "MoQ {}: Re-subscribing audio track '{}' after task exit",
+        // Throttled audio re-subscribe.
+        if audio_needs_resubscribe && Instant::now() >= next_audio_resubscribe_attempt {
+            next_audio_resubscribe_attempt = Instant::now() + AUDIO_RESUBSCRIBE_RETRY_DELAY;
+
+            if let Some(ref at) = audio_track_for_resub {
+                tracing::info!(
+                    "MoQ {}: Re-subscribing audio track '{}' after task exit",
+                    label,
+                    at.name,
+                );
+                let (new_consumer, new_sender, new_thread) = setup_audio(
+                    &cat.catalog,
+                    &moq_broadcast,
+                    cat.max_latency,
+                    &config,
+                    &shared,
+                    label,
+                );
+                moq_audio_thread_opt = new_thread;
+                audio_task = spawn_audio_forward_task(new_consumer, new_sender, label);
+                if audio_task.is_some() {
+                    audio_needs_resubscribe = false;
+                } else {
+                    tracing::warn!(
+                        "MoQ {}: audio re-subscribe attempt produced no task; retrying in {:?}",
                         label,
-                        at.name,
+                        AUDIO_RESUBSCRIBE_RETRY_DELAY,
                     );
-                    let (new_consumer, new_sender, new_thread) = setup_audio(
-                        &cat.catalog,
-                        &moq_broadcast,
-                        cat.max_latency,
-                        &config,
-                        &shared,
-                        label,
-                    );
-                    moq_audio_thread_opt = new_thread;
-                    audio_task = spawn_audio_forward_task(new_consumer, new_sender, label);
                 }
+            } else {
+                audio_needs_resubscribe = false;
             }
         }
 

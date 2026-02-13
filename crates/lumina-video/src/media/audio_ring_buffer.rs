@@ -8,8 +8,7 @@
 //! modifies `read_pos`. On overflow the producer overwrites old data (advancing
 //! `write_pos` past capacity); the consumer detects the skip and catches up.
 
-use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Configuration for the audio ring buffer.
@@ -41,15 +40,10 @@ impl Default for RingBufferConfig {
 }
 
 /// Shared state between producer and consumer.
-///
-/// The buffer uses `UnsafeCell<f32>` for interior mutability: the producer
-/// writes through `UnsafeCell::get()` while the consumer reads from it.
-/// This is required by Rust's aliasing model — without `UnsafeCell`, concurrent
-/// read/write to the same memory (even via raw pointers) is undefined behavior.
 struct RingBufferShared {
     /// The sample buffer (fixed size, power-of-2 for fast modulo).
-    /// Uses `UnsafeCell` because producer and consumer access it from different threads.
-    buffer: Box<[UnsafeCell<f32>]>,
+    /// Atomic sample slots (f32 stored as bits) avoid read/write data races.
+    buffer: Box<[AtomicU32]>,
     /// Write position (monotonically increasing, never wraps — use mask for index).
     /// Only modified by producer.
     write_pos: AtomicUsize,
@@ -121,7 +115,7 @@ pub fn audio_ring_buffer(config: RingBufferConfig) -> (RingBufferProducer, RingB
 
     let shared = Arc::new(RingBufferShared {
         buffer: (0..capacity)
-            .map(|_| UnsafeCell::new(0.0f32))
+            .map(|_| AtomicU32::new(0.0f32.to_bits()))
             .collect::<Vec<_>>()
             .into_boxed_slice(),
         write_pos: AtomicUsize::new(0),
@@ -171,27 +165,12 @@ impl RingBufferProducer {
             s.overflow_count.fetch_add(1, Ordering::Relaxed);
         }
 
-        // Write samples into the circular buffer (may overwrite old data).
-        //
-        // SAFETY: single producer, power-of-2 masking ensures valid indices.
-        // UnsafeCell<f32> is #[repr(transparent)], so a contiguous slice of
-        // UnsafeCell<f32> has the same layout as a slice of f32. We obtain
-        // the raw *mut f32 from UnsafeCell::get() on the first element.
-        let base_ptr: *mut f32 = s.buffer[0].get();
-        let start_idx = wp & mask;
-        let first_chunk = (cap - start_idx).min(len);
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(samples.as_ptr(), base_ptr.add(start_idx), first_chunk);
-        }
-        if first_chunk < len {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    samples.as_ptr().add(first_chunk),
-                    base_ptr,
-                    len - first_chunk,
-                );
-            }
+        // Atomic slot writes avoid undefined behavior if producer and consumer
+        // touch the same slot concurrently during overwrite scenarios.
+        let mut idx = wp & mask;
+        for &sample in samples {
+            s.buffer[idx].store(sample.to_bits(), Ordering::Relaxed);
+            idx = (idx + 1) & mask;
         }
 
         // Advance write position (makes samples visible to consumer)
@@ -277,10 +256,7 @@ impl RingBufferConsumer {
         }
 
         let idx = rp & s.mask;
-        // SAFETY: single consumer reads only from slots the producer has released
-        // (enforced by Acquire/Release on write_pos/read_pos). UnsafeCell::get()
-        // provides the interior mutability needed for cross-thread buffer access.
-        let sample = unsafe { *s.buffer[idx].get() };
+        let sample = f32::from_bits(s.buffer[idx].load(Ordering::Relaxed));
         s.read_pos.store(rp.wrapping_add(1), Ordering::Release);
         s.total_read.fetch_add(1, Ordering::Relaxed);
 
@@ -310,16 +286,7 @@ impl RingBufferConsumer {
     }
 }
 
-// SAFETY: RingBufferShared contains UnsafeCell<f32> (not Sync by default).
-// This is sound because the ring buffer is strictly SPSC:
-// - Only the producer writes to buffer slots (via UnsafeCell::get())
-// - Only the consumer reads from buffer slots (via UnsafeCell::get())
-// - Atomic write_pos/read_pos with Acquire/Release ordering ensure the consumer
-//   only reads slots that the producer has finished writing (and vice versa for
-//   overflow detection — the consumer never writes to the buffer).
-unsafe impl Sync for RingBufferShared {}
-unsafe impl Send for RingBufferProducer {}
-unsafe impl Send for RingBufferConsumer {}
+// Auto-traits are sufficient now — all fields are Send+Sync (atomics + Arc).
 
 #[cfg(test)]
 mod tests {
