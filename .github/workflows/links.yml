@@ -28,7 +28,8 @@ jobs:
             --exclude "moqs?:/"
             --exclude "rtmp://"
             --exclude "^https://api-core\\.zap\\.stream"
-            --exclude "^https://cdn\\.moq\\.dev/demo"
+            --exclude "^https://cdn\\.moq\\.dev"
+            --exclude "^https://commondatastorage\\.googleapis\\.com"
             '*.md'
             'crates/**/*.md'
             'crates/**/*.rs'
