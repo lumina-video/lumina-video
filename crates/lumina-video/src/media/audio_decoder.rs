@@ -1,7 +1,7 @@
 //! FFmpeg-based audio decoder for extracting audio from video files.
 //!
 //! This module provides audio decoding using FFmpeg, converting compressed
-//! audio to PCM samples that can be played back via rodio.
+//! audio to PCM samples that can be played back via cpal.
 
 use std::time::Duration;
 

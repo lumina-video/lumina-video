@@ -1127,7 +1127,7 @@ pub trait VideoDecoderBackend: Send {
     /// audio thread should be started.
     ///
     /// Decoders like FFmpeg only decode video frames and require a separate audio
-    /// pipeline (AudioThread + rodio) for audio playback.
+    /// pipeline (AudioThread + cpal) for audio playback.
     fn handles_audio_internally(&self) -> bool {
         false // Default: decoder does not handle audio (needs separate audio thread)
     }

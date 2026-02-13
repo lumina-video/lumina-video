@@ -20,7 +20,7 @@ egui-winit = { version = "0.31.1" }
 
 # Video/audio dependencies
 ffmpeg-next = "8.0"
-rodio = { version = "0.21", default-features = false, features = ["playback", "symphonia-all"] }
+cpal = "0.16"
 symphonia-core = "0.5"
 symphonia-codec-aac = "0.5"
 
