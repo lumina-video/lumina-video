@@ -1067,7 +1067,12 @@ impl VideoPlayer {
     ///
     /// 1. Migrates current mute/volume state to the new handle
     /// 2. Replaces `self.audio_handle` so UI controls affect MoQ playback
-    /// 3. Binds to FrameScheduler for A/V sync metrics
+    ///
+    /// NOTE: We intentionally do NOT bind to FrameScheduler here. The MoQ audio
+    /// PTS (publisher time, e.g. 7200s) has a completely different time base than
+    /// the wall-clock time the scheduler uses. Binding would cause a massive
+    /// position jump that freezes video. A/V sync for MoQ needs a dedicated
+    /// PTS-offset-aware approach (future work).
     ///
     /// When the handle becomes stale (thread torn down), unbinds and reverts.
     #[cfg(feature = "moq")]
@@ -1084,15 +1089,12 @@ impl VideoPlayer {
                 moq_ah.set_muted(self.audio_handle.is_muted());
                 moq_ah.set_volume(self.audio_handle.volume());
 
-                // Replace the player-level handle
+                // Replace the player-level handle (for UI mute/volume controls only)
                 self.audio_handle = moq_ah;
                 self.audio_handle.set_available(true);
 
-                // Bind to FrameScheduler for A/V sync
-                self.scheduler.set_audio_handle(self.audio_handle.clone());
-
                 self.moq_audio_bound = true;
-                tracing::info!("MoQ audio handle late-bound to VideoPlayer and FrameScheduler");
+                tracing::info!("MoQ audio handle late-bound to VideoPlayer (mute/volume only)");
             }
         } else {
             // Check if handle went stale (thread torn down)
@@ -1104,9 +1106,6 @@ impl VideoPlayer {
                 placeholder.set_muted(self.audio_handle.is_muted());
                 placeholder.set_volume(self.audio_handle.volume());
                 self.audio_handle = placeholder;
-
-                // Update FrameScheduler with placeholder
-                self.scheduler.set_audio_handle(self.audio_handle.clone());
 
                 self.moq_audio_bound = false;
             }

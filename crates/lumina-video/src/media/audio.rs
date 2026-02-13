@@ -869,8 +869,9 @@ mod rodio_impl {
         }
 
         fn size_hint(&self) -> (usize, Option<usize>) {
-            // Infinite source
-            (usize::MAX, None)
+            // Unknown/infinite — (0, None) is the standard "don't know" answer.
+            // NOTE: (usize::MAX, None) was wrong — lower bound should be realistic.
+            (0, None)
         }
     }
 

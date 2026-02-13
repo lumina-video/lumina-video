@@ -106,6 +106,9 @@ impl SymphoniaAacDecoder {
     }
 
     /// Decodes a single AAC frame into interleaved f32 samples.
+    ///
+    /// If the decoded output has fewer channels than `self.channels` (e.g. mono AAC
+    /// but stereo playback), upmixes by duplicating each sample across channels.
     fn decode_frame(&mut self, data: &[u8], timestamp_us: u64) -> Result<AudioSamples, String> {
         use symphonia_core::formats::Packet;
 
@@ -116,20 +119,44 @@ impl SymphoniaAacDecoder {
             .map_err(|e| format!("AAC decode error: {e}"))?;
 
         let spec = *decoded.spec();
-        let num_channels = spec.channels.count();
+        let decoded_channels = spec.channels.count();
         let num_frames = decoded.frames();
 
-        if num_frames == 0 || num_channels == 0 {
+        if num_frames == 0 || decoded_channels == 0 {
             return Err("Empty decoded buffer".to_string());
         }
 
         let mut sample_buf =
             symphonia_core::audio::SampleBuffer::<f32>::new(num_frames as u64, spec);
         sample_buf.copy_interleaved_ref(decoded);
-        let interleaved = sample_buf.samples().to_vec();
+        let raw = sample_buf.samples();
+
+        // Upmix if decoded channels < target channels (e.g. mono → stereo)
+        let target_ch = self.channels as usize;
+        let data = if decoded_channels < target_ch {
+            let mut upmixed = Vec::with_capacity(num_frames * target_ch);
+            for frame_samples in raw.chunks(decoded_channels) {
+                // Duplicate each decoded sample across target channels
+                for ch in 0..target_ch {
+                    upmixed.push(frame_samples[ch.min(decoded_channels - 1)]);
+                }
+            }
+            upmixed
+        } else if decoded_channels > target_ch {
+            // Downmix: take only the first target_ch channels per frame
+            let mut downmixed = Vec::with_capacity(num_frames * target_ch);
+            for frame_samples in raw.chunks(decoded_channels) {
+                for ch in 0..target_ch {
+                    downmixed.push(frame_samples[ch]);
+                }
+            }
+            downmixed
+        } else {
+            raw.to_vec()
+        };
 
         Ok(AudioSamples {
-            data: interleaved,
+            data,
             sample_rate: self.sample_rate,
             channels: self.channels,
             pts: Duration::from_micros(timestamp_us),
@@ -286,6 +313,9 @@ fn moq_audio_thread_main(
     let mut last_pts_us: Option<u64> = None;
     let ch = channels.min(2) as usize;
     let mut frames_since_metrics: u32 = 0;
+    let mut total_frames_decoded: u64 = 0;
+    let thread_start = std::time::Instant::now();
+    let mut first_frame_logged = false;
 
     loop {
         if stop_flag.load(Ordering::Relaxed) {
@@ -297,15 +327,23 @@ fn moq_audio_thread_main(
             Ok(frame) => match aac_decoder.decode_frame(&frame.data, frame.timestamp_us) {
                 Ok(samples) => {
                     consecutive_errors = 0;
+                    total_frames_decoded += 1;
+
+                    // Log first decoded frame details for diagnostics (eprintln for reliable stderr output)
+                    if !first_frame_logged {
+                        first_frame_logged = true;
+                        audio_handle.set_audio_base_pts(samples.pts);
+                        tracing::info!(
+                            "MoQ audio: first frame base_pts={:?}, {} interleaved samples, {}ch declared",
+                            samples.pts,
+                            samples.data.len(),
+                            samples.channels,
+                        );
+                    }
 
                     // Set base PTS on first decoded frame
                     if last_pts_us.is_none() {
                         audio_handle.set_audio_base_pts(samples.pts);
-                        tracing::debug!(
-                            "MoQ audio: first frame base_pts={:?}, {} samples",
-                            samples.pts,
-                            samples.data.len()
-                        );
                     }
 
                     // Gap detection: insert silence for PTS discontinuities > 32ms
@@ -336,7 +374,19 @@ fn moq_audio_thread_main(
                     frames_since_metrics += 1;
                     if frames_since_metrics >= 50 {
                         frames_since_metrics = 0;
-                        *audio_shared.ring_buffer_metrics.lock() = producer.metrics();
+                        let m = producer.metrics();
+                        let elapsed = thread_start.elapsed().as_secs_f64();
+                        let fps = total_frames_decoded as f64 / elapsed.max(0.001);
+                        tracing::debug!(
+                            "MoQ audio: {:.1} fps, fill={}% ({}/{}), wrote={}, read={}, overflows={}, stalls={}, samples/frame={}",
+                            fps,
+                            m.fill_samples * 100 / m.capacity_samples.max(1),
+                            m.fill_samples, m.capacity_samples,
+                            m.total_written, m.total_read,
+                            m.overflow_count, m.stall_count,
+                            samples.data.len(),
+                        );
+                        *audio_shared.ring_buffer_metrics.lock() = m;
                     }
                 }
                 Err(e) => {

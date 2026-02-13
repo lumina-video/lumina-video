@@ -92,7 +92,7 @@ pub(crate) async fn run_moq_worker(
     );
 
     // -- Phase 5: Audio setup --
-    let (mut audio_consumer_opt, audio_sender_opt, mut moq_audio_thread_opt) = setup_audio(
+    let (audio_consumer_opt, audio_sender_opt, mut moq_audio_thread_opt) = setup_audio(
         &catalog,
         &moq_broadcast,
         max_latency,
@@ -101,7 +101,49 @@ pub(crate) async fn run_moq_worker(
         label,
     );
 
-    // -- Phase 6: Streaming --
+    // -- Phase 5.5: Spawn dedicated audio forwarding task --
+    //
+    // IMPORTANT: OrderedConsumer::read() is NOT cancellation-safe — its internal
+    // read_unbuffered() has two await points (next_frame + read_chunks). If the
+    // future is dropped between them, the frame is consumed from the QUIC stream
+    // but never returned → lost. Running audio in tokio::select! alongside video
+    // caused ~50% audio frame loss (25 fps instead of 47 fps).
+    //
+    // Fix: audio gets its own task so read() is never cancelled.
+    let audio_task = match (audio_consumer_opt, audio_sender_opt) {
+        (Some(mut audio_consumer), Some(audio_sender)) => {
+            let label_owned = label.to_string();
+            Some(tokio::spawn(async move {
+                let mut buf = BytesMut::with_capacity(4096);
+                loop {
+                    match audio_consumer.read().await {
+                        Ok(Some(frame)) => {
+                            let data = assemble_payload(&frame.payload, &mut buf);
+                            let moq_frame = MoqAudioFrame {
+                                timestamp_us: frame.timestamp.as_micros() as u64,
+                                data,
+                            };
+                            if let Err(ChannelClosed) = audio_sender.send(moq_frame) {
+                                tracing::warn!("MoQ {}: Audio channel closed", label_owned);
+                                break;
+                            }
+                        }
+                        Ok(None) => {
+                            tracing::info!("MoQ {}: Audio track ended", label_owned);
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!("MoQ {}: Audio read error: {e}", label_owned);
+                            break;
+                        }
+                    }
+                }
+            }))
+        }
+        _ => None,
+    };
+
+    // -- Phase 6: Streaming (video only — audio has its own task) --
     shared.set_state(MoqDecoderState::Streaming);
     shared.buffering_percent.store(100, Ordering::Relaxed);
 
@@ -111,99 +153,68 @@ pub(crate) async fn run_moq_worker(
         video_track_name,
     );
 
-    // Pre-allocate reusable buffers to avoid per-frame allocation
+    // Pre-allocate reusable buffer for video payload assembly
     let mut video_buf = BytesMut::with_capacity(256 * 1024);
-    let mut audio_buf = BytesMut::with_capacity(4096);
 
     let mut stats_log_counter = 0u64;
     loop {
-        tokio::select! {
-            // No biased — fair scheduling prevents audio starvation
-            video_result = video_consumer.read() => {
-                match video_result {
-                    Ok(Some(frame)) => {
-                        let recv_count =
-                            shared.frame_stats.received.fetch_add(1, Ordering::Relaxed) + 1;
+        match video_consumer.read().await {
+            Ok(Some(frame)) => {
+                let recv_count =
+                    shared.frame_stats.received.fetch_add(1, Ordering::Relaxed) + 1;
 
-                        stats_log_counter += 1;
-                        #[allow(clippy::manual_is_multiple_of)] // MSRV 1.83: is_multiple_of requires 1.87+
-                        if stats_log_counter % 30 == 0 {
-                            shared.frame_stats.log_summary(label);
-                        }
+                stats_log_counter += 1;
+                #[allow(clippy::manual_is_multiple_of)] // MSRV 1.83: is_multiple_of requires 1.87+
+                if stats_log_counter % 30 == 0 {
+                    shared.frame_stats.log_summary(label);
+                }
 
-                        let data = assemble_payload(&frame.payload, &mut video_buf);
+                let data = assemble_payload(&frame.payload, &mut video_buf);
 
-                        let moq_frame = MoqVideoFrame {
-                            timestamp_us: frame.timestamp.as_micros() as u64,
-                            data,
-                            is_keyframe: frame.keyframe,
-                        };
+                let moq_frame = MoqVideoFrame {
+                    timestamp_us: frame.timestamp.as_micros() as u64,
+                    data,
+                    is_keyframe: frame.keyframe,
+                };
 
-                        if recv_count <= 5 {
-                            let nal_type = moq_frame.data.get(4).map(|b| b & 0x1F).unwrap_or(0);
-                            tracing::info!(
-                                "MoQ {} frame #{}: is_keyframe={}, NAL type={}, {} bytes",
-                                label, recv_count, moq_frame.is_keyframe, nal_type, moq_frame.data.len()
-                            );
-                        }
+                if recv_count <= 5 {
+                    let nal_type = moq_frame.data.get(4).map(|b| b & 0x1F).unwrap_or(0);
+                    tracing::info!(
+                        "MoQ {} frame #{}: is_keyframe={}, NAL type={}, {} bytes",
+                        label, recv_count, moq_frame.is_keyframe, nal_type, moq_frame.data.len()
+                    );
+                }
 
-                        if frame_tx.send(moq_frame).await.is_err() {
-                            tracing::warn!("MoQ {}: Frame channel closed, stopping worker", label);
-                            break;
-                        }
-                    }
-                    Ok(None) => {
-                        tracing::info!("MoQ {}: Video track ended", label);
-                        shared.frame_stats.log_summary(label);
-                        shared.set_state(MoqDecoderState::Ended);
-                        shared.eof_reached.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::error!("MoQ {}: Frame read error: {e}", label);
-                        shared.frame_stats.log_summary(label);
-                        shared.set_error(format!("Frame read error: {e}"));
-                        break;
-                    }
+                if frame_tx.send(moq_frame).await.is_err() {
+                    tracing::warn!("MoQ {}: Frame channel closed, stopping worker", label);
+                    break;
                 }
             }
-            audio_result = async {
-                if let Some(consumer) = audio_consumer_opt.as_mut() {
-                    consumer.read().await
-                } else {
-                    std::future::pending().await
-                }
-            } => {
-                if let Some(ref audio_sender) = audio_sender_opt {
-                    match audio_result {
-                        Ok(Some(frame)) => {
-                            let data = assemble_payload(&frame.payload, &mut audio_buf);
-                            let moq_frame = MoqAudioFrame {
-                                timestamp_us: frame.timestamp.as_micros() as u64,
-                                data,
-                            };
-                            if let Err(ChannelClosed) = audio_sender.send(moq_frame) {
-                                tracing::warn!("MoQ {}: Audio channel closed", label);
-                                audio_consumer_opt = None;
-                            }
-                        }
-                        Ok(None) => {
-                            tracing::info!("MoQ {}: Audio track ended", label);
-                            audio_consumer_opt = None;
-                        }
-                        Err(e) => {
-                            tracing::warn!("MoQ {}: Audio read error: {e}", label);
-                            audio_consumer_opt = None;
-                        }
-                    }
-                }
+            Ok(None) => {
+                tracing::info!("MoQ {}: Video track ended", label);
+                shared.frame_stats.log_summary(label);
+                shared.set_state(MoqDecoderState::Ended);
+                shared.eof_reached.store(true, Ordering::Relaxed);
+                break;
+            }
+            Err(e) => {
+                tracing::error!("MoQ {}: Frame read error: {e}", label);
+                shared.frame_stats.log_summary(label);
+                shared.set_error(format!("Frame read error: {e}"));
+                break;
             }
         }
     }
 
     // -- Phase 7: Teardown --
+    // Abort the audio task first — this drops the LiveEdgeSender, closing the
+    // crossbeam channel, which causes the audio decode thread to exit.
+    if let Some(task) = audio_task {
+        task.abort();
+        let _ = task.await;
+    }
     teardown_audio(
-        audio_sender_opt,
+        None, // sender was moved into the audio task
         moq_audio_thread_opt.take(),
         &shared,
         label,
