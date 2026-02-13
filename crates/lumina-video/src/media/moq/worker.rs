@@ -539,7 +539,7 @@ async fn fetch_and_validate_catalog(
         metadata.width = video_config.coded_width.unwrap_or(1920);
         metadata.height = video_config.coded_height.unwrap_or(1080);
         metadata.frame_rate = video_config.framerate.unwrap_or(30.0) as f32;
-        metadata.codec = format!("{:?}", video_config.codec);
+        metadata.codec = video_config.codec.to_string();
     }
 
     // Store codec description (avcC/hvcC box with SPS/PPS) if present
@@ -695,6 +695,10 @@ async fn teardown_audio(
                 );
             }
         }
+        shared_for_teardown
+            .audio
+            .alive
+            .store(false, Ordering::Release);
         shared_for_teardown
             .audio
             .internal_audio_ready

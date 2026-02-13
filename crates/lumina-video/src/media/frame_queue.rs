@@ -283,6 +283,8 @@ pub struct DecodeThread {
     dimensions: Arc<Mutex<Option<(u32, u32)>>>,
     /// Shared frame rate (updated by decode thread, read by UI thread)
     frame_rate: Arc<Mutex<Option<f32>>>,
+    /// Shared codec name (updated by decode thread, read by UI thread)
+    codec: Arc<Mutex<Option<String>>>,
     /// Shared buffering percentage (0-100, updated by decode thread)
     buffering_percent: Arc<std::sync::atomic::AtomicI32>,
 }
@@ -316,6 +318,7 @@ impl DecodeThread {
         let duration = Arc::new(Mutex::new(None));
         let dimensions = Arc::new(Mutex::new(None));
         let frame_rate = Arc::new(Mutex::new(None));
+        let codec: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let buffering_percent = Arc::new(AtomicI32::new(0)); // Start unbuffered, decoder will update
 
         let queue = Arc::clone(&frame_queue);
@@ -323,11 +326,12 @@ impl DecodeThread {
         let dur = Arc::clone(&duration);
         let dims = Arc::clone(&dimensions);
         let fps = Arc::clone(&frame_rate);
+        let cdc = Arc::clone(&codec);
         let buf = Arc::clone(&buffering_percent);
         let audio = audio_handle.clone();
 
         let handle = thread::spawn(move || {
-            decode_loop(decoder, queue, command_rx, stop, dur, dims, fps, buf, audio);
+            decode_loop(decoder, queue, command_rx, stop, dur, dims, fps, cdc, buf, audio);
         });
 
         Self {
@@ -338,6 +342,7 @@ impl DecodeThread {
             duration,
             dimensions,
             frame_rate,
+            codec,
             buffering_percent,
         }
     }
@@ -401,6 +406,11 @@ impl DecodeThread {
     /// Returns the current known frame rate (updated by decode thread).
     pub fn frame_rate(&self) -> Option<f32> {
         *self.frame_rate.lock()
+    }
+
+    /// Returns the current known codec name (updated by decode thread).
+    pub fn codec(&self) -> Option<String> {
+        self.codec.lock().clone()
     }
 
     /// Returns the current buffering percentage (0-100).
@@ -485,6 +495,7 @@ fn decode_loop<D: VideoDecoderBackend>(
     shared_duration: Arc<Mutex<Option<Duration>>>,
     shared_dimensions: Arc<Mutex<Option<(u32, u32)>>>,
     shared_frame_rate: Arc<Mutex<Option<f32>>>,
+    shared_codec: Arc<Mutex<Option<String>>>,
     shared_buffering: Arc<std::sync::atomic::AtomicI32>,
     audio_handle: Option<AudioHandle>,
 ) {
@@ -564,9 +575,12 @@ fn decode_loop<D: VideoDecoderBackend>(
         if has_duration && has_dimensions {
             *shared_duration.lock() = duration_opt;
             *shared_dimensions.lock() = Some(dims);
-            let fps = decoder.metadata().frame_rate;
-            if fps > 0.0 {
-                *shared_frame_rate.lock() = Some(fps);
+            let meta = decoder.metadata();
+            if meta.frame_rate > 0.0 {
+                *shared_frame_rate.lock() = Some(meta.frame_rate);
+            }
+            if !meta.codec.is_empty() {
+                *shared_codec.lock() = Some(meta.codec.clone());
             }
             break;
         }
@@ -580,9 +594,12 @@ fn decode_loop<D: VideoDecoderBackend>(
             if dims.0 > 0 && dims.1 > 0 {
                 *shared_dimensions.lock() = Some(dims);
             }
-            let fps = decoder.metadata().frame_rate;
-            if fps > 0.0 {
-                *shared_frame_rate.lock() = Some(fps);
+            let meta = decoder.metadata();
+            if meta.frame_rate > 0.0 {
+                *shared_frame_rate.lock() = Some(meta.frame_rate);
+            }
+            if !meta.codec.is_empty() {
+                *shared_codec.lock() = Some(meta.codec.clone());
             }
             break;
         }
@@ -625,9 +642,12 @@ fn decode_loop<D: VideoDecoderBackend>(
             if dims.0 > 0 && dims.1 > 0 {
                 *shared_dimensions.lock() = Some(dims);
             }
-            let fps = decoder.metadata().frame_rate;
-            if fps > 0.0 {
-                *shared_frame_rate.lock() = Some(fps);
+            let meta = decoder.metadata();
+            if meta.frame_rate > 0.0 {
+                *shared_frame_rate.lock() = Some(meta.frame_rate);
+            }
+            if !meta.codec.is_empty() {
+                *shared_codec.lock() = Some(meta.codec.clone());
             }
             last_metadata_check = std::time::Instant::now();
         }

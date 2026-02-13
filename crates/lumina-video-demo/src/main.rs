@@ -10,38 +10,23 @@ use std::sync::mpsc;
 use lumina_video::media::{DiscoveryEvent, MoqStream, NostrDiscovery};
 
 /// Sample videos for testing: (name, video_url, subtitle_url)
+/// NOTE: Google Storage gtv-videos-bucket returns 403 as of early 2026.
+/// Using samplelib.com (plain nginx, range-request support, no Cloudflare).
 const SAMPLE_VIDEOS: &[(&str, &str, Option<&str>)] = &[
     (
-        "Big Buck Bunny (MP4)",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
+        "Sample 1080p (30s)",
+        "https://download.samplelib.com/mp4/sample-30s.mp4",
+        None,
+    ),
+    (
+        "Sample 1080p (15s)",
+        "https://download.samplelib.com/mp4/sample-15s.mp4",
+        None,
+    ),
+    (
+        "Big Buck Bunny (320p, 10min)",
+        "https://storage.googleapis.com/exoplayer-test-media-0/BigBuckBunny_320x180.mp4",
         Some("https://raw.githubusercontent.com/demuxed/big-buck-captions/main/big-buck-bunny.srt"),
-    ),
-    (
-        "Sintel (MP4)",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/Sintel.mp4",
-        Some("https://durian.blender.org/wp-content/content/subtitles/sintel_en.srt"),
-    ),
-    // Tears of Steel has dialogue - good for A/V sync testing
-    (
-        "Tears of Steel (English)",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4",
-        Some("https://download.blender.org/demo/movies/ToS/subtitles/TOS-en.srt"),
-    ),
-    // Non-Latin script subtitle tests
-    (
-        "Tears of Steel (日本語)",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4",
-        Some("https://download.blender.org/demo/movies/ToS/subtitles/TOS-JP.srt"),
-    ),
-    (
-        "Tears of Steel (中文)",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4",
-        Some("https://download.blender.org/demo/movies/ToS/subtitles/TOS-CH-traditional.srt"),
-    ),
-    (
-        "Tears of Steel (Русский)",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4",
-        Some("https://download.blender.org/demo/movies/ToS/subtitles/TOS-ru.srt"),
     ),
     (
         "Sample (MKV)",
@@ -729,14 +714,15 @@ impl eframe::App for DemoApp {
                                     ui.end_row();
 
                                     ui.label("Pixel Format:");
-                                    // Derive format info from codec name
-                                    let format = if metadata.codec.contains("h264") || metadata.codec.contains("avc") {
+                                    // Derive format info from codec name (case-insensitive)
+                                    let codec_lower = metadata.codec.to_lowercase();
+                                    let format = if codec_lower.contains("h264") || codec_lower.contains("avc") {
                                         "YUV 4:2:0 (H.264)"
-                                    } else if metadata.codec.contains("hevc") || metadata.codec.contains("h265") {
+                                    } else if codec_lower.contains("hevc") || codec_lower.contains("h265") || codec_lower.contains("hvc") {
                                         "YUV 4:2:0 (HEVC)"
-                                    } else if metadata.codec.contains("vp9") {
+                                    } else if codec_lower.contains("vp9") || codec_lower.contains("vp09") {
                                         "YUV 4:2:0 (VP9)"
-                                    } else if metadata.codec.contains("av1") {
+                                    } else if codec_lower.contains("av1") || codec_lower.contains("av01") {
                                         "YUV 4:2:0 (AV1)"
                                     } else {
                                         "YUV 4:2:0"
@@ -748,19 +734,22 @@ impl eframe::App for DemoApp {
                                     ui.label(format!("{:.2} fps", metadata.frame_rate));
                                     ui.end_row();
 
-                                    // Measured FPS (actual frames rendered)
-                                    if self.fps_tracker.has_samples() {
-                                        ui.label("Measured FPS:");
-                                        let measured = self.fps_tracker.fps();
-                                        let fps_color = if measured >= metadata.frame_rate * 0.95 {
-                                            egui::Color32::GREEN
-                                        } else if measured >= metadata.frame_rate * 0.8 {
-                                            egui::Color32::YELLOW
-                                        } else {
-                                            egui::Color32::RED
-                                        };
-                                        ui.colored_label(fps_color, format!("{:.1} fps", measured));
-                                        ui.end_row();
+                                    // Measured FPS from sync metrics (actual decoded frame rate)
+                                    {
+                                        let sync = player.sync_metrics_snapshot();
+                                        if sync.current_fps > 0.0 {
+                                            ui.label("Measured FPS:");
+                                            let measured = sync.current_fps;
+                                            let fps_color = if measured >= metadata.frame_rate * 0.95 {
+                                                egui::Color32::GREEN
+                                            } else if measured >= metadata.frame_rate * 0.8 {
+                                                egui::Color32::from_rgb(255, 140, 0)
+                                            } else {
+                                                egui::Color32::RED
+                                            };
+                                            ui.colored_label(fps_color, format!("{:.1} fps", measured));
+                                            ui.end_row();
+                                        }
                                     }
 
                                     if let Some(duration) = metadata.duration {
@@ -978,6 +967,40 @@ impl eframe::App for DemoApp {
                                     };
                                     ui.colored_label(audio_color, audio_label);
                                     ui.end_row();
+
+                                    // Ring buffer health (only when audio is running)
+                                    if matches!(moq.audio_status, lumina_video::media::MoqAudioStatus::Running) {
+                                        ui.label("Ring buffer:");
+                                        let fill_color = if moq.ring_buffer_fill_percent < 10.0 {
+                                            egui::Color32::RED
+                                        } else if moq.ring_buffer_fill_percent < 30.0 {
+                                            egui::Color32::YELLOW
+                                        } else {
+                                            egui::Color32::GREEN
+                                        };
+                                        ui.colored_label(
+                                            fill_color,
+                                            format!("{:.0}%", moq.ring_buffer_fill_percent),
+                                        );
+                                        ui.end_row();
+
+                                        if moq.ring_buffer_stall_count > 0 {
+                                            ui.label("RB stalls:");
+                                            ui.colored_label(
+                                                egui::Color32::YELLOW,
+                                                format!("{}", moq.ring_buffer_stall_count),
+                                            );
+                                            ui.end_row();
+                                        }
+                                        if moq.ring_buffer_overflow_count > 0 {
+                                            ui.label("RB overflows:");
+                                            ui.colored_label(
+                                                egui::Color32::RED,
+                                                format!("{}", moq.ring_buffer_overflow_count),
+                                            );
+                                            ui.end_row();
+                                        }
+                                    }
                                 });
                         }
 
@@ -1039,7 +1062,24 @@ impl eframe::App for DemoApp {
                                 ui.end_row();
                             });
 
-                        // Zero-Copy Status (Linux only)
+                        // Zero-Copy Status (macOS: always active via IOSurface → Metal)
+                        #[cfg(target_os = "macos")]
+                        {
+                            ui.separator();
+                            ui.heading("Zero-Copy Status");
+                            ui.horizontal(|ui| {
+                                let size = egui::Vec2::splat(12.0);
+                                let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                                let color = egui::Color32::from_rgb(0, 200, 0);
+                                ui.painter().rect_filled(rect, 2.0, color);
+                                ui.label(egui::RichText::new("Active").strong().color(color));
+                            });
+                            ui.label(egui::RichText::new(
+                                "IOSurface \u{2192} Metal texture (VideoToolbox HW decode)"
+                            ).small().weak());
+                        }
+
+                        // Zero-Copy Status (Linux: DMABuf → Vulkan with metrics)
                         #[cfg(target_os = "linux")]
                         {
                             ui.separator();

@@ -10,6 +10,7 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use super::audio::{AudioConfig, AudioHandle, AudioPlayer, AudioSamples};
+use super::audio_ring_buffer::RingBufferConfig;
 use super::moq_decoder::{MoqAudioShared, MoqAudioStatus};
 
 /// A raw encoded audio frame received from MoQ transport, ready for AAC decoding.
@@ -190,6 +191,7 @@ impl Drop for MoqAudioThread {
                 *self.audio_shared.audio_status.lock() = MoqAudioStatus::Error;
             }
         }
+        self.audio_shared.alive.store(false, Ordering::Release);
         self.audio_shared
             .internal_audio_ready
             .store(false, Ordering::Relaxed);
@@ -206,7 +208,15 @@ impl Drop for MoqAudioThread {
 /// Maximum consecutive decode errors before downgrading to `Error` status.
 const MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 100;
 
-/// Audio thread main loop: receives AAC frames, decodes via symphonia, plays via rodio.
+/// Gap detection threshold: if two consecutive frames have a PTS gap larger than
+/// this, insert silence to keep the ring buffer timeline correct.
+const GAP_THRESHOLD_US: u64 = 32_000; // 32ms
+
+/// Audio thread main loop: receives AAC frames, decodes via symphonia, writes to ring buffer.
+///
+/// Uses a single continuous `RingBufferSource` appended once to the rodio Sink,
+/// eliminating per-source transitions, resampler state resets, and queue mutex
+/// contention that caused clicks/pops in the previous batch+append approach.
 fn moq_audio_thread_main(
     audio_rx: crossbeam_channel::Receiver<MoqAudioFrame>,
     sample_rate: u32,
@@ -216,13 +226,21 @@ fn moq_audio_thread_main(
     stop_flag: Arc<AtomicBool>,
     audio_shared: Arc<MoqAudioShared>,
 ) {
-    let mut player = match AudioPlayer::new_with_handle(
-        AudioConfig::default(),
+    let ring_config = RingBufferConfig::for_format(sample_rate, channels.min(2) as u16);
+    let audio_config = AudioConfig {
+        sample_rate,
+        channels: channels.min(2) as u16,
+        ..Default::default()
+    };
+
+    let (mut player, producer) = match AudioPlayer::new_ring_buffer(
+        audio_config,
+        ring_config,
         Some(audio_handle.clone()),
     ) {
-        Ok(p) => p,
+        Ok(pair) => pair,
         Err(e) => {
-            tracing::warn!("MoQ audio: failed to create AudioPlayer: {e}");
+            tracing::warn!("MoQ audio: failed to create ring buffer AudioPlayer: {e}");
             #[cfg(target_os = "linux")]
             tracing::warn!("MoQ audio: on Linux, ensure libasound2-dev is installed and an audio device is available");
             *audio_shared.audio_status.lock() = MoqAudioStatus::Error;
@@ -253,17 +271,21 @@ fn moq_audio_thread_main(
     audio_shared
         .internal_audio_ready
         .store(true, Ordering::Relaxed);
+    audio_shared.alive.store(true, Ordering::Release);
     *audio_shared.audio_status.lock() = MoqAudioStatus::Running;
     player.play();
 
     tracing::info!(
-        "MoQ audio: thread started ({}Hz, {}ch, description={})",
+        "MoQ audio: ring buffer thread started ({}Hz, {}ch, description={})",
         sample_rate,
         channels,
         description.as_ref().map(|d| d.len()).unwrap_or(0),
     );
 
     let mut consecutive_errors: u32 = 0;
+    let mut last_pts_us: Option<u64> = None;
+    let ch = channels.min(2) as usize;
+    let mut frames_since_metrics: u32 = 0;
 
     loop {
         if stop_flag.load(Ordering::Relaxed) {
@@ -274,8 +296,48 @@ fn moq_audio_thread_main(
         match audio_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(frame) => match aac_decoder.decode_frame(&frame.data, frame.timestamp_us) {
                 Ok(samples) => {
-                    player.queue_samples(samples);
                     consecutive_errors = 0;
+
+                    // Set base PTS on first decoded frame
+                    if last_pts_us.is_none() {
+                        audio_handle.set_audio_base_pts(samples.pts);
+                        tracing::debug!(
+                            "MoQ audio: first frame base_pts={:?}, {} samples",
+                            samples.pts,
+                            samples.data.len()
+                        );
+                    }
+
+                    // Gap detection: insert silence for PTS discontinuities > 32ms
+                    if let Some(prev_pts) = last_pts_us {
+                        let expected_next = prev_pts
+                            + (samples.data.len() as u64 * 1_000_000)
+                                / (sample_rate as u64 * ch as u64);
+                        let actual = frame.timestamp_us;
+                        if actual > expected_next + GAP_THRESHOLD_US {
+                            let gap_us = actual - expected_next;
+                            let silence_samples =
+                                (gap_us as usize * sample_rate as usize * ch) / 1_000_000;
+                            let silence = vec![0.0f32; silence_samples.min(48000 * ch)]; // Cap at 1s
+                            producer.write(&silence);
+                            tracing::debug!(
+                                "MoQ audio: inserted {}ms silence ({} samples) for PTS gap",
+                                gap_us / 1000,
+                                silence_samples,
+                            );
+                        }
+                    }
+                    last_pts_us = Some(frame.timestamp_us);
+
+                    // Write decoded PCM directly to ring buffer (lock-free)
+                    producer.write(&samples.data);
+
+                    // Periodically flush ring buffer metrics for UI observability (~1/sec)
+                    frames_since_metrics += 1;
+                    if frames_since_metrics >= 50 {
+                        frames_since_metrics = 0;
+                        *audio_shared.ring_buffer_metrics.lock() = producer.metrics();
+                    }
                 }
                 Err(e) => {
                     consecutive_errors += 1;
@@ -303,6 +365,10 @@ fn moq_audio_thread_main(
         }
     }
 
+    // Drop producer before cleanup so consumer knows we're done
+    drop(producer);
+
+    audio_shared.alive.store(false, Ordering::Release);
     audio_shared
         .internal_audio_ready
         .store(false, Ordering::Relaxed);

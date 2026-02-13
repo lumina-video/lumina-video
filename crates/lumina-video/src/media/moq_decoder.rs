@@ -101,6 +101,14 @@ pub(crate) struct MoqAudioShared {
     pub moq_audio_handle: parking_lot::Mutex<Option<super::audio::AudioHandle>>,
     /// Current audio pipeline status.
     pub audio_status: parking_lot::Mutex<MoqAudioStatus>,
+    /// Liveness flag: set to `true` when audio thread starts, `false` on teardown.
+    /// Used by `VideoPlayer::poll_moq_audio_handle()` to detect stale handles
+    /// that appear "available" after the thread has been torn down.
+    pub alive: std::sync::atomic::AtomicBool,
+    /// Ring buffer metrics updated by the audio thread for observability.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+    pub ring_buffer_metrics:
+        parking_lot::Mutex<super::audio_ring_buffer::RingBufferMetrics>,
 }
 
 impl MoqAudioShared {
@@ -110,6 +118,9 @@ impl MoqAudioShared {
             internal_audio_ready: std::sync::atomic::AtomicBool::new(false),
             moq_audio_handle: parking_lot::Mutex::new(None),
             audio_status: parking_lot::Mutex::new(MoqAudioStatus::Unavailable),
+            alive: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+            ring_buffer_metrics: parking_lot::Mutex::new(Default::default()),
         }
     }
 }
@@ -148,7 +159,7 @@ pub struct MoqDecoderConfig {
     /// Size of the MoQ audio handoff buffer (in AAC frames).
     ///
     /// Higher values smooth jitter, lower values reduce latency.
-    /// Default: 60 (~1.2 s of AAC at 48 kHz / 1024-sample frames).
+    /// Default: 120 (~2.5 s of AAC at 48 kHz / 1024-sample frames).
     pub audio_buffer_capacity: usize,
 }
 
@@ -161,7 +172,7 @@ impl Default for MoqDecoderConfig {
             max_latency_ms: 500, // 500ms max latency for live streaming
             enable_audio: true,
             initial_volume: 1.0,
-            audio_buffer_capacity: 60,
+            audio_buffer_capacity: 120,
         }
     }
 }
@@ -252,6 +263,10 @@ pub struct MoqStatsSnapshot {
     pub transport_protocol: String,
     /// Current audio pipeline status.
     pub audio_status: MoqAudioStatus,
+    /// Ring buffer health metrics (fill level, stall/overflow counts).
+    pub ring_buffer_fill_percent: f32,
+    pub ring_buffer_stall_count: u64,
+    pub ring_buffer_overflow_count: u64,
 }
 
 /// Handle to MoQ shared state for producing snapshots.
@@ -264,8 +279,48 @@ pub struct MoqStatsHandle {
 }
 
 impl MoqStatsHandle {
+    /// Returns the MoQ audio handle if available and alive.
+    ///
+    /// Used by `VideoPlayer::poll_moq_audio_handle()` for late binding:
+    /// the MoQ audio thread creates its handle asynchronously, so it's not
+    /// available at `check_init_complete()` time.
+    pub fn audio_handle(&self) -> Option<super::audio::AudioHandle> {
+        if !self
+            .shared
+            .audio
+            .alive
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return None;
+        }
+        self.shared.audio.moq_audio_handle.lock().clone()
+    }
+
+    /// Returns whether the MoQ audio thread is alive.
+    pub fn is_audio_alive(&self) -> bool {
+        self.shared
+            .audio
+            .alive
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn snapshot(&self) -> MoqStatsSnapshot {
         let metadata = self.shared.metadata.lock().clone();
+
+        // Read ring buffer metrics (only on desktop platforms where audio is decoded)
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+        let (rb_fill, rb_stalls, rb_overflows) = {
+            let m = self.shared.audio.ring_buffer_metrics.lock();
+            let fill_pct = if m.capacity_samples > 0 {
+                m.fill_samples as f32 / m.capacity_samples as f32 * 100.0
+            } else {
+                0.0
+            };
+            (fill_pct, m.stall_count, m.overflow_count)
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+        let (rb_fill, rb_stalls, rb_overflows) = (0.0, 0, 0);
+
         MoqStatsSnapshot {
             state: *self.shared.state.lock(),
             error_message: self.shared.error_message.lock().clone(),
@@ -278,6 +333,9 @@ impl MoqStatsHandle {
             has_codec_description: self.shared.codec_description.lock().is_some(),
             transport_protocol: self.shared.transport_protocol.lock().clone(),
             audio_status: *self.shared.audio.audio_status.lock(),
+            ring_buffer_fill_percent: rb_fill,
+            ring_buffer_stall_count: rb_stalls,
+            ring_buffer_overflow_count: rb_overflows,
         }
     }
 }

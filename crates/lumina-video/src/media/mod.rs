@@ -35,6 +35,11 @@ pub mod android_video;
 #[cfg(target_os = "android")]
 pub mod android_vulkan;
 pub mod audio;
+#[cfg(all(
+    feature = "moq",
+    any(target_os = "macos", target_os = "linux", target_os = "android")
+))]
+pub(crate) mod audio_ring_buffer;
 #[cfg(target_os = "macos")]
 pub mod audio_decoder;
 #[cfg(not(target_arch = "wasm32"))]
