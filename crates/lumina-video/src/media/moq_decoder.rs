@@ -87,8 +87,6 @@ pub enum MoqAudioStatus {
     Unavailable,
     /// Track subscribed, audio thread spawning.
     Starting,
-    /// Pre-buffering audio frames, waiting for first video decode.
-    Buffering,
     /// Decoding and playing audio.
     Running,
     /// Initialisation or sustained runtime failure.
@@ -106,11 +104,13 @@ pub(crate) struct MoqAudioShared {
     pub moq_audio_handle: parking_lot::Mutex<Option<super::audio::AudioHandle>>,
     /// Current audio pipeline status.
     pub audio_status: parking_lot::Mutex<MoqAudioStatus>,
-    /// Set to true by decoder on first successful video decode.
-    /// Audio pre-buffer waits for this before starting playback.
-    pub video_started: std::sync::atomic::AtomicBool,
-    /// Count of LiveEdgeSender live-edge eviction events (pressure telemetry).
-    pub audio_live_edge_evictions: AtomicU64,
+    /// Liveness flag: set to `true` when audio thread starts, `false` on teardown.
+    /// Used by `VideoPlayer::poll_moq_audio_handle()` to detect stale handles
+    /// that appear "available" after the thread has been torn down.
+    pub alive: std::sync::atomic::AtomicBool,
+    /// Ring buffer metrics updated by the audio thread for observability.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+    pub ring_buffer_metrics: parking_lot::Mutex<super::audio_ring_buffer::RingBufferMetrics>,
 }
 
 impl MoqAudioShared {
@@ -120,8 +120,9 @@ impl MoqAudioShared {
             internal_audio_ready: std::sync::atomic::AtomicBool::new(false),
             moq_audio_handle: parking_lot::Mutex::new(None),
             audio_status: parking_lot::Mutex::new(MoqAudioStatus::Unavailable),
-            video_started: std::sync::atomic::AtomicBool::new(false),
-            audio_live_edge_evictions: AtomicU64::new(0),
+            alive: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+            ring_buffer_metrics: parking_lot::Mutex::new(Default::default()),
         }
     }
 }
@@ -160,7 +161,7 @@ pub struct MoqDecoderConfig {
     /// Size of the MoQ audio handoff buffer (in AAC frames).
     ///
     /// Higher values smooth jitter, lower values reduce latency.
-    /// Default: 60 (~1.2 s of AAC at 48 kHz / 1024-sample frames).
+    /// Default: 120 (~2.5 s of AAC at 48 kHz / 1024-sample frames).
     pub audio_buffer_capacity: usize,
 }
 
@@ -173,7 +174,7 @@ impl Default for MoqDecoderConfig {
             max_latency_ms: 500, // 500ms max latency for live streaming
             enable_audio: true,
             initial_volume: 1.0,
-            audio_buffer_capacity: 180, // ~3.8s at 48kHz; absorbs group-boundary burst delivery
+            audio_buffer_capacity: 120,
         }
     }
 }
@@ -274,8 +275,10 @@ pub struct MoqStatsSnapshot {
     pub transport_protocol: String,
     /// Current audio pipeline status.
     pub audio_status: MoqAudioStatus,
-    /// Count of LiveEdgeSender live-edge eviction events.
-    pub audio_live_edge_evictions: u64,
+    /// Ring buffer health metrics (fill level, stall/overflow counts).
+    pub ring_buffer_fill_percent: f32,
+    pub ring_buffer_stall_count: u64,
+    pub ring_buffer_overflow_count: u64,
 }
 
 /// Handle to MoQ shared state for producing snapshots.
@@ -288,8 +291,35 @@ pub struct MoqStatsHandle {
 }
 
 impl MoqStatsHandle {
+    /// Returns the MoQ audio handle if available and alive.
+    ///
+    /// Used by `VideoPlayer::poll_moq_audio_handle()` for late binding.
+    pub fn audio_handle(&self) -> Option<super::audio::AudioHandle> {
+        if !self.shared.audio.alive.load(Ordering::Acquire) {
+            return None;
+        }
+        self.shared.audio.moq_audio_handle.lock().clone()
+    }
+
+    /// Returns whether the MoQ audio thread is alive.
+    pub fn is_audio_alive(&self) -> bool {
+        self.shared.audio.alive.load(Ordering::Acquire)
+    }
+
     pub fn snapshot(&self) -> MoqStatsSnapshot {
         let metadata = self.shared.metadata.lock().clone();
+
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+        let rb_metrics = self.shared.audio.ring_buffer_metrics.lock().clone();
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+        let rb_metrics = super::audio_ring_buffer::RingBufferMetrics::default();
+
+        let fill_pct = if rb_metrics.capacity_samples > 0 {
+            rb_metrics.fill_samples as f32 * 100.0 / rb_metrics.capacity_samples as f32
+        } else {
+            0.0
+        };
+
         MoqStatsSnapshot {
             state: *self.shared.state.lock(),
             error_message: self.shared.error_message.lock().clone(),
@@ -302,11 +332,9 @@ impl MoqStatsHandle {
             has_codec_description: self.shared.codec_description.lock().is_some(),
             transport_protocol: self.shared.transport_protocol.lock().clone(),
             audio_status: *self.shared.audio.audio_status.lock(),
-            audio_live_edge_evictions: self
-                .shared
-                .audio
-                .audio_live_edge_evictions
-                .load(Ordering::Relaxed),
+            ring_buffer_fill_percent: fill_pct,
+            ring_buffer_stall_count: rb_metrics.stall_count,
+            ring_buffer_overflow_count: rb_metrics.overflow_count,
         }
     }
 }
@@ -340,11 +368,8 @@ pub(crate) struct MoqSharedState {
 }
 
 impl MoqSharedState {
-    pub(crate) fn new(enable_audio: bool) -> Self {
+    pub(crate) fn new() -> Self {
         let audio = Arc::new(MoqAudioShared::new());
-        if enable_audio {
-            *audio.moq_audio_handle.lock() = Some(super::audio::AudioHandle::new());
-        }
         Self {
             state: Mutex::new(MoqDecoderState::Disconnected),
             error_message: Mutex::new(None),
@@ -570,7 +595,7 @@ impl MoqDecoder {
         };
 
         // Create shared state
-        let shared = Arc::new(MoqSharedState::new(config.enable_audio));
+        let shared = Arc::new(MoqSharedState::new());
 
         // Create channel for frames (bounded to limit memory usage)
         let (frame_tx, frame_rx) = async_channel::bounded(30);
@@ -1912,13 +1937,6 @@ impl VideoDecoderBackend for MoqDecoder {
                 // Decode the frame
                 match self.decode_frame(&moq_frame) {
                     Ok(frame) => {
-                        // Signal audio that video decode has succeeded
-                        let _ = self.shared.audio.video_started.compare_exchange(
-                            false,
-                            true,
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                        );
                         // Track frame rendered
                         self.shared
                             .frame_stats
@@ -1996,7 +2014,10 @@ impl VideoDecoderBackend for MoqDecoder {
     }
 
     fn handles_audio_internally(&self) -> bool {
-        self.shared.audio.moq_audio_handle.lock().is_some()
+        self.shared
+            .audio
+            .internal_audio_ready
+            .load(Ordering::Relaxed)
     }
 
     fn audio_handle(&self) -> Option<super::audio::AudioHandle> {
@@ -3367,7 +3388,7 @@ pub mod android {
                 }
             };
 
-            let shared = Arc::new(MoqSharedState::new(config.enable_audio));
+            let shared = Arc::new(MoqSharedState::new());
             let (nal_tx, nal_rx) = async_channel::bounded(60); // Larger buffer for NAL units
 
             // Generate unique player ID for frame queue isolation
@@ -3740,13 +3761,6 @@ pub mod android {
 
             // Return next decoded frame if available
             if let Some(frame) = self.pending_frames.pop_front() {
-                // Signal audio that video decode has succeeded
-                let _ = self.shared.audio.video_started.compare_exchange(
-                    false,
-                    true,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                );
                 return Ok(Some(self.convert_to_video_frame(frame)));
             }
 
@@ -3780,7 +3794,10 @@ pub mod android {
         }
 
         fn handles_audio_internally(&self) -> bool {
-            self.shared.audio.moq_audio_handle.lock().is_some()
+            self.shared
+                .audio
+                .internal_audio_ready
+                .load(Ordering::Relaxed)
         }
 
         fn audio_handle(&self) -> Option<super::audio::AudioHandle> {
@@ -3983,7 +4000,7 @@ impl MoqGStreamerDecoder {
         };
 
         // Create shared state
-        let shared = Arc::new(MoqSharedState::new(config.enable_audio));
+        let shared = Arc::new(MoqSharedState::new());
 
         // Create channel for NAL units (bounded to limit memory usage)
         let (nal_tx, nal_rx) = async_channel::bounded(60);
@@ -4619,17 +4636,7 @@ impl VideoDecoderBackend for MoqGStreamerDecoder {
         }
 
         // Pull decoded frame from appsink
-        let result = self.pull_decoded_frame();
-        if let Ok(Some(_)) = &result {
-            // Signal audio that video decode has succeeded
-            let _ = self.shared.audio.video_started.compare_exchange(
-                false,
-                true,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            );
-        }
-        result
+        self.pull_decoded_frame()
     }
 
     fn seek(&mut self, _position: Duration) -> Result<(), VideoError> {
@@ -4661,7 +4668,10 @@ impl VideoDecoderBackend for MoqGStreamerDecoder {
     }
 
     fn handles_audio_internally(&self) -> bool {
-        self.shared.audio.moq_audio_handle.lock().is_some()
+        self.shared
+            .audio
+            .internal_audio_ready
+            .load(Ordering::Relaxed)
     }
 
     fn audio_handle(&self) -> Option<super::audio::AudioHandle> {
@@ -4707,7 +4717,7 @@ mod tests {
 
     #[test]
     fn test_shared_state() {
-        let shared = MoqSharedState::new(false);
+        let shared = MoqSharedState::new();
         assert_eq!(*shared.state.lock(), MoqDecoderState::Disconnected);
         assert!(!shared.eof_reached.load(Ordering::Relaxed));
 

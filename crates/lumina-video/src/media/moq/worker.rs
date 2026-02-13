@@ -23,7 +23,6 @@ use moq_native::ClientConfig;
 use crate::media::moq::MoqUrl;
 use crate::media::moq_audio::{
     select_preferred_audio_rendition, ChannelClosed, LiveEdgeSender, MoqAudioFrame, MoqAudioThread,
-    SendResult,
 };
 use crate::media::moq_decoder::{
     MoqAudioStatus, MoqDecoder, MoqDecoderConfig, MoqDecoderState, MoqSharedState, MoqVideoFrame,
@@ -250,13 +249,10 @@ struct CatalogResult {
 /// before they reach the channel, so the decoder gate starves and cannot clear.
 #[allow(clippy::too_many_arguments)]
 async fn resubscribe_video_track(
-    shared: &Arc<MoqSharedState>,
+    _shared: &Arc<MoqSharedState>,
     moq_broadcast: &moq_lite::BroadcastConsumer,
     video_track: &moq_lite::Track,
     max_latency: Duration,
-    audio_track_for_resub: &Option<moq_lite::Track>,
-    audio_consumer_opt: &mut Option<hang::container::OrderedConsumer>,
-    moq_audio_thread_opt: &Option<MoqAudioThread>,
     video_consumer: &mut hang::container::OrderedConsumer,
     idr_gate_enabled: bool,
     waiting_for_valid_idr: &mut bool,
@@ -318,21 +314,7 @@ async fn resubscribe_video_track(
         max_latency,
     );
 
-    // Re-subscribe audio only if the audio thread is still alive.
-    if audio_consumer_opt.is_none() && moq_audio_thread_opt.is_some() {
-        if let Some(at) = audio_track_for_resub.as_ref() {
-            *audio_consumer_opt = Some(hang::container::OrderedConsumer::new(
-                moq_broadcast.subscribe_track(at),
-                max_latency,
-            ));
-            tracing::info!("MoQ {}: Audio track re-subscribed", label);
-        }
-    } else if audio_consumer_opt.is_none() {
-        tracing::warn!(
-            "MoQ {}: Audio thread not alive, skipping audio re-subscribe",
-            label,
-        );
-    }
+    // Audio runs in its own dedicated task and is not re-subscribed here.
 
     // Reset startup gate and A/V startup sync — but NOT for decoder recovery.
     //
@@ -345,7 +327,6 @@ async fn resubscribe_video_track(
         *waiting_for_valid_idr = true;
         *idr_gate_groups_seen = 0;
         *idr_gate_start = None;
-        shared.audio.video_started.store(false, Ordering::Relaxed);
     } else if idr_gate_enabled {
         tracing::info!(
             "MoQ {}: Skipping worker IDR gate reset (reason={}, decoder has its own gate)",
@@ -404,14 +385,6 @@ pub(crate) async fn run_moq_worker(
     shared.buffering_percent.store(50, Ordering::Relaxed);
 
     // -- Phase 3: Fetch and validate catalog --
-
-    // Reset session state for audio coordination
-    shared.audio.video_started.store(false, Ordering::Relaxed);
-    shared
-        .audio
-        .audio_live_edge_evictions
-        .store(0, Ordering::Relaxed);
-
     let cat = fetch_and_validate_catalog(&moq_broadcast, &shared, &config, label).await?;
 
     // -- Phase 4: Subscribe to video track --
@@ -425,7 +398,7 @@ pub(crate) async fn run_moq_worker(
     );
 
     // -- Phase 5: Audio setup --
-    let (mut audio_consumer_opt, audio_sender_opt, mut moq_audio_thread_opt) = setup_audio(
+    let (audio_consumer_opt, audio_sender_opt, mut moq_audio_thread_opt) = setup_audio(
         &cat.catalog,
         &moq_broadcast,
         cat.max_latency,
@@ -434,14 +407,46 @@ pub(crate) async fn run_moq_worker(
         label,
     );
 
-    // Determine audio track for potential re-subscribe (when stream loops)
-    let audio_track_for_resub: Option<moq_lite::Track> = if audio_consumer_opt.is_some() {
-        select_preferred_audio_rendition(&cat.catalog).map(|(name, _)| moq_lite::Track {
-            name: name.to_string(),
-            priority: 2,
-        })
-    } else {
-        None
+    // -- Phase 5.5: Spawn dedicated audio forwarding task --
+    //
+    // IMPORTANT: OrderedConsumer::read() (hang crate) is NOT cancellation-safe —
+    // its internal read_unbuffered() has two await points (next_frame + read_chunks).
+    // If tokio::select! cancels the future between them, the frame is consumed from
+    // QUIC but never returned → lost. Running audio in the shared select! loop
+    // caused ~50% audio frame loss (25 fps instead of 47 fps).
+    //
+    // Fix: audio gets its own task so read() is never cancelled.
+    let audio_task = match (audio_consumer_opt, audio_sender_opt) {
+        (Some(mut audio_consumer), Some(audio_sender)) => {
+            let label_owned = label.to_string();
+            Some(tokio::spawn(async move {
+                let mut buf = BytesMut::with_capacity(4096);
+                loop {
+                    match audio_consumer.read().await {
+                        Ok(Some(frame)) => {
+                            let data = assemble_payload(&frame.payload, &mut buf);
+                            let moq_frame = MoqAudioFrame {
+                                timestamp_us: frame.timestamp.as_micros() as u64,
+                                data,
+                            };
+                            if let Err(ChannelClosed) = audio_sender.send(moq_frame) {
+                                tracing::warn!("MoQ {}: Audio channel closed", label_owned);
+                                break;
+                            }
+                        }
+                        Ok(None) => {
+                            tracing::info!("MoQ {}: Audio track ended", label_owned);
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!("MoQ {}: Audio read error: {e}", label_owned);
+                            break;
+                        }
+                    }
+                }
+            }))
+        }
+        _ => None,
     };
 
     // -- Phase 5b: Frame dump hook (diagnostic, env-gated) --
@@ -476,9 +481,6 @@ pub(crate) async fn run_moq_worker(
         Duration::from_secs(MOQ_STARTUP_HARD_FAILSAFE_SECS);
     let mut idr_gate_start: Option<std::time::Instant> = None;
 
-    // Note: video_started is set by the decoder on first successful decode,
-    // NOT here. This ensures audio only starts after a confirmed good frame.
-
     // -- Phase 6: Streaming --
     shared.set_state(MoqDecoderState::Streaming);
     shared.buffering_percent.store(100, Ordering::Relaxed);
@@ -492,8 +494,6 @@ pub(crate) async fn run_moq_worker(
 
     // Pre-allocate reusable buffers to avoid per-frame allocation
     let mut video_buf = BytesMut::with_capacity(256 * 1024);
-    let mut audio_buf = BytesMut::with_capacity(4096);
-
     let mut stats_log_counter = 0u64;
     let mut resubscribe_count: u32 = 0;
     let mut recent_resubscribes: VecDeque<Instant> = VecDeque::with_capacity(8);
@@ -532,9 +532,6 @@ pub(crate) async fn run_moq_worker(
                                 &moq_broadcast,
                                 &video_track,
                                 cat.max_latency,
-                                &audio_track_for_resub,
-                                &mut audio_consumer_opt,
-                                &moq_audio_thread_opt,
                                 &mut video_consumer,
                                 idr_gate_enabled,
                                 &mut waiting_for_valid_idr,
@@ -665,9 +662,6 @@ pub(crate) async fn run_moq_worker(
                                         &moq_broadcast,
                                         &video_track,
                                         cat.max_latency,
-                                        &audio_track_for_resub,
-                                        &mut audio_consumer_opt,
-                                        &moq_audio_thread_opt,
                                         &mut video_consumer,
                                         idr_gate_enabled,
                                         &mut waiting_for_valid_idr,
@@ -731,9 +725,6 @@ pub(crate) async fn run_moq_worker(
                             &moq_broadcast,
                             &video_track,
                             cat.max_latency,
-                            &audio_track_for_resub,
-                            &mut audio_consumer_opt,
-                            &moq_audio_thread_opt,
                             &mut video_consumer,
                             idr_gate_enabled,
                             &mut waiting_for_valid_idr,
@@ -778,9 +769,6 @@ pub(crate) async fn run_moq_worker(
                     &moq_broadcast,
                     &video_track,
                     cat.max_latency,
-                    &audio_track_for_resub,
-                    &mut audio_consumer_opt,
-                    &moq_audio_thread_opt,
                     &mut video_consumer,
                     idr_gate_enabled,
                     &mut waiting_for_valid_idr,
@@ -803,52 +791,17 @@ pub(crate) async fn run_moq_worker(
                 video_deadline = tokio::time::Instant::now() + READ_FRAME_TIMEOUT;
                 continue;
             }
-            audio_result = async {
-                if let Some(consumer) = audio_consumer_opt.as_mut() {
-                    consumer.read().await
-                } else {
-                    std::future::pending().await
-                }
-            } => {
-                if let Some(ref audio_sender) = audio_sender_opt {
-                    match audio_result {
-                        Ok(Some(frame)) => {
-                            let data = assemble_payload(&frame.payload, &mut audio_buf);
-                            let moq_frame = MoqAudioFrame {
-                                timestamp_us: frame.timestamp.as_micros() as u64,
-                                data,
-                            };
-                            match audio_sender.send(moq_frame) {
-                                Ok(SendResult::Dropped) => {
-                                    shared
-                                        .audio
-                                        .audio_live_edge_evictions
-                                        .fetch_add(1, Ordering::Relaxed);
-                                }
-                                Err(ChannelClosed) => {
-                                    tracing::warn!("MoQ {}: Audio channel closed", label);
-                                    audio_consumer_opt = None;
-                                }
-                                _ => {}
-                            }
-                        }
-                        Ok(None) => {
-                            tracing::info!("MoQ {}: Audio track ended", label);
-                            audio_consumer_opt = None;
-                        }
-                        Err(e) => {
-                            tracing::warn!("MoQ {}: Audio read error: {e}", label);
-                            audio_consumer_opt = None;
-                        }
-                    }
-                }
-            }
         }
     }
 
     // -- Phase 7: Teardown --
+    // Abort the dedicated audio task before tearing down the audio thread
+    if let Some(task) = audio_task {
+        task.abort();
+        let _ = task.await;
+    }
     teardown_audio(
-        audio_sender_opt,
+        None, // sender was moved into the audio task
         moq_audio_thread_opt.take(),
         &shared,
         label,
@@ -1387,7 +1340,7 @@ async fn teardown_audio(
     drop(audio_sender);
     {
         let mut status = shared.audio.audio_status.lock();
-        if *status == MoqAudioStatus::Starting || *status == MoqAudioStatus::Buffering {
+        if *status == MoqAudioStatus::Starting {
             *status = MoqAudioStatus::Unavailable;
         }
     }
@@ -1412,6 +1365,10 @@ async fn teardown_audio(
             .audio
             .internal_audio_ready
             .store(false, Ordering::Relaxed);
+        shared_for_teardown
+            .audio
+            .alive
+            .store(false, Ordering::Release);
         if let Some(handle) = shared_for_teardown.audio.moq_audio_handle.lock().as_ref() {
             handle.set_available(false);
             handle.clear_playback_epoch();
@@ -1420,10 +1377,7 @@ async fn teardown_audio(
         }
         {
             let mut status = shared_for_teardown.audio.audio_status.lock();
-            if *status == MoqAudioStatus::Running
-                || *status == MoqAudioStatus::Starting
-                || *status == MoqAudioStatus::Buffering
-            {
+            if *status == MoqAudioStatus::Running || *status == MoqAudioStatus::Starting {
                 *status = MoqAudioStatus::Unavailable;
             }
         }

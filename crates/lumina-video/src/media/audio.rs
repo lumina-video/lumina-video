@@ -732,6 +732,183 @@ mod rodio_impl {
             self.handle.reset_samples_played();
             self.handle.clear_audio_base_pts();
         }
+
+        /// Creates a new audio player backed by a ring buffer for continuous MoQ playback.
+        ///
+        /// Returns `(AudioPlayer, RingBufferProducer)` — the caller writes decoded PCM
+        /// samples to the producer; the player's single `RingBufferSource` reads from
+        /// the consumer, never exhausting and never triggering rodio Source transitions.
+        #[cfg(feature = "moq")]
+        pub fn new_ring_buffer(
+            config: AudioConfig,
+            ring_config: crate::media::audio_ring_buffer::RingBufferConfig,
+            external_handle: Option<AudioHandle>,
+        ) -> Result<(Self, crate::media::audio_ring_buffer::RingBufferProducer), String> {
+            // Create audio output stream (same as new_with_handle)
+            #[cfg(target_os = "linux")]
+            let stream = OutputStreamBuilder::from_default_device()
+                .map(|b| b.with_buffer_size(rodio::cpal::BufferSize::Fixed(1024)))
+                .and_then(|b| b.open_stream_or_fallback())
+                .or_else(|e| {
+                    tracing::warn!("Audio: explicit buffer setup failed ({e}), trying default");
+                    OutputStreamBuilder::open_default_stream()
+                })
+                .map_err(|e| format!("Failed to create audio output: {e}"))?;
+
+            #[cfg(not(target_os = "linux"))]
+            let stream = OutputStreamBuilder::open_default_stream()
+                .map_err(|e| format!("Failed to create audio output: {e}"))?;
+
+            let device_sample_rate = stream.config().sample_rate();
+            tracing::info!(
+                "Audio device sample rate: {}Hz (ring buffer mode)",
+                device_sample_rate
+            );
+
+            let handle = external_handle.unwrap_or_default();
+            handle.set_available(true);
+            handle.set_audio_format(config.sample_rate, config.channels as u32);
+
+            let sink = Sink::connect_new(stream.mixer());
+            sink.pause(); // Start paused
+
+            // Create ring buffer and source
+            let (producer, consumer) =
+                crate::media::audio_ring_buffer::audio_ring_buffer(ring_config);
+            let source = RingBufferSource::new(
+                consumer,
+                handle.clone(),
+                config.sample_rate,
+                config.channels,
+            );
+
+            // Append the single continuous source — never exhausts, no transitions
+            sink.append(source);
+
+            tracing::info!(
+                "Audio player initialized in ring buffer mode ({}Hz, {}ch, device={}Hz)",
+                config.sample_rate,
+                config.channels,
+                device_sample_rate,
+            );
+
+            let player = Self {
+                handle,
+                _stream: stream,
+                sink: Arc::new(Mutex::new(sink)),
+                state: AudioState::Paused,
+                device_sample_rate,
+                initial_pts: None,
+            };
+
+            Ok((player, producer))
+        }
+    }
+
+    // ========================================================================
+    // Ring buffer rodio Source (continuous, never exhausts)
+    // ========================================================================
+
+    /// A rodio `Source` backed by a ring buffer consumer.
+    ///
+    /// Always returns `Some(f32)` — returns silence (0.0) when the buffer is empty
+    /// or in stall mode. This prevents rodio from treating the source as exhausted,
+    /// which would trigger a Source transition and resampler state reset.
+    #[cfg(feature = "moq")]
+    struct RingBufferSource {
+        consumer: crate::media::audio_ring_buffer::RingBufferConsumer,
+        handle: AudioHandle,
+        sample_rate: u32,
+        channels: u16,
+        /// Pending samples not yet flushed to atomic counter (batched counting)
+        pending: u64,
+    }
+
+    #[cfg(feature = "moq")]
+    impl RingBufferSource {
+        fn new(
+            consumer: crate::media::audio_ring_buffer::RingBufferConsumer,
+            handle: AudioHandle,
+            sample_rate: u32,
+            channels: u16,
+        ) -> Self {
+            Self {
+                consumer,
+                handle,
+                sample_rate,
+                channels,
+                pending: 0,
+            }
+        }
+
+        #[inline]
+        fn flush_if_needed(&mut self) {
+            if self.pending >= FLUSH_SAMPLES {
+                let n = self.pending;
+                self.pending = 0;
+                self.handle.add_samples_played(n);
+            }
+        }
+    }
+
+    #[cfg(feature = "moq")]
+    impl Iterator for RingBufferSource {
+        type Item = f32;
+
+        #[inline]
+        fn next(&mut self) -> Option<f32> {
+            match self.consumer.read_sample() {
+                Some(sample) => {
+                    // Apply volume scaling on the real-time thread
+                    let vol = self.handle.effective_volume();
+                    self.pending += 1;
+                    self.flush_if_needed();
+                    Some(sample * vol)
+                }
+                None => {
+                    // Return silence — never return None (never exhaust)
+                    Some(0.0)
+                }
+            }
+        }
+
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            // Unknown/infinite — (0, None) is the standard "don't know" answer.
+            (0, None)
+        }
+    }
+
+    #[cfg(feature = "moq")]
+    impl rodio::Source for RingBufferSource {
+        fn current_span_len(&self) -> Option<usize> {
+            // No bounded span — rodio won't plan transitions
+            None
+        }
+
+        #[inline]
+        fn channels(&self) -> u16 {
+            self.channels
+        }
+
+        #[inline]
+        fn sample_rate(&self) -> u32 {
+            self.sample_rate
+        }
+
+        #[inline]
+        fn total_duration(&self) -> Option<Duration> {
+            // None = infinite/live source
+            None
+        }
+    }
+
+    #[cfg(feature = "moq")]
+    impl Drop for RingBufferSource {
+        fn drop(&mut self) {
+            if self.pending != 0 {
+                self.handle.add_samples_played(self.pending);
+            }
+        }
     }
 }
 

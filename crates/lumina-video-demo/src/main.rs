@@ -979,11 +979,25 @@ impl eframe::App for DemoApp {
                                         );
                                         ui.end_row();
                                     }
-                                    if moq.audio_live_edge_evictions > 0 {
-                                        ui.label("Audio evictions:");
+                                    // Ring buffer metrics
+                                    if moq.ring_buffer_fill_percent > 0.0 {
+                                        ui.label("Ring buffer:");
+                                        let fill_color = if moq.ring_buffer_fill_percent > 90.0 {
+                                            egui::Color32::from_rgb(255, 140, 0)
+                                        } else {
+                                            egui::Color32::GREEN
+                                        };
+                                        ui.colored_label(
+                                            fill_color,
+                                            format!("{:.0}%", moq.ring_buffer_fill_percent),
+                                        );
+                                        ui.end_row();
+                                    }
+                                    if moq.ring_buffer_overflow_count > 0 {
+                                        ui.label("RB overflows:");
                                         ui.colored_label(
                                             egui::Color32::from_rgb(255, 140, 0),
-                                            format!("{}", moq.audio_live_edge_evictions),
+                                            format!("{}", moq.ring_buffer_overflow_count),
                                         );
                                         ui.end_row();
                                     }
@@ -996,9 +1010,6 @@ impl eframe::App for DemoApp {
                                         }
                                         lumina_video::media::MoqAudioStatus::Starting => {
                                             ("Starting...", egui::Color32::YELLOW)
-                                        }
-                                        lumina_video::media::MoqAudioStatus::Buffering => {
-                                            ("Buffering...", egui::Color32::YELLOW)
                                         }
                                         lumina_video::media::MoqAudioStatus::Running => {
                                             ("Running", egui::Color32::GREEN)
