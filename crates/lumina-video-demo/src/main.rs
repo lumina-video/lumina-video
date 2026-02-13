@@ -77,8 +77,10 @@ fn get_moq_test_streams() -> Vec<(String, String)> {
 
 /// Known MoQ relay endpoints for manual entry
 const MOQ_RELAYS: &[(&str, &str)] = &[
+    ("localhost", "moq://localhost:4443/anon"),
     ("cdn.moq.dev (anon)", "moqs://cdn.moq.dev:443/anon"),
     ("cdn.moq.dev", "moqs://cdn.moq.dev:443"),
+    ("localhost (anon)", "moq://localhost:4443/anon"),
     (
         "Cloudflare (interop)",
         "moqs://interop-relay.cloudflare.mediaoverquic.com:443",
@@ -470,7 +472,10 @@ impl eframe::App for DemoApp {
         // Top panel with controls
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("lumina-video Demo");
+                ui.heading(format!(
+                    "lumina-video Demo  [{}]",
+                    option_env!("LUMINA_BUILD_ID").unwrap_or("dev")
+                ));
                 ui.separator();
 
                 // Source type selector
@@ -754,7 +759,7 @@ impl eframe::App for DemoApp {
                                         let fps_color = if measured >= metadata.frame_rate * 0.95 {
                                             egui::Color32::GREEN
                                         } else if measured >= metadata.frame_rate * 0.8 {
-                                            egui::Color32::YELLOW
+                                            egui::Color32::from_rgb(255, 165, 0) // orange
                                         } else {
                                             egui::Color32::RED
                                         };
@@ -950,11 +955,49 @@ impl eframe::App for DemoApp {
                                         );
                                         ui.end_row();
                                     }
+                                    if fs.dropped_dpb_grace > 0 {
+                                        ui.label("DPB Grace:");
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(255, 200, 100),
+                                            format!("{}", fs.dropped_dpb_grace),
+                                        );
+                                        ui.end_row();
+                                    }
+                                    if fs.skipped_startup_frames > 0 {
+                                        ui.label("Skip (startup):");
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(255, 140, 0),
+                                            format!("{}", fs.skipped_startup_frames),
+                                        );
+                                        ui.end_row();
+                                    }
                                     if fs.decode_errors > 0 {
                                         ui.label("Decode errors:");
                                         ui.colored_label(
                                             egui::Color32::RED,
                                             format!("{}", fs.decode_errors),
+                                        );
+                                        ui.end_row();
+                                    }
+                                    // Ring buffer metrics
+                                    if moq.ring_buffer_fill_percent > 0.0 {
+                                        ui.label("Ring buffer:");
+                                        let fill_color = if moq.ring_buffer_fill_percent > 90.0 {
+                                            egui::Color32::from_rgb(255, 140, 0)
+                                        } else {
+                                            egui::Color32::GREEN
+                                        };
+                                        ui.colored_label(
+                                            fill_color,
+                                            format!("{:.0}%", moq.ring_buffer_fill_percent),
+                                        );
+                                        ui.end_row();
+                                    }
+                                    if moq.ring_buffer_overflow_count > 0 {
+                                        ui.label("RB overflows:");
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(255, 140, 0),
+                                            format!("{}", moq.ring_buffer_overflow_count),
                                         );
                                         ui.end_row();
                                     }

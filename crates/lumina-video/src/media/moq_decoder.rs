@@ -48,6 +48,8 @@
 //! - `seek()` returns an error (live streams don't support seeking)
 //! - `is_eof()` returns true only when the stream actually ends
 
+#[cfg(target_os = "macos")]
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,6 +71,10 @@ use tokio::runtime::Handle;
 // macOS-specific imports for VTDecompressionSession zero-copy
 #[cfg(target_os = "macos")]
 use super::video::MacOSGpuSurface;
+
+/// Hard failsafe timeout for startup gating (seconds). Used by worker IDR gate
+/// (directly) and audio pre-buffer (derived as +1s). Single source of truth.
+pub(crate) const MOQ_STARTUP_HARD_FAILSAFE_SECS: u64 = 10;
 
 /// Audio pipeline lifecycle state.
 ///
@@ -98,6 +104,13 @@ pub(crate) struct MoqAudioShared {
     pub moq_audio_handle: parking_lot::Mutex<Option<super::audio::AudioHandle>>,
     /// Current audio pipeline status.
     pub audio_status: parking_lot::Mutex<MoqAudioStatus>,
+    /// Liveness flag: set to `true` when audio thread starts, `false` on teardown.
+    /// Used by `VideoPlayer::poll_moq_audio_handle()` to detect stale handles
+    /// that appear "available" after the thread has been torn down.
+    pub alive: std::sync::atomic::AtomicBool,
+    /// Ring buffer metrics updated by the audio thread for observability.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+    pub ring_buffer_metrics: parking_lot::Mutex<super::audio_ring_buffer::RingBufferMetrics>,
 }
 
 impl MoqAudioShared {
@@ -107,6 +120,9 @@ impl MoqAudioShared {
             internal_audio_ready: std::sync::atomic::AtomicBool::new(false),
             moq_audio_handle: parking_lot::Mutex::new(None),
             audio_status: parking_lot::Mutex::new(MoqAudioStatus::Unavailable),
+            alive: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+            ring_buffer_metrics: parking_lot::Mutex::new(Default::default()),
         }
     }
 }
@@ -145,7 +161,7 @@ pub struct MoqDecoderConfig {
     /// Size of the MoQ audio handoff buffer (in AAC frames).
     ///
     /// Higher values smooth jitter, lower values reduce latency.
-    /// Default: 60 (~1.2 s of AAC at 48 kHz / 1024-sample frames).
+    /// Default: 120 (~2.5 s of AAC at 48 kHz / 1024-sample frames).
     pub audio_buffer_capacity: usize,
 }
 
@@ -158,7 +174,7 @@ impl Default for MoqDecoderConfig {
             max_latency_ms: 500, // 500ms max latency for live streaming
             enable_audio: true,
             initial_volume: 1.0,
-            audio_buffer_capacity: 60,
+            audio_buffer_capacity: 120,
         }
     }
 }
@@ -183,6 +199,8 @@ pub(crate) struct FrameStats {
     pub(crate) dropped_backpressure: AtomicU64,
     /// Frames dropped waiting for IDR
     pub(crate) dropped_waiting_idr: AtomicU64,
+    /// Frames skipped by startup IDR gate (before first valid IDR)
+    pub(crate) skipped_startup_frames: AtomicU64,
     /// Frames passed to VT decoder
     pub(crate) submitted_to_decoder: AtomicU64,
     /// Frames decoded successfully (VT callback)
@@ -191,6 +209,8 @@ pub(crate) struct FrameStats {
     pub(crate) rendered: AtomicU64,
     /// Decode errors
     pub(crate) decode_errors: AtomicU64,
+    /// Frames dropped during DPB grace (after isolated VT callback error)
+    pub(crate) dropped_dpb_grace: AtomicU64,
 }
 
 impl FrameStats {
@@ -198,14 +218,16 @@ impl FrameStats {
         let received = self.received.load(Ordering::Relaxed);
         let dropped_bp = self.dropped_backpressure.load(Ordering::Relaxed);
         let dropped_idr = self.dropped_waiting_idr.load(Ordering::Relaxed);
+        let skipped_startup = self.skipped_startup_frames.load(Ordering::Relaxed);
         let submitted = self.submitted_to_decoder.load(Ordering::Relaxed);
         let decoded = self.decoded.load(Ordering::Relaxed);
         let rendered = self.rendered.load(Ordering::Relaxed);
         let errors = self.decode_errors.load(Ordering::Relaxed);
+        let dropped_dpb = self.dropped_dpb_grace.load(Ordering::Relaxed);
 
         tracing::info!(
-            "MoQ FrameStats [{}]: recv={}, drop_bp={}, drop_idr={}, submit={}, decoded={}, rendered={}, errors={}",
-            label, received, dropped_bp, dropped_idr, submitted, decoded, rendered, errors
+            "MoQ FrameStats [{}]: recv={}, drop_bp={}, drop_idr={}, drop_dpb={}, skip_startup={}, submit={}, decoded={}, rendered={}, errors={}",
+            label, received, dropped_bp, dropped_idr, dropped_dpb, skipped_startup, submitted, decoded, rendered, errors
         );
     }
 
@@ -214,10 +236,12 @@ impl FrameStats {
             received: self.received.load(Ordering::Relaxed),
             dropped_backpressure: self.dropped_backpressure.load(Ordering::Relaxed),
             dropped_waiting_idr: self.dropped_waiting_idr.load(Ordering::Relaxed),
+            skipped_startup_frames: self.skipped_startup_frames.load(Ordering::Relaxed),
             submitted_to_decoder: self.submitted_to_decoder.load(Ordering::Relaxed),
             decoded: self.decoded.load(Ordering::Relaxed),
             rendered: self.rendered.load(Ordering::Relaxed),
             decode_errors: self.decode_errors.load(Ordering::Relaxed),
+            dropped_dpb_grace: self.dropped_dpb_grace.load(Ordering::Relaxed),
         }
     }
 }
@@ -228,10 +252,12 @@ pub struct MoqFrameStatsSnapshot {
     pub received: u64,
     pub dropped_backpressure: u64,
     pub dropped_waiting_idr: u64,
+    pub skipped_startup_frames: u64,
     pub submitted_to_decoder: u64,
     pub decoded: u64,
     pub rendered: u64,
     pub decode_errors: u64,
+    pub dropped_dpb_grace: u64,
 }
 
 /// Point-in-time snapshot of all MoQ decoder stats for UI display.
@@ -249,6 +275,10 @@ pub struct MoqStatsSnapshot {
     pub transport_protocol: String,
     /// Current audio pipeline status.
     pub audio_status: MoqAudioStatus,
+    /// Ring buffer health metrics (fill level, stall/overflow counts).
+    pub ring_buffer_fill_percent: f32,
+    pub ring_buffer_stall_count: u64,
+    pub ring_buffer_overflow_count: u64,
 }
 
 /// Handle to MoQ shared state for producing snapshots.
@@ -261,8 +291,38 @@ pub struct MoqStatsHandle {
 }
 
 impl MoqStatsHandle {
+    /// Returns the MoQ audio handle if available and alive.
+    ///
+    /// Used by `VideoPlayer::poll_moq_audio_handle()` for late binding.
+    pub fn audio_handle(&self) -> Option<super::audio::AudioHandle> {
+        if !self.shared.audio.alive.load(Ordering::Acquire) {
+            return None;
+        }
+        self.shared.audio.moq_audio_handle.lock().clone()
+    }
+
+    /// Returns whether the MoQ audio thread is alive.
+    pub fn is_audio_alive(&self) -> bool {
+        self.shared.audio.alive.load(Ordering::Acquire)
+    }
+
     pub fn snapshot(&self) -> MoqStatsSnapshot {
         let metadata = self.shared.metadata.lock().clone();
+
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+        let (ring_buffer_fill_percent, ring_buffer_stall_count, ring_buffer_overflow_count) = {
+            let rb = self.shared.audio.ring_buffer_metrics.lock().clone();
+            let fill_pct = if rb.capacity_samples > 0 {
+                rb.fill_samples as f32 * 100.0 / rb.capacity_samples as f32
+            } else {
+                0.0
+            };
+            (fill_pct, rb.stall_count, rb.overflow_count)
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+        let (ring_buffer_fill_percent, ring_buffer_stall_count, ring_buffer_overflow_count) =
+            (0.0f32, 0u64, 0u64);
+
         MoqStatsSnapshot {
             state: *self.shared.state.lock(),
             error_message: self.shared.error_message.lock().clone(),
@@ -275,6 +335,9 @@ impl MoqStatsHandle {
             has_codec_description: self.shared.codec_description.lock().is_some(),
             transport_protocol: self.shared.transport_protocol.lock().clone(),
             audio_status: *self.shared.audio.audio_status.lock(),
+            ring_buffer_fill_percent,
+            ring_buffer_stall_count,
+            ring_buffer_overflow_count,
         }
     }
 }
@@ -302,10 +365,14 @@ pub(crate) struct MoqSharedState {
     /// Audio-specific shared state, passed to MoqAudioThread on desktop.
     /// Present on all platforms (non-desktop stays Unavailable).
     pub(crate) audio: Arc<MoqAudioShared>,
+    /// Decoder sets this when it is starved waiting for an IDR after decode errors.
+    /// Worker handles it by re-subscribing the video track.
+    pub(crate) request_video_resubscribe: AtomicBool,
 }
 
 impl MoqSharedState {
     pub(crate) fn new() -> Self {
+        let audio = Arc::new(MoqAudioShared::new());
         Self {
             state: Mutex::new(MoqDecoderState::Disconnected),
             error_message: Mutex::new(None),
@@ -324,7 +391,8 @@ impl MoqSharedState {
             codec_description: Mutex::new(None),
             frame_stats: FrameStats::default(),
             transport_protocol: Mutex::new("unknown".to_string()),
-            audio: Arc::new(MoqAudioShared::new()),
+            audio,
+            request_video_resubscribe: AtomicBool::new(false),
         }
     }
 
@@ -387,9 +455,112 @@ pub struct MoqDecoder {
     /// H.264 AVCC NAL length field size (1, 2, or 4 bytes), from avcC.
     #[cfg(target_os = "macos")]
     h264_nal_length_size: usize,
-    /// True after a decode error; decoder must wait for next IDR to resync.
+    /// True if stream is AVCC format (from catalog avcC). Used for correct NAL
+    /// parsing in `find_nal_types_for_format`, avoiding the `data_is_annex_b`
+    /// heuristic which misclassifies 256-511 byte NALs.
+    #[cfg(target_os = "macos")]
+    is_avcc: bool,
+    /// True after 3+ consecutive decode errors; decoder must wait for next IDR
+    /// to resync. Cleared only when a real IDR (NAL type 5) arrives.
+    /// The VT session is destroyed on sustained decode failures.
     #[cfg(target_os = "macos")]
     waiting_for_idr_after_error: bool,
+    /// Consecutive decode error count. Isolated errors (1-2) skip the frame but
+    /// keep the VT session alive. At 3+ consecutive errors, the session is
+    /// destroyed and `waiting_for_idr_after_error` is set. Reset to 0 on
+    /// successful decode or IDR resync.
+    #[cfg(target_os = "macos")]
+    consecutive_decode_errors: u32,
+    /// Lightweight DPB grace: skip non-IDR frames after an isolated VT callback
+    /// error (consecutive_decode_errors == 1 only). Bypasses note_idr_wait_progress()
+    /// to avoid premature resubscribe. Bounded by timeout/drop budget;
+    /// on expiry, escalates to waiting_for_idr_after_error for normal recovery.
+    #[cfg(target_os = "macos")]
+    skip_pframes_until_idr: bool,
+    #[cfg(target_os = "macos")]
+    dpb_grace_started_at: Option<std::time::Instant>,
+    #[cfg(target_os = "macos")]
+    dpb_grace_dropped_frames: u32,
+    /// Observed real-IDR cadence (EMA, microseconds). Used to adapt DPB grace
+    /// timeout/drop budget to stream cadence instead of fixed constants.
+    #[cfg(target_os = "macos")]
+    observed_idr_interval_us: Option<u64>,
+    /// Last seen real-IDR PTS (microseconds) for cadence estimation.
+    #[cfg(target_os = "macos")]
+    last_idr_pts_us: Option<u64>,
+    /// Strict recovery gate: after VT session recreation for recovery, only
+    /// allow non-IDR frames once a real IDR decodes successfully on the fresh
+    /// session.
+    #[cfg(target_os = "macos")]
+    require_clean_idr_after_recreate: bool,
+    /// True until the one-shot VT session recreation has fired.
+    #[cfg(target_os = "macos")]
+    needs_session_recreation: bool,
+    /// If set, defer VT session (re)creation until this instant.
+    /// This avoids blocking sleeps on decode paths while still enforcing
+    /// a quiesce window after session destruction.
+    #[cfg(target_os = "macos")]
+    quiesce_until: Option<std::time::Instant>,
+    /// Counts VT session creations for lifecycle diagnostics.
+    #[cfg(target_os = "macos")]
+    vt_session_count: u32,
+    /// Opt-in diagnostics for frame-level forensic logging around decode errors.
+    #[cfg(target_os = "macos")]
+    forensic_enabled: bool,
+    /// Rolling window of most-recent submitted frames (for N-3 context on failure).
+    #[cfg(target_os = "macos")]
+    forensic_recent: VecDeque<ForensicFrameSample>,
+    /// Active post-error capture window (+3 frames after failing frame).
+    #[cfg(target_os = "macos")]
+    forensic_post_error: Option<PostErrorCapture>,
+    /// Monotonic frame sequence number for forensic logs.
+    #[cfg(target_os = "macos")]
+    forensic_seq: u64,
+    /// Approximate group index, incremented on keyframe boundaries.
+    #[cfg(target_os = "macos")]
+    forensic_group_index: u64,
+    /// Start of current "waiting for IDR" starvation window.
+    #[cfg(target_os = "macos")]
+    idr_wait_started_at: Option<std::time::Instant>,
+    /// Number of frames dropped in current IDR starvation window.
+    #[cfg(target_os = "macos")]
+    idr_wait_dropped_frames: u32,
+    /// Number of keyframe boundaries seen that still lacked a real IDR while
+    /// waiting for IDR recovery.
+    #[cfg(target_os = "macos")]
+    idr_wait_broken_keyframe_boundaries: u8,
+    /// Last time a decoder-side video re-subscribe request was emitted.
+    /// Used to prevent rapid request churn when stream metadata is unstable.
+    #[cfg(target_os = "macos")]
+    idr_last_resubscribe_request_at: Option<std::time::Instant>,
+    /// Start of the current RequiredFrameDropped storm-cycle window.
+    #[cfg(target_os = "macos")]
+    required_drop_window_started_at: Option<std::time::Instant>,
+    /// Number of storm cycles observed in the current window.
+    #[cfg(target_os = "macos")]
+    required_drop_storms_in_window: u8,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+struct ForensicFrameSample {
+    seq: u64,
+    group_idx: u64,
+    pts_us: u64,
+    size: usize,
+    is_keyframe: bool,
+    hash64: u64,
+    first16: [u8; 16],
+    first16_len: usize,
+    nal_types: [u8; MoqDecoder::MAX_NAL_TYPES],
+    nal_count: usize,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+struct PostErrorCapture {
+    trigger_seq: u64,
+    remaining_after: u8,
 }
 
 impl MoqDecoder {
@@ -449,6 +620,10 @@ impl MoqDecoder {
         });
 
         let initial_volume = config.initial_volume;
+        #[cfg(target_os = "macos")]
+        let forensic_enabled = std::env::var("LUMINA_MOQ_ERROR_FORENSICS")
+            .map(|v| v != "0")
+            .unwrap_or(false);
         Ok(Self {
             url: moq_url,
             config,
@@ -478,7 +653,51 @@ impl MoqDecoder {
             #[cfg(target_os = "macos")]
             h264_nal_length_size: 4,
             #[cfg(target_os = "macos")]
+            is_avcc: false, // updated when VT session is created from catalog avcC
+            #[cfg(target_os = "macos")]
             waiting_for_idr_after_error: false,
+            #[cfg(target_os = "macos")]
+            consecutive_decode_errors: 0,
+            #[cfg(target_os = "macos")]
+            skip_pframes_until_idr: false,
+            #[cfg(target_os = "macos")]
+            dpb_grace_started_at: None,
+            #[cfg(target_os = "macos")]
+            dpb_grace_dropped_frames: 0,
+            #[cfg(target_os = "macos")]
+            observed_idr_interval_us: None,
+            #[cfg(target_os = "macos")]
+            last_idr_pts_us: None,
+            #[cfg(target_os = "macos")]
+            require_clean_idr_after_recreate: false,
+            #[cfg(target_os = "macos")]
+            needs_session_recreation: true,
+            #[cfg(target_os = "macos")]
+            quiesce_until: None,
+            #[cfg(target_os = "macos")]
+            vt_session_count: 0,
+            #[cfg(target_os = "macos")]
+            forensic_enabled,
+            #[cfg(target_os = "macos")]
+            forensic_recent: VecDeque::with_capacity(8),
+            #[cfg(target_os = "macos")]
+            forensic_post_error: None,
+            #[cfg(target_os = "macos")]
+            forensic_seq: 0,
+            #[cfg(target_os = "macos")]
+            forensic_group_index: 0,
+            #[cfg(target_os = "macos")]
+            idr_wait_started_at: None,
+            #[cfg(target_os = "macos")]
+            idr_wait_dropped_frames: 0,
+            #[cfg(target_os = "macos")]
+            idr_wait_broken_keyframe_boundaries: 0,
+            #[cfg(target_os = "macos")]
+            idr_last_resubscribe_request_at: None,
+            #[cfg(target_os = "macos")]
+            required_drop_window_started_at: None,
+            #[cfg(target_os = "macos")]
+            required_drop_storms_in_window: 0,
         })
     }
 
@@ -532,55 +751,492 @@ impl MoqDecoder {
         self.shared.audio_info.lock().clone()
     }
 
-    /// Checks if AVCC data contains an IDR frame (H.264 NAL type 5).
-    /// The hang crate's is_keyframe flag can be wrong when joining mid-stream.
-    /// AVCC sample may contain multiple NAL units (SPS/PPS/AUD before IDR),
-    /// so we iterate all NALs and return true if any is type 5. The NAL length
-    /// prefix size comes from avcC (lengthSizeMinusOne + 1).
+    /// Checks if data contains an IDR frame (H.264 NAL type 5).
+    ///
+    /// Auto-detects Annex B (start codes) vs AVCC (length-prefixed) format.
+    /// The hang crate's is_keyframe flag can be wrong when joining mid-stream,
+    /// so we parse actual NAL types. Returns true if any NAL is type 5.
     #[allow(dead_code)]
     fn is_idr_frame(nal_data: &[u8], nal_length_size: usize) -> bool {
-        if !(1..=4).contains(&nal_length_size) {
-            return false;
-        }
-        let mut offset = 0usize;
-        while offset + nal_length_size <= nal_data.len() {
-            let mut nal_len = 0usize;
-            for i in 0..nal_length_size {
-                nal_len = (nal_len << 8) | nal_data[offset + i] as usize;
-            }
-            offset += nal_length_size;
-            if nal_len == 0 || offset + nal_len > nal_data.len() {
-                break;
-            }
-            let nal_type = nal_data[offset] & 0x1F;
-            if nal_type == 5 {
-                return true;
-            }
-            offset += nal_len;
-        }
-        false
+        let (types, count) = Self::find_nal_types(nal_data, nal_length_size);
+        types[..count].contains(&5)
     }
 
-    /// Gets the NAL type from AVCC data for logging.
+    /// Gets the first NAL type from data for logging.
     #[allow(dead_code)]
     fn get_nal_type(nal_data: &[u8], nal_length_size: usize) -> u8 {
-        if !(1..=4).contains(&nal_length_size) {
-            return 0;
-        }
-        if nal_data.len() > nal_length_size {
-            nal_data[nal_length_size] & 0x1F
+        let (types, count) = Self::find_nal_types(nal_data, nal_length_size);
+        if count > 0 {
+            types[0]
         } else {
             0
         }
     }
 
+    /// Max NAL units we track per sample (AUD + SPS + PPS + SEI + IDR + spare).
+    const MAX_NAL_TYPES: usize = 8;
+
+    /// Returns all NAL types found in data, using known format context.
+    ///
+    /// When `is_avcc` is known from catalog/init context, use this to avoid
+    /// the `data_is_annex_b()` heuristic which misclassifies AVCC frames
+    /// whose first NAL is 256-511 bytes (length prefix `[0,0,1,X]` looks
+    /// like an Annex B start code).
+    pub(crate) fn find_nal_types_for_format(
+        nal_data: &[u8],
+        nal_length_size: usize,
+        is_avcc: bool,
+    ) -> ([u8; Self::MAX_NAL_TYPES], usize) {
+        if is_avcc {
+            Self::find_nal_types_avcc(nal_data, nal_length_size)
+        } else {
+            Self::find_nal_types_annex_b(nal_data)
+        }
+    }
+
+    /// Returns all NAL types found in data, auto-detecting Annex B vs AVCC format.
+    ///
+    /// WARNING: The heuristic `data_is_annex_b()` misclassifies AVCC frames whose
+    /// first NAL is 256-511 bytes. Prefer `find_nal_types_for_format()` when the
+    /// format is known from catalog context.
+    pub(crate) fn find_nal_types(
+        nal_data: &[u8],
+        nal_length_size: usize,
+    ) -> ([u8; Self::MAX_NAL_TYPES], usize) {
+        if Self::data_is_annex_b(nal_data) {
+            Self::find_nal_types_annex_b(nal_data)
+        } else {
+            Self::find_nal_types_avcc(nal_data, nal_length_size)
+        }
+    }
+
+    /// Check if data starts with Annex B start codes.
+    ///
+    /// WARNING: This is a heuristic that can produce false positives for AVCC data
+    /// where the first NAL length is 256-511 bytes (prefix `[0,0,1,X]`).
+    pub(crate) fn data_is_annex_b(data: &[u8]) -> bool {
+        matches!(data, [0, 0, 0, 1, ..] | [0, 0, 1, ..])
+    }
+
+    /// Extract NAL types from Annex B bitstream (start-code delimited).
+    fn find_nal_types_annex_b(data: &[u8]) -> ([u8; Self::MAX_NAL_TYPES], usize) {
+        let mut types = [0u8; Self::MAX_NAL_TYPES];
+        let mut count = 0;
+        let mut i = 0;
+        while i < data.len() && count < Self::MAX_NAL_TYPES {
+            let sc_len = if data.get(i..i + 4) == Some(&[0, 0, 0, 1]) {
+                4
+            } else if data.get(i..i + 3) == Some(&[0, 0, 1]) {
+                3
+            } else {
+                i += 1;
+                continue;
+            };
+            let nal_start = i + sc_len;
+            if let Some(&byte) = data.get(nal_start) {
+                types[count] = byte & 0x1F;
+                count += 1;
+            }
+            i = nal_start + 1;
+        }
+        (types, count)
+    }
+
+    /// Extract NAL types from AVCC data (length-prefixed).
+    fn find_nal_types_avcc(
+        nal_data: &[u8],
+        nal_length_size: usize,
+    ) -> ([u8; Self::MAX_NAL_TYPES], usize) {
+        let mut types = [0u8; Self::MAX_NAL_TYPES];
+        let mut count = 0;
+        if !(1..=4).contains(&nal_length_size) {
+            return (types, count);
+        }
+        let mut offset = 0usize;
+        while offset + nal_length_size <= nal_data.len() && count < Self::MAX_NAL_TYPES {
+            let len_bytes = match nal_data.get(offset..offset + nal_length_size) {
+                Some(b) => b,
+                None => break,
+            };
+            let mut nal_len = 0usize;
+            for &byte in len_bytes {
+                nal_len = (nal_len << 8) | byte as usize;
+            }
+            offset += nal_length_size;
+            if nal_len == 0 || offset + nal_len > nal_data.len() {
+                break;
+            }
+            types[count] = match nal_data.get(offset) {
+                Some(&b) => b & 0x1F,
+                None => break,
+            };
+            count += 1;
+            offset += nal_len;
+        }
+        (types, count)
+    }
+
     /// Returns true if frame should be skipped while waiting for an IDR resync.
+    /// Only accepts real IDR (NAL type 5) as valid resync point. I-frames (NAL type 1
+    /// with is_keyframe=true) cannot initialize a fresh VT session because they need
+    /// existing DPB reference frames.
     #[cfg(target_os = "macos")]
     fn should_wait_for_idr(&self, moq_frame: &MoqVideoFrame) -> bool {
         if !self.waiting_for_idr_after_error {
             return false;
         }
-        !Self::is_idr_frame(&moq_frame.data, self.h264_nal_length_size)
+        let (types, count) = Self::find_nal_types_for_format(
+            &moq_frame.data,
+            self.h264_nal_length_size,
+            self.is_avcc,
+        );
+        let is_idr = types[..count].contains(&5);
+        !is_idr // only real IDR can clear the resync gate
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fnv1a64(data: &[u8]) -> u64 {
+        // Deterministic lightweight fingerprint for cross-run frame matching.
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for &b in data {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+
+    #[cfg(target_os = "macos")]
+    fn record_forensic_sample(&mut self, moq_frame: &MoqVideoFrame, nal_types: &[u8]) {
+        if !self.forensic_enabled {
+            return;
+        }
+
+        if moq_frame.is_keyframe {
+            self.forensic_group_index = self.forensic_group_index.saturating_add(1);
+        }
+        self.forensic_seq = self.forensic_seq.saturating_add(1);
+
+        let mut first16 = [0u8; 16];
+        let first16_len = moq_frame.data.len().min(16);
+        first16[..first16_len].copy_from_slice(&moq_frame.data[..first16_len]);
+
+        let mut nal_arr = [0u8; Self::MAX_NAL_TYPES];
+        let nal_count = nal_types.len().min(Self::MAX_NAL_TYPES);
+        nal_arr[..nal_count].copy_from_slice(&nal_types[..nal_count]);
+
+        let sample = ForensicFrameSample {
+            seq: self.forensic_seq,
+            group_idx: self.forensic_group_index,
+            pts_us: moq_frame.timestamp_us,
+            size: moq_frame.data.len(),
+            is_keyframe: moq_frame.is_keyframe,
+            hash64: Self::fnv1a64(&moq_frame.data),
+            first16,
+            first16_len,
+            nal_types: nal_arr,
+            nal_count,
+        };
+
+        if self.forensic_recent.len() == 8 {
+            let _ = self.forensic_recent.pop_front();
+        }
+        self.forensic_recent.push_back(sample);
+
+        if let Some(mut post) = self.forensic_post_error {
+            if sample.seq > post.trigger_seq && post.remaining_after > 0 {
+                tracing::warn!(
+                    "MoQ forensic post-error +{}: seq={}, group≈{}, pts={}us, size={}, keyframe={}, hash64={:016x}, nal_types={:?}, first16={:02x?}",
+                    (4 - post.remaining_after) as usize,
+                    sample.seq,
+                    sample.group_idx,
+                    sample.pts_us,
+                    sample.size,
+                    sample.is_keyframe,
+                    sample.hash64,
+                    &sample.nal_types[..sample.nal_count],
+                    &sample.first16[..sample.first16_len]
+                );
+                post.remaining_after -= 1;
+                if post.remaining_after == 0 {
+                    tracing::warn!("MoQ forensic: post-error window capture complete");
+                    self.forensic_post_error = None;
+                } else {
+                    self.forensic_post_error = Some(post);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn log_forensic_error_window(&mut self) {
+        if !self.forensic_enabled {
+            return;
+        }
+        let Some(failing) = self.forensic_recent.back().copied() else {
+            return;
+        };
+
+        tracing::warn!(
+            "MoQ forensic trigger: seq={}, group≈{}, pts={}us, size={}, keyframe={}, hash64={:016x}, nal_types={:?}, first16={:02x?}",
+            failing.seq,
+            failing.group_idx,
+            failing.pts_us,
+            failing.size,
+            failing.is_keyframe,
+            failing.hash64,
+            &failing.nal_types[..failing.nal_count],
+            &failing.first16[..failing.first16_len]
+        );
+
+        for sample in self.forensic_recent.iter().rev().skip(1).take(3).rev() {
+            tracing::warn!(
+                "MoQ forensic pre-error: seq={}, group≈{}, pts={}us, size={}, keyframe={}, hash64={:016x}, nal_types={:?}, first16={:02x?}",
+                sample.seq,
+                sample.group_idx,
+                sample.pts_us,
+                sample.size,
+                sample.is_keyframe,
+                sample.hash64,
+                &sample.nal_types[..sample.nal_count],
+                &sample.first16[..sample.first16_len]
+            );
+        }
+
+        self.forensic_post_error = Some(PostErrorCapture {
+            trigger_seq: failing.seq,
+            remaining_after: 3,
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reset_idr_wait_tracking(&mut self) {
+        self.idr_wait_started_at = None;
+        self.idr_wait_dropped_frames = 0;
+        self.idr_wait_broken_keyframe_boundaries = 0;
+    }
+
+    /// Ensure a VTDecompressionSession exists, creating one if needed.
+    ///
+    /// Tries catalog avcC description first, falls back to keyframe SPS/PPS
+    /// extraction. Respects quiesce window after session destruction.
+    #[cfg(target_os = "macos")]
+    fn ensure_vt_session(&mut self, moq_frame: &MoqVideoFrame) -> Result<(), VideoError> {
+        if self.vt_decoder.is_some() {
+            return Ok(());
+        }
+
+        // Enforce non-blocking quiesce window after session destruction
+        if let Some(quiesce_until) = self.quiesce_until {
+            let now = std::time::Instant::now();
+            if now < quiesce_until {
+                return Err(VideoError::DecodeFailed(
+                    "Waiting for VT quiesce".to_string(),
+                ));
+            }
+            self.quiesce_until = None;
+            tracing::info!("MoQ: VT quiesce window complete, creating new session");
+        }
+
+        let metadata = self.shared.metadata.lock().clone();
+
+        // First, try to use codec description from catalog (avcC/hvcC box)
+        if let Some(ref desc) = *self.shared.codec_description.lock() {
+            match Self::parse_avcc_box(desc) {
+                Ok((sps, pps, nal_length_size)) => {
+                    let decoder = macos_vt::VTDecoder::new_h264(
+                        &sps,
+                        &pps,
+                        metadata.width,
+                        metadata.height,
+                        true, // catalog avcC = AVCC format
+                    )?;
+                    self.vt_decoder = Some(decoder);
+                    self.h264_nal_length_size = nal_length_size;
+                    self.is_avcc = true;
+                    self.vt_session_count += 1;
+                    tracing::info!("MoQ: initialized VTDecoder session #{} from catalog avcC ({} bytes SPS, {} bytes PPS, NAL len size {})", self.vt_session_count, sps.len(), pps.len(), nal_length_size);
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!("MoQ: failed to parse avcC from catalog: {}", e);
+                }
+            }
+        }
+
+        // Fallback: extract SPS/PPS from keyframe
+        if !moq_frame.is_keyframe {
+            tracing::debug!("MoQ: waiting for keyframe to initialize VTDecoder");
+            return Err(VideoError::DecodeFailed(
+                "Waiting for keyframe with SPS/PPS".to_string(),
+            ));
+        }
+
+        match Self::extract_h264_params(&moq_frame.data) {
+            Ok((sps, pps)) => {
+                let decoder = macos_vt::VTDecoder::new_h264(
+                    &sps,
+                    &pps,
+                    metadata.width,
+                    metadata.height,
+                    false, // keyframe extraction = Annex B format
+                )?;
+                self.vt_decoder = Some(decoder);
+                self.h264_nal_length_size = 4;
+                self.vt_session_count += 1;
+                tracing::info!(
+                    "MoQ: initialized VTDecoder session #{} from keyframe SPS/PPS (Annex B)",
+                    self.vt_session_count
+                );
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!("MoQ: failed to extract H.264 params: {}", e);
+                Err(e)
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn request_video_resubscribe_with_cooldown(&mut self) -> bool {
+        const RESUBSCRIBE_REQUEST_COOLDOWN: Duration = Duration::from_millis(800);
+        let now = std::time::Instant::now();
+        if let Some(last) = self.idr_last_resubscribe_request_at {
+            if now.saturating_duration_since(last) < RESUBSCRIBE_REQUEST_COOLDOWN {
+                return false;
+            }
+        }
+        if self
+            .shared
+            .request_video_resubscribe
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.idr_last_resubscribe_request_at = Some(now);
+            return true;
+        }
+        false
+    }
+
+    #[cfg(target_os = "macos")]
+    fn note_idr_wait_progress(&mut self, nal_type: u8, frame_len: usize, is_keyframe: bool) {
+        // Keep recovery bounded: if a real IDR doesn't arrive quickly, force
+        // re-subscribe so we can rejoin on a fresh group boundary.
+        const IDR_WAIT_MAX: Duration = Duration::from_millis(1000);
+        const IDR_WAIT_MAX_DROPS: u32 = 24;
+        const BROKEN_KEYFRAME_BOUNDARY_THRESHOLD: u8 = 3;
+
+        let start = match self.idr_wait_started_at {
+            Some(start) => start,
+            None => {
+                let now = std::time::Instant::now();
+                self.idr_wait_started_at = Some(now);
+                now
+            }
+        };
+        self.idr_wait_dropped_frames = self.idr_wait_dropped_frames.saturating_add(1);
+
+        // Metadata keyframe without a real IDR is common in degenerate groups.
+        // Do not immediately re-subscribe on a single boundary; require a
+        // short sequence of broken boundaries to avoid churn.
+        let broken_keyframe_boundary = is_keyframe && nal_type != 5;
+        if broken_keyframe_boundary {
+            self.idr_wait_broken_keyframe_boundaries =
+                self.idr_wait_broken_keyframe_boundaries.saturating_add(1);
+            if self.idr_wait_broken_keyframe_boundaries >= BROKEN_KEYFRAME_BOUNDARY_THRESHOLD
+                && self.request_video_resubscribe_with_cooldown()
+            {
+                tracing::warn!(
+                    "MoQ: repeated keyframe boundaries without IDR (count={}, nal_type={}, {} bytes) — requesting video re-subscribe",
+                    self.idr_wait_broken_keyframe_boundaries,
+                    nal_type,
+                    frame_len
+                );
+                self.idr_wait_started_at = Some(std::time::Instant::now());
+                self.idr_wait_dropped_frames = 0;
+                self.idr_wait_broken_keyframe_boundaries = 0;
+                return;
+            }
+        }
+
+        let elapsed = start.elapsed();
+        if elapsed < IDR_WAIT_MAX && self.idr_wait_dropped_frames < IDR_WAIT_MAX_DROPS {
+            return;
+        }
+
+        if self.request_video_resubscribe_with_cooldown() {
+            tracing::warn!(
+                "MoQ: IDR starvation ({}ms, {} dropped, broken_keyframes={}, last_nal_type={}, {} bytes) — requesting video re-subscribe",
+                elapsed.as_millis(),
+                self.idr_wait_dropped_frames,
+                self.idr_wait_broken_keyframe_boundaries,
+                nal_type,
+                frame_len
+            );
+        }
+
+        // Keep reporting at a bounded cadence if starvation persists.
+        self.idr_wait_started_at = Some(std::time::Instant::now());
+        self.idr_wait_dropped_frames = 0;
+        self.idr_wait_broken_keyframe_boundaries = 0;
+    }
+
+    #[cfg(target_os = "macos")]
+    fn note_required_drop_storm_cycle(&mut self) -> u8 {
+        const STORM_ESCALATION_WINDOW: Duration = Duration::from_millis(4500);
+
+        let now = std::time::Instant::now();
+        match self.required_drop_window_started_at {
+            Some(start) if now.saturating_duration_since(start) <= STORM_ESCALATION_WINDOW => {
+                self.required_drop_storms_in_window =
+                    self.required_drop_storms_in_window.saturating_add(1);
+            }
+            _ => {
+                self.required_drop_window_started_at = Some(now);
+                self.required_drop_storms_in_window = 1;
+            }
+        }
+        self.required_drop_storms_in_window
+    }
+
+    #[cfg(target_os = "macos")]
+    fn note_real_idr_timestamp(&mut self, pts_us: u64) {
+        // Ignore clearly invalid cadence deltas.
+        const MIN_IDR_INTERVAL_US: u64 = 300_000;
+        const MAX_IDR_INTERVAL_US: u64 = 8_000_000;
+
+        if let Some(prev_pts) = self.last_idr_pts_us {
+            let delta_us = pts_us.saturating_sub(prev_pts);
+            if (MIN_IDR_INTERVAL_US..=MAX_IDR_INTERVAL_US).contains(&delta_us) {
+                self.observed_idr_interval_us = Some(match self.observed_idr_interval_us {
+                    // Smooth noisy group boundaries while still adapting.
+                    Some(current) => ((current * 3) + delta_us) / 4,
+                    None => delta_us,
+                });
+            }
+        }
+        self.last_idr_pts_us = Some(pts_us);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn dpb_grace_budget(&self) -> (Duration, u32) {
+        // Base timeout from observed IDR cadence + margin for jitter/bursting.
+        let observed_us = self.observed_idr_interval_us.unwrap_or(2_000_000);
+        let timeout_us = observed_us.saturating_add(900_000);
+        let timeout_us = timeout_us.clamp(2_500_000, 5_000_000);
+        let timeout = Duration::from_micros(timeout_us);
+
+        let fps = if self.cached_metadata.frame_rate.is_finite()
+            && self.cached_metadata.frame_rate > 1.0
+        {
+            self.cached_metadata.frame_rate as f64
+        } else {
+            24.0
+        };
+        let max_drops = ((timeout.as_secs_f64() * fps).ceil() as u32)
+            .saturating_add(8)
+            .clamp(60, 180);
+
+        (timeout, max_drops)
     }
 
     /// Decodes an encoded frame.
@@ -589,63 +1245,18 @@ impl MoqDecoder {
     /// On other platforms, returns a placeholder (FFmpeg integration TODO).
     #[cfg(target_os = "macos")]
     fn decode_frame(&mut self, moq_frame: &MoqVideoFrame) -> Result<VideoFrame, VideoError> {
-        // Initialize VTDecoder lazily
-        if self.vt_decoder.is_none() {
-            let metadata = self.shared.metadata.lock().clone();
-
-            // First, try to use codec description from catalog (avcC/hvcC box)
-            if let Some(ref desc) = *self.shared.codec_description.lock() {
-                match Self::parse_avcc_box(desc) {
-                    Ok((sps, pps, nal_length_size)) => {
-                        let decoder = macos_vt::VTDecoder::new_h264(
-                            &sps,
-                            &pps,
-                            metadata.width,
-                            metadata.height,
-                        )?;
-                        self.vt_decoder = Some(decoder);
-                        self.h264_nal_length_size = nal_length_size;
-                        tracing::info!("MoQ: initialized VTDecoder from catalog avcC ({} bytes SPS, {} bytes PPS, NAL len size {})", sps.len(), pps.len(), nal_length_size);
-                    }
-                    Err(e) => {
-                        tracing::warn!("MoQ: failed to parse avcC from catalog: {}", e);
-                    }
-                }
-            }
-
-            // If still no decoder, try extracting SPS/PPS from keyframe
-            if self.vt_decoder.is_none() {
-                if !moq_frame.is_keyframe {
-                    tracing::debug!("MoQ: waiting for keyframe to initialize VTDecoder");
-                    return Err(VideoError::DecodeFailed(
-                        "Waiting for keyframe with SPS/PPS".to_string(),
-                    ));
-                }
-
-                // Try to extract SPS/PPS from the keyframe data
-                match Self::extract_h264_params(&moq_frame.data) {
-                    Ok((sps, pps)) => {
-                        let decoder = macos_vt::VTDecoder::new_h264(
-                            &sps,
-                            &pps,
-                            metadata.width,
-                            metadata.height,
-                        )?;
-                        self.vt_decoder = Some(decoder);
-                        self.h264_nal_length_size = 4; // Default for Annex B extraction
-                        tracing::info!("MoQ: initialized VTDecoder from keyframe SPS/PPS");
-                    }
-                    Err(e) => {
-                        tracing::warn!("MoQ: failed to extract H.264 params: {}", e);
-                        return Err(e);
-                    }
-                }
-            }
-        }
+        // Initialize VTDecoder lazily (creates from catalog avcC or keyframe SPS/PPS)
+        self.ensure_vt_session(moq_frame)?;
 
         // Check if we're waiting for IDR resync after a decode error
         if self.should_wait_for_idr(moq_frame) {
-            let nal_type = Self::get_nal_type(&moq_frame.data, self.h264_nal_length_size);
+            let (t, c) = Self::find_nal_types_for_format(
+                &moq_frame.data,
+                self.h264_nal_length_size,
+                self.is_avcc,
+            );
+            let nal_type = if c > 0 { t[0] } else { 0 };
+            self.note_idr_wait_progress(nal_type, moq_frame.data.len(), moq_frame.is_keyframe);
             tracing::debug!(
                 "MoQ: waiting for IDR resync after decode error (got NAL type {}, is_keyframe={}, {} bytes)",
                 nal_type, moq_frame.is_keyframe, moq_frame.data.len()
@@ -655,46 +1266,222 @@ impl MoqDecoder {
                 nal_type
             )));
         }
+        self.reset_idr_wait_tracking();
 
-        // CRITICAL: Check actual NAL type, not just is_keyframe flag.
-        // When joining a MoQ stream mid-session, the first frame may be marked
-        // as keyframe by hang but actually be a P-frame (NAL type 1).
-        // VideoToolbox requires an actual IDR frame (NAL type 5) to start decoding.
-        let is_idr = Self::is_idr_frame(&moq_frame.data, self.h264_nal_length_size);
-        if let Some(ref decoder) = self.vt_decoder {
-            // If we haven't decoded any frames yet, we MUST have an IDR frame
-            let frame_count = decoder.frame_count();
-            if frame_count == 0 && !is_idr {
-                let nal_type = Self::get_nal_type(&moq_frame.data, self.h264_nal_length_size);
-                tracing::debug!(
-                    "MoQ: waiting for IDR frame (got NAL type {}, is_keyframe={}, {} bytes)",
-                    nal_type,
-                    moq_frame.is_keyframe,
-                    moq_frame.data.len()
-                );
-                return Err(VideoError::DecodeFailed(format!(
-                    "Waiting for IDR frame (got NAL type {})",
-                    nal_type
-                )));
-            }
+        // Check NAL types for diagnostics and keyframe validation.
+        // Use format-aware parsing (self.is_avcc) to avoid data_is_annex_b() heuristic bug.
+        let (nal_types_arr, nal_count) = Self::find_nal_types_for_format(
+            &moq_frame.data,
+            self.h264_nal_length_size,
+            self.is_avcc,
+        );
+        let nal_types = &nal_types_arr[..nal_count];
+        let is_idr = nal_types.contains(&5);
+        if is_idr {
+            self.note_real_idr_timestamp(moq_frame.timestamp_us);
+        }
+        self.record_forensic_sample(moq_frame, nal_types);
 
-            // If we were waiting for IDR and got one, clear error state and prepare decoder
-            if self.waiting_for_idr_after_error && is_idr {
-                if let Some(ref mut decoder) = self.vt_decoder {
-                    decoder.prepare_for_idr_resync();
-                }
+        // Bounded DPB grace: skip non-IDR frames after isolated VT callback error.
+        // The skipped error frame leaves a stale DPB reference — subsequent
+        // P-frames decode with status=0 but produce macroblock artifacts.
+        // Bypasses note_idr_wait_progress() to avoid premature resubscribe.
+        let (dpb_grace_timeout, dpb_grace_max_drops) = self.dpb_grace_budget();
+        if self.skip_pframes_until_idr {
+            if is_idr {
+                let dpb_drops = self.dpb_grace_dropped_frames;
+                // Clear DPB grace state
+                self.skip_pframes_until_idr = false;
+                self.dpb_grace_started_at = None;
+                self.dpb_grace_dropped_frames = 0;
+                // Reset error tracking — fresh session starts clean
+                self.consecutive_decode_errors = 0;
                 self.waiting_for_idr_after_error = false;
-                tracing::info!("MoQ: received IDR, cleared decoder error state and resyncing");
+                self.reset_idr_wait_tracking();
+                // Destroy corrupted VT session — IDR alone doesn't clear
+                // VT's internal corruption state (r34: SS4 still pixelated
+                // after IDR on same session, SS6 clean after recreation).
+                self.vt_decoder = None;
+                self.require_clean_idr_after_recreate = true;
+                self.ensure_vt_session(moq_frame)?;
+                tracing::info!(
+                    "MoQ: DPB grace cleared by IDR — recreated VT session #{} ({} frames dropped, budget={}ms/{} drops)",
+                    self.vt_session_count,
+                    dpb_drops,
+                    dpb_grace_timeout.as_millis(),
+                    dpb_grace_max_drops
+                );
+                // Fall through to decode this IDR on the fresh session
+            } else {
+                let start = *self
+                    .dpb_grace_started_at
+                    .get_or_insert_with(std::time::Instant::now);
+                self.dpb_grace_dropped_frames += 1;
+                self.shared
+                    .frame_stats
+                    .dropped_dpb_grace
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let elapsed = start.elapsed();
+
+                if elapsed > dpb_grace_timeout
+                    || self.dpb_grace_dropped_frames > dpb_grace_max_drops
+                {
+                    // Grace expired — escalate to normal IDR-wait with resubscribe.
+                    self.skip_pframes_until_idr = false;
+                    let drops = self.dpb_grace_dropped_frames;
+                    self.dpb_grace_started_at = None;
+                    self.dpb_grace_dropped_frames = 0;
+                    self.waiting_for_idr_after_error = true;
+                    tracing::warn!(
+                        "MoQ: DPB grace expired ({}ms, {} drops; budget={}ms/{} drops) — escalating to IDR-wait",
+                        elapsed.as_millis(),
+                        drops,
+                        dpb_grace_timeout.as_millis(),
+                        dpb_grace_max_drops
+                    );
+                }
+
+                // Use distinct message that does NOT contain "Waiting for IDR frame"
+                // to avoid double-counting in dropped_waiting_idr (line ~1729).
+                return Err(VideoError::DecodeFailed(format!(
+                    "DPB grace skip (NAL type {})",
+                    nal_types.first().copied().unwrap_or(0)
+                )));
             }
         }
 
+        if self.require_clean_idr_after_recreate && !is_idr {
+            tracing::debug!(
+                "MoQ: post-recreate clean-IDR gate active (NAL type {}, {} bytes)",
+                nal_types.first().copied().unwrap_or(0),
+                moq_frame.data.len()
+            );
+            return Err(VideoError::DecodeFailed(format!(
+                "Waiting for IDR frame (post-recreate gate, NAL type {})",
+                nal_types.first().copied().unwrap_or(0)
+            )));
+        }
+
+        // One-shot VT session recreation at the second IDR after startup.
+        // The initial VT session can produce silently corrupted output (VT
+        // status=0 but visibly pixelated). Recreating once at the next IDR
+        // boundary clears the corruption. Requires at least 48 frames decoded
+        // (one full group at 24fps) to ensure VT hardware has flushed, and
+        // only triggers on real IDR (type 5), not I-frames (type 1).
+        // A/B test: set to false to skip one-shot recreation and isolate
+        // whether mid-session errors are content-dependent or lifecycle-dependent.
+        // r31 result: HARMFUL — destroyed working session, caused 44 IDR drops,
+        // FPS dropped to 8.0, errors increased from 2→8. Errors are content-dependent
+        // (specific BBB P-frames at group position 3), not lifecycle-dependent.
+        const ENABLE_ONESHOT_RECREATION: bool = false;
+        if ENABLE_ONESHOT_RECREATION
+            && self.needs_session_recreation
+            && !self.waiting_for_idr_after_error
+            && is_idr
+        {
+            if let Some(ref decoder) = self.vt_decoder {
+                let prev_count = decoder.frame_count();
+                // Only trigger after at least one full group (48 frames)
+                // to give VT hardware time to fully initialize.
+                if prev_count >= 48 {
+                    self.needs_session_recreation = false;
+                    // Drop triggers: WaitForAsync → Invalidate → CFRelease
+                    self.vt_decoder = None;
+                    self.quiesce_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(50));
+                    tracing::info!(
+                        "MoQ: one-shot VT recreation scheduled after quiesce window ({} bytes, {} frames on previous session)",
+                        moq_frame.data.len(),
+                        prev_count
+                    );
+                    return Err(VideoError::DecodeFailed(
+                        "Waiting for VT quiesce".to_string(),
+                    ));
+                }
+            }
+        }
+
+        if let Some(ref decoder) = self.vt_decoder {
+            let frame_count = decoder.frame_count();
+
+            // Log first 10 frames at INFO level for pipeline diagnostics
+            if frame_count < 10 {
+                let mut preview = [0u8; 20];
+                let preview_len = moq_frame.data.len().min(20);
+                preview[..preview_len].copy_from_slice(&moq_frame.data[..preview_len]);
+                tracing::info!(
+                    "MoQ decode frame #{}: {} bytes, is_keyframe={}, format={}, NAL types={:?}, is_idr={}, first 20 bytes={:02x?}",
+                    frame_count,
+                    moq_frame.data.len(),
+                    moq_frame.is_keyframe,
+                    if self.is_avcc { "AVCC" } else { "AnnexB" },
+                    nal_types,
+                    is_idr,
+                    &preview[..preview_len],
+                );
+            }
+
+            // First submitted frame must be a real IDR. Trusting metadata-only keyframe
+            // flags (with non-IDR NAL 1 payloads) can poison VT reference state.
+            if frame_count == 0 && !is_idr {
+                // New VT sessions must begin on an IDR access unit.
+                // Enter the normal IDR-wait path so this is treated as non-fatal,
+                // counted as dropped-waiting-IDR, and eligible for bounded re-subscribe.
+                self.waiting_for_idr_after_error = true;
+                tracing::warn!(
+                    "MoQ: dropping frame #{} — first frame is not IDR (NAL types={:?}, is_keyframe={}, {} bytes, format={})",
+                    frame_count,
+                    nal_types,
+                    moq_frame.is_keyframe,
+                    moq_frame.data.len(),
+                    if self.is_avcc { "AVCC" } else { "AnnexB" },
+                );
+                return Err(VideoError::DecodeFailed(format!(
+                    "Waiting for IDR frame (got NAL types {:?})",
+                    nal_types
+                )));
+            }
+
+            // Only clear IDR resync on a real IDR (NAL type 5). I-frames (NAL type 1
+            // with is_keyframe=true) cannot initialize a fresh VT session — they need
+            // existing reference frames in the DPB. Accepting I-frames here causes a
+            // cascade: fresh session → decode fail → destroy → repeat.
+            if self.waiting_for_idr_after_error && is_idr {
+                self.waiting_for_idr_after_error = false;
+                self.consecutive_decode_errors = 0;
+                self.reset_idr_wait_tracking();
+                tracing::info!(
+                    "MoQ: received real IDR after error, will recreate VT session (session={})",
+                    if self.vt_decoder.is_some() {
+                        "exists"
+                    } else {
+                        "None"
+                    }
+                );
+            }
+        }
+
+        // Treat metadata keyframe boundaries without a real IDR as discontinuities.
+        // Decoding these as plain P-frames can poison visual output without emitting
+        // callback errors. Instead, enter IDR wait and let the existing bounded
+        // recovery/resubscribe machinery converge on a real IDR boundary.
+        if moq_frame.is_keyframe && !is_idr {
+            self.waiting_for_idr_after_error = true;
+            tracing::warn!(
+                "MoQ: keyframe metadata mismatch (is_keyframe=true but NAL types={:?}); entering IDR wait",
+                nal_types
+            );
+            return Err(VideoError::DecodeFailed(format!(
+                "Waiting for IDR frame (metadata keyframe without IDR, NAL types {:?})",
+                nal_types
+            )));
+        }
+
         // Decode the frame using VTDecoder
+        let vt_is_keyframe = is_idr;
+
         let decode_result = if let Some(ref mut decoder) = self.vt_decoder {
-            decoder.decode_frame(
-                &moq_frame.data,
-                moq_frame.timestamp_us,
-                moq_frame.is_keyframe,
-            )
+            decoder.decode_frame(&moq_frame.data, moq_frame.timestamp_us, vt_is_keyframe)
         } else {
             return Err(VideoError::DecodeFailed(
                 "VTDecoder not initialized".to_string(),
@@ -711,6 +1498,16 @@ impl MoqDecoder {
                     .fetch_add(1, Ordering::Relaxed)
                     + 1;
 
+                // Reset consecutive error counter on success
+                self.consecutive_decode_errors = 0;
+                if self.require_clean_idr_after_recreate && is_idr {
+                    self.require_clean_idr_after_recreate = false;
+                    tracing::info!(
+                        "MoQ: post-recreate clean-IDR gate satisfied on session #{}",
+                        self.vt_session_count
+                    );
+                }
+
                 // Log first few successful decodes
                 if decoded_count <= 5 {
                     tracing::info!(
@@ -725,12 +1522,141 @@ impl MoqDecoder {
                 "VTDecoder: no frame decoded (async?)".to_string(),
             )),
             Err(e) => {
-                // Decode error - enter IDR resync mode
-                self.waiting_for_idr_after_error = true;
-                if let Some(ref mut decoder) = self.vt_decoder {
-                    decoder.prepare_for_idr_resync();
+                self.consecutive_decode_errors += 1;
+                let total_errors = self
+                    .shared
+                    .frame_stats
+                    .decode_errors
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                let error_text = e.to_string();
+                let hard_vt_callback_failure = error_text.contains("VT decode callback error:");
+                let required_drop_storm = error_text.contains("VT required-frame-drop storm");
+                if hard_vt_callback_failure {
+                    // Let consecutive_decode_errors increment naturally (+= 1 below).
+                    // First 1-2 errors: soft skip (keep session, no resubscribe).
+                    // At 3+ consecutive: hard reset + IDR resync + resubscribe.
+                    // This avoids destroying a valid VT session for isolated P-frame
+                    // errors (-12909) which are common on macOS with certain H.264
+                    // content. The session resets to 0 on any successful decode.
+                    if self.consecutive_decode_errors >= 2 {
+                        // About to hit 3 — request resubscribe for fast IDR delivery
+                        if self.request_video_resubscribe_with_cooldown() {
+                            tracing::warn!(
+                                "MoQ: VT callback failure #{} — requesting video re-subscribe",
+                                self.consecutive_decode_errors + 1
+                            );
+                        }
+                    }
+                } else if required_drop_storm {
+                    // Keep isolated storms soft, but don't loop forever on repeated
+                    // storm cycles in a short window.
+                    const STORM_ESCALATION_THRESHOLD: u8 = 3;
+                    const STORM_ESCALATION_WINDOW_MS: u128 = 4500;
+                    let storms_in_window = self.note_required_drop_storm_cycle();
+                    if storms_in_window >= STORM_ESCALATION_THRESHOLD {
+                        self.consecutive_decode_errors = 3;
+                        self.required_drop_window_started_at = Some(std::time::Instant::now());
+                        self.required_drop_storms_in_window = 0;
+                        let requested_resubscribe = self.request_video_resubscribe_with_cooldown();
+                        tracing::warn!(
+                            "MoQ: required-frame-drop storm persisted ({} storms within ~{}ms) — escalating to VT session reset{}",
+                            storms_in_window,
+                            STORM_ESCALATION_WINDOW_MS,
+                            if requested_resubscribe {
+                                " + video re-subscribe request"
+                            } else {
+                                ""
+                            }
+                        );
+                    } else {
+                        self.consecutive_decode_errors = 0;
+                        self.waiting_for_idr_after_error = false;
+                        tracing::warn!(
+                            "MoQ: required-frame-drop storm detected (window_count={}) — skipping frame without re-subscribe",
+                            storms_in_window
+                        );
+                    }
                 }
-                tracing::warn!("MoQ: VT decode failed, entering IDR resync mode: {}", e);
+                self.log_forensic_error_window();
+
+                // Log NAL header bytes for forensic analysis of failing frames
+                let data = &moq_frame.data;
+                let nal_header_hex = if data.len() >= 16 {
+                    format!("{:02x?}", &data[..16])
+                } else {
+                    format!("{:02x?}", data)
+                };
+                // Parse first NAL type from AVCC (4-byte length prefix)
+                let first_nal_type = if self.is_avcc {
+                    match data.get(self.h264_nal_length_size) {
+                        Some(&nal_byte) => {
+                            format!(
+                                "nal_type={} ({})",
+                                nal_byte & 0x1f,
+                                match nal_byte & 0x1f {
+                                    1 => "non-IDR slice",
+                                    5 => "IDR slice",
+                                    6 => "SEI",
+                                    7 => "SPS",
+                                    8 => "PPS",
+                                    _ => "other",
+                                }
+                            )
+                        }
+                        None => "unknown".to_string(),
+                    }
+                } else {
+                    "unknown".to_string()
+                };
+                tracing::warn!(
+                    "MoQ: failing frame forensics: size={}, is_keyframe={}, pts={}us, {}, header={}",
+                    data.len(), moq_frame.is_keyframe, moq_frame.timestamp_us,
+                    first_nal_type, nal_header_hex
+                );
+
+                if self.consecutive_decode_errors >= 3 {
+                    // 3+ consecutive errors: destroy VT session and wait for IDR resync.
+                    // prepare_for_idr_resync() only clears the output queue — VT's
+                    // internal DPB retains stale reference frames. Full session
+                    // recreation from catalog SPS/PPS is needed for clean recovery.
+                    self.waiting_for_idr_after_error = true;
+                    self.skip_pframes_until_idr = false;
+                    self.dpb_grace_started_at = None;
+                    self.dpb_grace_dropped_frames = 0;
+                    self.require_clean_idr_after_recreate = true;
+                    self.vt_decoder = None; // Drop: WaitForAsync → Invalidate → CFRelease
+                    self.quiesce_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(50));
+                    tracing::warn!(
+                        "MoQ: VT decode error #{} (consecutive={}), destroyed session for IDR resync: {}",
+                        total_errors, self.consecutive_decode_errors, e
+                    );
+                } else {
+                    self.waiting_for_idr_after_error = false;
+
+                    if hard_vt_callback_failure && self.consecutive_decode_errors == 1 {
+                        // First isolated VT callback failure: the skipped P-frame was
+                        // a DPB reference. Subsequent P-frames will decode successfully
+                        // but produce macroblock artifacts. Enter bounded DPB grace
+                        // to skip until next natural IDR resets the DPB.
+                        self.skip_pframes_until_idr = true;
+                        self.dpb_grace_started_at = None;
+                        self.dpb_grace_dropped_frames = 0;
+                        tracing::warn!(
+                            "MoQ: VT callback error #{} (isolated), DPB grace until next IDR: {}",
+                            total_errors,
+                            e
+                        );
+                    } else {
+                        tracing::warn!(
+                            "MoQ: VT decode error #{} (consecutive={}), skipping frame without IDR gate: {}",
+                            total_errors,
+                            self.consecutive_decode_errors,
+                            e
+                        );
+                    }
+                }
                 Err(e)
             }
         }
@@ -793,8 +1719,7 @@ impl MoqDecoder {
     /// - For each SPS: 2 bytes length (big endian) + SPS data
     /// - 1 byte: num_pps
     /// - For each PPS: 2 bytes length (big endian) + PPS data
-    #[cfg(target_os = "macos")]
-    fn parse_avcc_box(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>, usize), VideoError> {
+    pub(crate) fn parse_avcc_box(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>, usize), VideoError> {
         if data.len() < 7 {
             return Err(VideoError::DecodeFailed("avcC too short".to_string()));
         }
@@ -1025,9 +1950,12 @@ impl VideoDecoderBackend for MoqDecoder {
                     Err(VideoError::DecodeFailed(msg))
                         if msg.contains("Waiting for keyframe")
                             || msg.contains("Waiting for IDR frame")
+                            || msg.contains("Waiting for VT quiesce")
+                            || msg.contains("DPB grace skip")
                             || msg.contains("no frame decoded") =>
                     {
-                        // Track frames dropped waiting for IDR
+                        // Track frames dropped waiting for IDR (but NOT DPB grace —
+                        // those are already counted via dropped_dpb_grace)
                         if msg.contains("Waiting for IDR") {
                             self.shared
                                 .frame_stats
@@ -1132,7 +2060,7 @@ mod macos_vt {
     use std::collections::VecDeque;
     use std::ffi::c_void;
     use std::ptr;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
     // ==========================================================================
     // Raw FFI declarations for VideoToolbox and CoreMedia
@@ -1263,6 +2191,15 @@ mod macos_vt {
             sampleSizeArray: *const usize,
             sampleBufferOut: *mut *mut c_void,
         ) -> i32;
+
+        fn CMSampleBufferGetSampleAttachmentsArray(
+            sbuf: *mut c_void,
+            createIfNecessary: bool,
+        ) -> *const c_void;
+
+        /// kCMSampleAttachmentKey_DependsOnOthers: kCFBooleanFalse = sync sample (keyframe)
+        static kCMSampleAttachmentKey_DependsOnOthers: *const c_void;
+        static kCMSampleAttachmentKey_NotSync: *const c_void;
     }
 
     // VideoToolbox framework
@@ -1295,9 +2232,13 @@ mod macos_vt {
     extern "C" {
         fn CFRelease(cf: *const c_void);
         fn CFRetain(cf: *const c_void) -> *const c_void;
+        fn CFArrayGetValueAtIndex(theArray: *const c_void, idx: isize) -> *const c_void;
+        fn CFDictionarySetValue(theDict: *const c_void, key: *const c_void, value: *const c_void);
         /// Null allocator - performs no allocation/deallocation.
         /// Use this for caller-owned memory passed to CM functions.
         static kCFAllocatorNull: *const c_void;
+        static kCFBooleanTrue: *const c_void;
+        static kCFBooleanFalse: *const c_void;
     }
 
     /// Wrapper for CVPixelBuffer (raw pointer) that releases on drop.
@@ -1342,6 +2283,8 @@ mod macos_vt {
         pts_us: u64,
         /// The decoded CVPixelBuffer (retained)
         pixel_buffer: PixelBufferWrapper,
+        /// True when callback had kVTDecodeInfo_RequiredFrameDropped.
+        required_frame_dropped: bool,
     }
 
     /// Shared state for decoder callback to push decoded frames.
@@ -1350,6 +2293,8 @@ mod macos_vt {
         decoded_frames: ParkingMutex<VecDeque<DecodedVTFrame>>,
         /// Error flag set by callback on decode failure
         decode_error: AtomicBool,
+        /// OSStatus from last callback error (0 = no error)
+        decode_error_status: AtomicI32,
         /// Frame counter for debugging
         frame_count: AtomicU32,
     }
@@ -1359,6 +2304,7 @@ mod macos_vt {
             Self {
                 decoded_frames: ParkingMutex::new(VecDeque::with_capacity(8)),
                 decode_error: AtomicBool::new(false),
+                decode_error_status: AtomicI32::new(0),
                 frame_count: AtomicU32::new(0),
             }
         }
@@ -1384,7 +2330,17 @@ mod macos_vt {
         /// Codec type (H.264 or H.265, reserved for H.265 support)
         #[allow(dead_code)]
         codec: VTCodec,
+        /// True if NAL data is AVCC format (length-prefixed), false for Annex B (start codes).
+        /// Set from catalog info to avoid heuristic detection that misclassifies
+        /// AVCC frames with 256-511 byte NALs (length prefix [0,0,1,X] looks like Annex B).
+        is_avcc: bool,
+        /// Consecutive callbacks flagged with RequiredFrameDropped.
+        required_drop_streak: u32,
     }
+
+    /// If this many consecutive decoded callbacks require frame drops, treat as
+    /// a corruption storm and force session recovery.
+    const VT_REQUIRED_DROP_STORM_THRESHOLD: u32 = 36;
 
     // SAFETY: VTDecompressionSession is designed for multi-threaded use.
     // The session pointer is only accessed through synchronized methods.
@@ -1415,20 +2371,22 @@ mod macos_vt {
             pps: &[u8],
             width: u32,
             height: u32,
+            is_avcc: bool,
         ) -> Result<Self, VideoError> {
             tracing::info!(
-                "VTDecoder: Creating H.264 decoder {}x{} (SPS: {} bytes, PPS: {} bytes)",
+                "VTDecoder: Creating H.264 decoder {}x{} (SPS: {} bytes, PPS: {} bytes, avcc={})",
                 width,
                 height,
                 sps.len(),
-                pps.len()
+                pps.len(),
+                is_avcc,
             );
 
             // Create CMFormatDescription from SPS/PPS
             let format_desc = Self::create_h264_format_description(sps, pps)?;
 
             // Create decoder with format description
-            Self::create_decoder(format_desc, width, height, VTCodec::H264)
+            Self::create_decoder(format_desc, width, height, VTCodec::H264, is_avcc)
         }
 
         /// Creates a new VTDecoder for H.265 with the given VPS/SPS/PPS NAL units.
@@ -1446,21 +2404,23 @@ mod macos_vt {
             pps: &[u8],
             width: u32,
             height: u32,
+            is_avcc: bool,
         ) -> Result<Self, VideoError> {
             tracing::info!(
-                "VTDecoder: Creating H.265 decoder {}x{} (VPS: {} bytes, SPS: {} bytes, PPS: {} bytes)",
+                "VTDecoder: Creating H.265 decoder {}x{} (VPS: {} bytes, SPS: {} bytes, PPS: {} bytes, avcc={})",
                 width,
                 height,
                 vps.len(),
                 sps.len(),
-                pps.len()
+                pps.len(),
+                is_avcc,
             );
 
             // Create CMFormatDescription from VPS/SPS/PPS
             let format_desc = Self::create_h265_format_description(vps, sps, pps)?;
 
             // Create decoder with format description
-            Self::create_decoder(format_desc, width, height, VTCodec::H265)
+            Self::create_decoder(format_desc, width, height, VTCodec::H265, is_avcc)
         }
 
         /// Creates CMVideoFormatDescription for H.264 from SPS/PPS.
@@ -1544,6 +2504,7 @@ mod macos_vt {
             width: u32,
             height: u32,
             codec: VTCodec,
+            is_avcc: bool,
         ) -> Result<Self, VideoError> {
             // Create output pixel buffer attributes for IOSurface + Metal compatibility
             let destination_attributes = Self::create_output_attributes()?;
@@ -1556,8 +2517,9 @@ mod macos_vt {
                 Self::create_session(format_desc, &destination_attributes, &callback_state)?;
 
             tracing::info!(
-                "VTDecoder: Created {:?} session with IOSurface+Metal output",
-                codec
+                "VTDecoder: Created {:?} session with IOSurface+Metal output (avcc={})",
+                codec,
+                is_avcc,
             );
 
             Ok(Self {
@@ -1567,6 +2529,8 @@ mod macos_vt {
                 width,
                 height,
                 codec,
+                is_avcc,
+                required_drop_streak: 0,
             })
         }
 
@@ -1694,10 +2658,10 @@ mod macos_vt {
                 preview
             );
 
-            // Check if data is in AVCC format (length-prefixed) or Annex B (start codes)
-            // AVCC: first 4 bytes are NAL length (big-endian)
-            // Annex B: starts with 0x00 0x00 0x00 0x01 or 0x00 0x00 0x01
-            let is_avcc = Self::is_avcc_format(nal_data);
+            // Use known format from catalog/init context instead of heuristic detection.
+            // The heuristic is_avcc_format() misclassifies AVCC frames with 256-511 byte
+            // NAL lengths: the prefix [0x00,0x00,0x01,X] looks like an Annex B start code.
+            let is_avcc = self.is_avcc;
             tracing::debug!(
                 "VTDecoder: detected format: {}",
                 if is_avcc { "AVCC" } else { "Annex B" }
@@ -1803,8 +2767,51 @@ mod macos_vt {
                 )));
             }
 
+            // SAFETY: Mutate the sample attachment dictionary to set keyframe flags.
+            //
+            // - `sample_buffer_ptr` is a valid CMSampleBufferRef created by
+            //   `CMSampleBufferCreate` above with `num_samples = 1`, so sample
+            //   index 0 is the only valid index.
+            // - `CMSampleBufferGetSampleAttachmentsArray(sample_buffer_ptr, true)`
+            //   returns a retained CFArrayRef with one entry per sample (i.e. one
+            //   mutable CFDictionaryRef at index 0), or null on failure.
+            // - `CFArrayGetValueAtIndex(attachments, 0)` yields a non-null
+            //   CFDictionaryRef that we may mutate via `CFDictionarySetValue`
+            //   because the array was obtained with `createIfNecessary = true`.
+            // - Both pointers are checked for null before use.
+            // - `is_keyframe` guards which keys are set: keyframes get
+            //   DependsOnOthers=false + NotSync=false; non-keyframes get
+            //   DependsOnOthers=true.
+            unsafe {
+                let attachments = CMSampleBufferGetSampleAttachmentsArray(sample_buffer_ptr, true);
+                if !attachments.is_null() {
+                    let dict = CFArrayGetValueAtIndex(attachments, 0);
+                    if !dict.is_null() {
+                        if is_keyframe {
+                            CFDictionarySetValue(
+                                dict,
+                                kCMSampleAttachmentKey_DependsOnOthers,
+                                kCFBooleanFalse,
+                            );
+                            CFDictionarySetValue(
+                                dict,
+                                kCMSampleAttachmentKey_NotSync,
+                                kCFBooleanFalse,
+                            );
+                        } else {
+                            CFDictionarySetValue(
+                                dict,
+                                kCMSampleAttachmentKey_DependsOnOthers,
+                                kCFBooleanTrue,
+                            );
+                        }
+                    }
+                }
+            }
+
             tracing::debug!(
-                "VTDecoder: CMSampleBuffer created, calling VTDecompressionSessionDecodeFrame"
+                "VTDecoder: CMSampleBuffer created (keyframe={}), calling VTDecompressionSessionDecodeFrame",
+                is_keyframe
             );
 
             // Decode the frame synchronously for MoQ live streams
@@ -1861,10 +2868,19 @@ mod macos_vt {
             }
 
             // Check for decode errors from callback
-            if self.callback_state.decode_error.load(Ordering::Acquire) {
-                return Err(VideoError::DecodeFailed(
-                    "VT decode callback reported error".to_string(),
-                ));
+            if self
+                .callback_state
+                .decode_error
+                .swap(false, Ordering::AcqRel)
+            {
+                let cb_status = self
+                    .callback_state
+                    .decode_error_status
+                    .swap(0, Ordering::Relaxed);
+                return Err(VideoError::DecodeFailed(format!(
+                    "VT decode callback error: OSStatus {}",
+                    cb_status
+                )));
             }
 
             // Pop decoded frame from callback queue
@@ -1874,6 +2890,30 @@ mod macos_vt {
 
             match decoded {
                 Some(frame) => {
+                    if frame.required_frame_dropped {
+                        self.required_drop_streak = self.required_drop_streak.saturating_add(1);
+                        tracing::debug!(
+                            "VTDecoder: callback flagged RequiredFrameDropped on decoded frame (streak={})",
+                            self.required_drop_streak
+                        );
+                        if self.required_drop_streak >= VT_REQUIRED_DROP_STORM_THRESHOLD {
+                            let storm_streak = self.required_drop_streak;
+                            // Reset so we don't immediately retrigger every frame if
+                            // callback flags remain noisy for a short window.
+                            self.required_drop_streak = 0;
+                            return Err(VideoError::DecodeFailed(format!(
+                                "VT required-frame-drop storm (streak={})",
+                                storm_streak
+                            )));
+                        }
+                    } else if self.required_drop_streak > 0 {
+                        tracing::debug!(
+                            "VTDecoder: required-frame-drop streak cleared at {}",
+                            self.required_drop_streak
+                        );
+                        self.required_drop_streak = 0;
+                    }
+
                     tracing::debug!("VTDecoder: got frame from queue, calling create_gpu_frame");
                     // Create MacOSGpuSurface from CVPixelBuffer
                     let video_frame = self.create_gpu_frame(frame)?;
@@ -1892,6 +2932,11 @@ mod macos_vt {
         ///
         /// AVCC format: first 4 bytes are NAL length (big-endian), followed by NAL data
         /// Annex B format: starts with 0x00 0x00 0x00 0x01 or 0x00 0x00 0x01
+        ///
+        /// NOTE: This heuristic has known false negatives for AVCC frames with 256-511 byte
+        /// NALs (length prefix [0,0,1,X] looks like Annex B). Prefer using VTDecoder::is_avcc
+        /// field which is set from catalog info.
+        #[allow(dead_code)]
         fn is_avcc_format(data: &[u8]) -> bool {
             if data.len() < 5 {
                 return false;
@@ -2048,6 +3093,7 @@ mod macos_vt {
         }
 
         /// Clears queued output and error flag before waiting for a fresh IDR.
+        #[allow(dead_code)]
         pub fn prepare_for_idr_resync(&mut self) {
             // Wait for any pending async frames to complete
             let wait_status =
@@ -2070,11 +3116,20 @@ mod macos_vt {
     impl Drop for VTDecoder {
         fn drop(&mut self) {
             let frame_count = self.callback_state.frame_count.load(Ordering::Relaxed);
-            tracing::info!("VTDecoder: dropped after decoding {} frames", frame_count);
+            tracing::info!("VTDecoder: dropping after decoding {} frames", frame_count);
 
-            // Invalidate and release the session
             if !self.session.is_null() {
                 unsafe {
+                    // Drain any in-flight async decode callbacks before invalidating.
+                    // Without this, Invalidate can fire while a callback is still writing
+                    // to callback_state, and the hardware decoder may not fully quiesce.
+                    let wait_status = VTDecompressionSessionWaitForAsynchronousFrames(self.session);
+                    if wait_status != 0 {
+                        tracing::warn!(
+                            "VTDecoder: WaitForAsyncFrames in drop returned OSStatus {}",
+                            wait_status
+                        );
+                    }
                     VTDecompressionSessionInvalidate(self.session);
                     CFRelease(self.session);
                 }
@@ -2084,6 +3139,7 @@ mod macos_vt {
             if !self.format_desc.is_null() {
                 unsafe { CFRelease(self.format_desc) };
             }
+            tracing::info!("VTDecoder: dropped (session invalidated + released)");
         }
     }
 
@@ -2112,6 +3168,9 @@ mod macos_vt {
 
         if status != 0 {
             tracing::error!("VT decode callback error: OSStatus {}", status);
+            callback_state
+                .decode_error_status
+                .store(status, Ordering::Release);
             callback_state.decode_error.store(true, Ordering::Release);
             return;
         }
@@ -2123,21 +3182,38 @@ mod macos_vt {
         }
         if info_flags & 0x2 != 0 {
             // kVTDecodeInfo_FrameDropped
-            tracing::debug!("VT decode: frame dropped (info_flags=0x{:x})", info_flags);
-            return;
-        }
-        if info_flags & 0x4 != 0 {
-            // kVTDecodeInfo_RequiredFrameDropped - but we still have an image_buffer
-            tracing::debug!(
-                "VT decode: required frame drop flagged but continuing (info_flags=0x{:x})",
+            tracing::warn!(
+                "VT decode: frame dropped by VideoToolbox (info_flags=0x{:x})",
                 info_flags
             );
-        }
-
-        if image_buffer.is_null() {
-            tracing::warn!("VT decode callback: null image buffer");
             return;
         }
+        if image_buffer.is_null() {
+            if info_flags & 0x4 != 0 {
+                // kVTDecodeInfo_RequiredFrameDropped with no image — genuine drop
+                tracing::warn!(
+                    "VT decode: frame dropped (info_flags=0x{:x}, no image buffer)",
+                    info_flags
+                );
+            } else {
+                tracing::warn!("VT decode callback: null image buffer");
+            }
+            return;
+        }
+
+        // info_flags bit 0x4 (RequiredFrameDropped) fires on 100% of frames on
+        // macOS 15 / Apple Silicon even when status=0 and image_buffer is valid.
+        // When VT successfully produces pixels, treat the frame as good — the flag
+        // is informational, not an error signal.
+        let required_frame_dropped = if info_flags & 0x4 != 0 && !image_buffer.is_null() {
+            tracing::trace!(
+                "VT decode: info_flags=0x{:x} with valid image — treating as successful",
+                info_flags
+            );
+            false
+        } else {
+            false
+        };
 
         // CVImageBuffer is the same as CVPixelBuffer for video frames
         // Retain the pixel buffer so it stays valid
@@ -2160,6 +3236,7 @@ mod macos_vt {
         let frame = DecodedVTFrame {
             pts_us,
             pixel_buffer,
+            required_frame_dropped,
         };
         tracing::debug!("VT decode callback: acquiring lock on decoded_frames queue");
         let mut queue = callback_state.decoded_frames.lock();

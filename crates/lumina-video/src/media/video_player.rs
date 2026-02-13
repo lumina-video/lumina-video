@@ -208,6 +208,9 @@ pub struct VideoPlayer {
     /// Wrapped in Mutex so init thread can populate it after MoqDecoder is created
     #[cfg(feature = "moq")]
     moq_stats: Arc<parking_lot::Mutex<Option<MoqStatsHandle>>>,
+    /// Whether we've already late-bound the MoQ audio handle to self.audio_handle
+    #[cfg(feature = "moq")]
+    moq_audio_bound: bool,
     /// Loaded subtitle track for rendering
     subtitle_track: Option<SubtitleTrack>,
     /// Whether subtitles are visible
@@ -260,6 +263,8 @@ impl VideoPlayer {
             linux_zero_copy_metrics: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "moq")]
             moq_stats: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(feature = "moq")]
+            moq_audio_bound: false,
             subtitle_track: None,
             show_subtitles: true,
             subtitle_style: SubtitleStyle::default(),
@@ -367,6 +372,8 @@ impl VideoPlayer {
             linux_zero_copy_metrics: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "moq")]
             moq_stats: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(feature = "moq")]
+            moq_audio_bound: false,
             subtitle_track: None,
             show_subtitles: true,
             subtitle_style: SubtitleStyle::default(),
@@ -630,7 +637,6 @@ impl VideoPlayer {
                     let is_moq = super::moq_decoder::MoqDecoder::is_moq_url(&self.url);
                     #[cfg(not(feature = "moq"))]
                     let is_moq = false;
-
                     if !uses_native_audio && !is_moq {
                         if let Some(audio_thread) = AudioThread::new(&self.url, metadata.start_time)
                         {
@@ -981,10 +987,17 @@ impl VideoPlayer {
             }
         }
 
-        // Update frame rate
+        // Update frame rate and manage pacing for live streams
         if let Some(fps) = thread.frame_rate() {
             if fps > 0.0 {
                 metadata.frame_rate = fps;
+                if metadata.duration.is_none() {
+                    // Live/MoQ: enable pacing to smooth group-boundary bursts
+                    self.scheduler.set_frame_rate_pacing(fps);
+                } else {
+                    // VOD or stream that acquired duration: disable pacing
+                    self.scheduler.clear_frame_rate_pacing();
+                }
             }
         }
     }
@@ -1054,6 +1067,58 @@ impl VideoPlayer {
     /// # Returns
     ///
     /// Returns `Ok(())` if subtitles were loaded successfully, or an error if parsing failed.
+    /// Polls for MoQ audio handle availability and late-binds it.
+    ///
+    /// The MoQ audio thread creates its AudioHandle asynchronously — it's not
+    /// available at `check_init_complete()` time. This method is called each
+    /// frame from the `show()` loop. When the handle becomes available:
+    ///
+    /// 1. Migrates current mute/volume state to the new handle
+    /// 2. Replaces `self.audio_handle` so UI controls affect MoQ playback
+    ///
+    /// NOTE: We intentionally do NOT bind to FrameScheduler here. The MoQ audio
+    /// PTS (publisher time, e.g. 7200s) has a completely different time base than
+    /// the wall-clock time the scheduler uses. Binding would cause a massive
+    /// position jump that freezes video.
+    ///
+    /// When the handle becomes stale (thread torn down), unbinds and reverts.
+    #[cfg(feature = "moq")]
+    fn poll_moq_audio_handle(&mut self) {
+        let moq_stats = self.moq_stats.lock();
+        let Some(ref stats) = *moq_stats else {
+            return;
+        };
+
+        if !self.moq_audio_bound {
+            // Try to acquire the audio handle
+            if let Some(moq_ah) = stats.audio_handle() {
+                // Migrate current mute/volume state
+                moq_ah.set_muted(self.audio_handle.is_muted());
+                moq_ah.set_volume(self.audio_handle.volume());
+
+                // Replace the player-level handle (for UI mute/volume controls only)
+                self.audio_handle = moq_ah;
+                self.audio_handle.set_available(true);
+
+                self.moq_audio_bound = true;
+                tracing::info!("MoQ audio handle late-bound to VideoPlayer (mute/volume only)");
+            }
+        } else {
+            // Check if handle went stale (thread torn down)
+            if !stats.is_audio_alive() {
+                tracing::info!("MoQ audio handle stale (thread torn down), unbinding");
+
+                // Create a fresh placeholder handle and migrate state
+                let placeholder = AudioHandle::new();
+                placeholder.set_muted(self.audio_handle.is_muted());
+                placeholder.set_volume(self.audio_handle.volume());
+                self.audio_handle = placeholder;
+
+                self.moq_audio_bound = false;
+            }
+        }
+    }
+
     pub fn load_subtitles_srt(&mut self, content: &str) -> Result<(), SubtitleError> {
         let track = SubtitleTrack::from_srt(content)?;
         self.subtitle_track = Some(track);
@@ -1131,6 +1196,12 @@ impl VideoPlayer {
 
         // Sync metadata from decode thread (for lazy metadata like macOS AVPlayer)
         self.sync_metadata_from_decode_thread();
+
+        // Late-bind MoQ audio handle (async — not available at init time)
+        #[cfg(feature = "moq")]
+        if self.initialized {
+            self.poll_moq_audio_handle();
+        }
 
         // Update frame if playback requested (even if buffering), or try to get preview frame when Ready/Paused
         if self.scheduler.is_playback_requested() {

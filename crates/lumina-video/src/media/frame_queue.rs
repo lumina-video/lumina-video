@@ -497,6 +497,7 @@ fn decode_loop<D: VideoDecoderBackend>(
     // Try multiple times since streaming decoders (HTTP, ExoPlayer) need time to buffer
     let mut preview_attempts = 0;
     let max_preview_attempts = 30; // Try for up to ~3 seconds for slow HTTP streams
+    let mut preview_dims: Option<(u32, u32)> = None;
 
     loop {
         // Check for early termination (user closed video)
@@ -511,6 +512,7 @@ fn decode_loop<D: VideoDecoderBackend>(
                 let (w, h) = frame.dimensions();
                 if w > 1 && h > 1 {
                     tracing::info!("Decoded preview frame at {:?} ({}x{})", frame.pts, w, h);
+                    preview_dims = Some((w, h));
                     let _ = frame_queue.try_push(frame);
                     break;
                 } else {
@@ -546,48 +548,66 @@ fn decode_loop<D: VideoDecoderBackend>(
 
     // Wait for metadata to become available (ExoPlayer needs time to determine duration/dimensions)
     // This is important because pausing too early may prevent ExoPlayer from reporting metadata
-    let metadata_wait_start = std::time::Instant::now();
-    let metadata_timeout = Duration::from_secs(3);
-
-    loop {
-        // Check for early termination (user closed video)
-        if stop_flag.load(Ordering::Acquire) {
-            tracing::debug!("Metadata loop interrupted by stop signal");
-            return;
+    //
+    // For live streams (no duration), skip this wait entirely if we already have dimensions
+    // from the preview frame. Live stream decoders (MoQ) never report duration, and their
+    // cached_metadata only syncs in decode_next() — which isn't called during this loop.
+    // Without this bypass, MoQ streams always stall for the full 3-second timeout.
+    let is_live = decoder.duration().is_none();
+    if is_live && preview_dims.is_some() {
+        tracing::info!(
+            "Live stream: using preview dimensions {:?}, skipping metadata wait",
+            preview_dims
+        );
+        *shared_dimensions.lock() = preview_dims;
+        let fps = decoder.metadata().frame_rate;
+        if fps > 0.0 {
+            *shared_frame_rate.lock() = Some(fps);
         }
+    } else {
+        let metadata_wait_start = std::time::Instant::now();
+        let metadata_timeout = Duration::from_secs(3);
 
-        let duration_opt = decoder.duration();
-        let has_duration = duration_opt.is_some();
-        let dims = decoder.dimensions();
-        let has_dimensions = dims.0 > 1 && dims.1 > 1; // >1 to exclude placeholder
-
-        if has_duration && has_dimensions {
-            *shared_duration.lock() = duration_opt;
-            *shared_dimensions.lock() = Some(dims);
-            let fps = decoder.metadata().frame_rate;
-            if fps > 0.0 {
-                *shared_frame_rate.lock() = Some(fps);
+        loop {
+            // Check for early termination (user closed video)
+            if stop_flag.load(Ordering::Acquire) {
+                tracing::debug!("Metadata loop interrupted by stop signal");
+                return;
             }
-            break;
-        }
 
-        if metadata_wait_start.elapsed() > metadata_timeout {
-            tracing::warn!("Timeout waiting for video metadata");
-            // Store whatever we have
-            if let Some(dur) = duration_opt {
-                *shared_duration.lock() = Some(dur);
-            }
-            if dims.0 > 0 && dims.1 > 0 {
+            let duration_opt = decoder.duration();
+            let has_duration = duration_opt.is_some();
+            let dims = decoder.dimensions();
+            let has_dimensions = dims.0 > 1 && dims.1 > 1; // >1 to exclude placeholder
+
+            if has_duration && has_dimensions {
+                *shared_duration.lock() = duration_opt;
                 *shared_dimensions.lock() = Some(dims);
+                let fps = decoder.metadata().frame_rate;
+                if fps > 0.0 {
+                    *shared_frame_rate.lock() = Some(fps);
+                }
+                break;
             }
-            let fps = decoder.metadata().frame_rate;
-            if fps > 0.0 {
-                *shared_frame_rate.lock() = Some(fps);
-            }
-            break;
-        }
 
-        thread::sleep(Duration::from_millis(100));
+            if metadata_wait_start.elapsed() > metadata_timeout {
+                tracing::warn!("Timeout waiting for video metadata");
+                // Store whatever we have
+                if let Some(dur) = duration_opt {
+                    *shared_duration.lock() = Some(dur);
+                }
+                if dims.0 > 0 && dims.1 > 0 {
+                    *shared_dimensions.lock() = Some(dims);
+                }
+                let fps = decoder.metadata().frame_rate;
+                if fps > 0.0 {
+                    *shared_frame_rate.lock() = Some(fps);
+                }
+                break;
+            }
+
+            thread::sleep(Duration::from_millis(100));
+        }
     }
 
     // Pause the decoder after getting preview frame (for decoders like ExoPlayer that auto-play)
@@ -953,6 +973,55 @@ const RECOVERY_FRAME_THRESHOLD: u32 = 30;
 /// Wall-clock duration before forcing a resync when stuck.
 /// This handles videos with sparse keyframes where gaps > position clamp can occur.
 const STUCK_TIMEOUT: Duration = Duration::from_secs(3);
+/// Near-boundary reject windows should recover faster than generic stuck handling.
+const NEAR_BOUNDARY_FORCE_TIMEOUT: Duration = Duration::from_millis(900);
+/// Startup tolerance while waiting for audio to begin.
+const AUDIO_STARTUP_AHEAD_TOLERANCE: Duration = Duration::from_millis(500);
+/// Base live tolerance once audio is running.
+const LIVE_BASE_AHEAD_TOLERANCE: Duration = Duration::from_millis(2000);
+/// Maximum adaptive live tolerance to avoid unbounded A/V divergence.
+const LIVE_MAX_AHEAD_TOLERANCE: Duration = Duration::from_millis(4600);
+/// Margin added when adapting to near-boundary gaps.
+const LIVE_AHEAD_MARGIN: Duration = Duration::from_millis(180);
+/// Only treat this much extra gap beyond base as near-boundary.
+const LIVE_NEAR_BOUNDARY_RANGE: Duration = Duration::from_millis(2600);
+/// Small jitter allowance to avoid thrashing exactly at tolerance boundaries.
+const LIVE_ACCEPT_JITTER_TOLERANCE: Duration = Duration::from_millis(90);
+/// Reject windows starting this frequently indicate a scheduler thrash burst.
+const REJECT_BURST_WINDOW: Duration = Duration::from_millis(140);
+/// Number of rapid reject-window starts before enabling burst tolerance.
+const REJECT_BURST_THRESHOLD: u32 = 8;
+/// Duration to keep elevated tolerance during a detected burst.
+const REJECT_BURST_TOLERANCE_HOLD: Duration = Duration::from_secs(2);
+/// How long to wait for audio clock movement before treating timing as "started".
+const AUDIO_CLOCK_START_GRACE: Duration = Duration::from_secs(2);
+/// Minimum interval between repeated audio-clock-zero diagnostics.
+const AUDIO_ZERO_DIAG_COOLDOWN: Duration = Duration::from_secs(2);
+/// Larger gaps are treated as stale and dropped.
+const STALE_GAP_THRESHOLD: Duration = Duration::from_secs(10);
+/// If repeated forced-resync attempts fail in one reject window, drop one head frame.
+const MAX_FORCED_RESYNCS_PER_WINDOW: u32 = 2;
+/// Lead target after a discontinuity rebase.
+const OFFSET_REBASE_TARGET_LEAD: Duration = Duration::from_millis(150);
+/// Minimum stable lead required before applying a one-shot rebase.
+const OFFSET_REBASE_MIN_LEAD: Duration = Duration::from_millis(2500);
+/// Consecutive stable reject samples required before rebasing.
+const OFFSET_REBASE_MIN_STABLE_SAMPLES: u32 = 6;
+/// Maximum per-sample lead wobble still considered stable.
+const OFFSET_REBASE_STABILITY_TOLERANCE: Duration = Duration::from_millis(220);
+/// Clamp to avoid unbounded scheduler bias.
+const MAX_VIDEO_PTS_BIAS: Duration = Duration::from_secs(8);
+/// Max number of aggressive catch-up frame admissions before escalating.
+const CATCH_UP_MAX_FRAMES: u32 = 10;
+/// If catch-up does not recover quickly, escalate to forced resync.
+const CATCH_UP_MAX_DURATION: Duration = Duration::from_millis(1300);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RejectHandlingState {
+    Normal,
+    CatchUp,
+    Resync,
+}
 
 /// The scheduler only advances position when frames are actually being delivered,
 /// preventing the scroll bar from advancing during buffering.
@@ -985,6 +1054,42 @@ pub struct FrameScheduler {
     audio_start_time: Option<std::time::Instant>,
     /// Audio position when audio_start_time was recorded (for seek-aware drift calculation)
     audio_start_pos: Duration,
+    /// Last time we logged 10s A/V clock delta diagnostics.
+    last_clock_delta_log: Option<std::time::Instant>,
+    /// Wall-clock elapsed and audio_delta at last log point (for computing 10s deltas).
+    last_clock_delta_values: Option<(Duration, Duration)>,
+    /// Number of consecutive rejections in the current reject window.
+    rejection_count: u32,
+    /// Peak observed A/V gap in the current reject window.
+    rejection_peak_gap: Duration,
+    /// Number of force-resync attempts in the current reject window.
+    forced_resyncs_in_window: u32,
+    /// Last wall-clock time when a reject window started.
+    last_reject_window_start: Option<std::time::Instant>,
+    /// Number of rapid reject-window starts in the current burst.
+    reject_burst_count: u32,
+    /// Elevated tolerance window to break repeated reject thrash.
+    burst_tolerance_until: Option<std::time::Instant>,
+    /// Last time we logged detailed "audio clock still zero" diagnostics.
+    last_audio_zero_diag: Option<std::time::Instant>,
+    /// Current reject-handling phase.
+    reject_state: RejectHandlingState,
+    /// Number of frames aggressively accepted while in catch-up.
+    catch_up_frames_in_window: u32,
+    /// One-shot guard: only apply one offset rebase per reject window.
+    offset_rebased_in_window: bool,
+    /// Last lead seen during the current reject window.
+    last_reject_lead: Option<Duration>,
+    /// Number of consecutive stable lead samples in the reject window.
+    stable_reject_lead_samples: u32,
+    /// Scheduler-only bias to account for persistent video PTS lead over audio.
+    video_pts_bias: Duration,
+    /// Wall-clock time when the last frame was accepted for display.
+    /// Used for frame-rate pacing to prevent burst consumption of queued frames.
+    last_frame_accept_time: Option<std::time::Instant>,
+    /// Minimum interval between frame acceptances (1/fps), derived from metadata.
+    /// Zero disables pacing (e.g., for VOD or unknown frame rate).
+    frame_pacing_interval: Duration,
 }
 
 impl FrameScheduler {
@@ -1005,6 +1110,23 @@ impl FrameScheduler {
             seek_generation: 0,
             audio_start_time: None,
             audio_start_pos: Duration::ZERO,
+            last_clock_delta_log: None,
+            last_clock_delta_values: None,
+            rejection_count: 0,
+            rejection_peak_gap: Duration::ZERO,
+            forced_resyncs_in_window: 0,
+            last_reject_window_start: None,
+            reject_burst_count: 0,
+            burst_tolerance_until: None,
+            last_audio_zero_diag: None,
+            reject_state: RejectHandlingState::Normal,
+            catch_up_frames_in_window: 0,
+            offset_rebased_in_window: false,
+            last_reject_lead: None,
+            stable_reject_lead_samples: 0,
+            video_pts_bias: Duration::ZERO,
+            last_frame_accept_time: None,
+            frame_pacing_interval: Duration::ZERO,
         }
     }
 
@@ -1029,13 +1151,70 @@ impl FrameScheduler {
             seek_generation: 0,
             audio_start_time: None,
             audio_start_pos: Duration::ZERO,
+            last_clock_delta_log: None,
+            last_clock_delta_values: None,
+            rejection_count: 0,
+            rejection_peak_gap: Duration::ZERO,
+            forced_resyncs_in_window: 0,
+            last_reject_window_start: None,
+            reject_burst_count: 0,
+            burst_tolerance_until: None,
+            last_audio_zero_diag: None,
+            reject_state: RejectHandlingState::Normal,
+            catch_up_frames_in_window: 0,
+            offset_rebased_in_window: false,
+            last_reject_lead: None,
+            stable_reject_lead_samples: 0,
+            video_pts_bias: Duration::ZERO,
+            last_frame_accept_time: None,
+            frame_pacing_interval: Duration::ZERO,
         }
     }
 
     /// Sets the audio handle for sync tracking.
     pub fn set_audio_handle(&mut self, audio_handle: AudioHandle) {
         self.audio_handle = Some(audio_handle);
+        self.last_audio_zero_diag = None;
         self.sync_metrics.set_using_audio_clock(true);
+    }
+
+    /// Sets frame-rate pacing for live streams. When fps > 0, the scheduler
+    /// won't accept a new frame sooner than 1/fps after the last acceptance.
+    /// This prevents burst consumption of group-boundary deliveries.
+    /// Updates pacing if fps changes (e.g., provisional → accurate metadata).
+    pub fn set_frame_rate_pacing(&mut self, fps: f32) {
+        if fps <= 0.0 {
+            return;
+        }
+        let new_interval = Duration::from_secs_f64(1.0 / fps as f64);
+        if self.frame_pacing_interval == new_interval {
+            return; // No change
+        }
+        let was_zero = self.frame_pacing_interval.is_zero();
+        self.frame_pacing_interval = new_interval;
+        if was_zero {
+            tracing::info!(
+                "Frame-rate pacing enabled: {:.1} fps ({:.1}ms interval)",
+                fps,
+                1000.0 / fps as f64,
+            );
+        } else {
+            tracing::info!(
+                "Frame-rate pacing updated: {:.1} fps ({:.1}ms interval)",
+                fps,
+                1000.0 / fps as f64,
+            );
+        }
+    }
+
+    /// Disables frame-rate pacing (e.g., when a stream acquires duration metadata
+    /// and is no longer treated as live).
+    pub fn clear_frame_rate_pacing(&mut self) {
+        if !self.frame_pacing_interval.is_zero() {
+            tracing::info!("Frame-rate pacing disabled");
+            self.frame_pacing_interval = Duration::ZERO;
+            self.last_frame_accept_time = None;
+        }
     }
 
     /// Returns the sync metrics tracker.
@@ -1113,6 +1292,9 @@ impl FrameScheduler {
         self.playback_requested = true;
         self.waiting_for_first_frame = true;
         self.stalled = false;
+        self.reset_rejection_tracking();
+        self.last_clock_delta_log = None;
+        self.last_clock_delta_values = None;
         // Don't set playback_start_time yet - wait for first frame
     }
 
@@ -1121,8 +1303,11 @@ impl FrameScheduler {
         self.playback_requested = false;
         self.waiting_for_first_frame = false;
         self.stalled = false;
+        self.reset_rejection_tracking();
         self.audio_start_time = None;
         self.audio_start_pos = Duration::ZERO;
+        self.last_clock_delta_log = None;
+        self.last_clock_delta_values = None;
         if let Some(start) = self.playback_start_time.take() {
             // Calculate wall-clock position
             let wall_clock_pos = self.playback_start_position + start.elapsed();
@@ -1153,8 +1338,9 @@ impl FrameScheduler {
         self.current_position = position;
         self.current_frame = None;
         self.stalled = false;
-        self.rejection_start_time = None;
+        self.reset_rejection_tracking();
         self.seek_generation = self.seek_generation.wrapping_add(1);
+        self.video_pts_bias = Duration::ZERO;
 
         // Reset sync metrics on seek to clear max_drift from transient spikes
         self.sync_metrics.reset();
@@ -1167,6 +1353,8 @@ impl FrameScheduler {
             self.playback_start_time = None;
             self.audio_start_time = None;
             self.audio_start_pos = Duration::ZERO;
+            self.last_clock_delta_log = None;
+            self.last_clock_delta_values = None;
 
             // Clear audio epoch and native position so they get re-synchronized
             if let Some(ref audio) = self.audio_handle {
@@ -1238,6 +1426,195 @@ impl FrameScheduler {
         }
     }
 
+    fn audio_started_for_timing(&self) -> bool {
+        self.audio_handle
+            .as_ref()
+            .map(|h| {
+                if !h.is_available() {
+                    return true;
+                }
+                if h.position_for_sync() > Duration::ZERO {
+                    return true;
+                }
+                self.playback_start_time
+                    .map(|t| t.elapsed() >= AUDIO_CLOCK_START_GRACE)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(true)
+    }
+
+    fn maybe_log_audio_zero_diag(
+        &mut self,
+        now: std::time::Instant,
+        current_pos: Duration,
+        next_pts: Duration,
+        gap: Duration,
+        ahead_tolerance: Duration,
+    ) {
+        let Some(audio) = self.audio_handle.clone() else {
+            return;
+        };
+        let sync_pos = audio.position_for_sync();
+        if sync_pos > Duration::ZERO {
+            return;
+        }
+        if self
+            .last_audio_zero_diag
+            .map(|last| now.duration_since(last) < AUDIO_ZERO_DIAG_COOLDOWN)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        self.last_audio_zero_diag = Some(now);
+        let raw_pos = audio.position();
+        let samples_played = audio.samples_played();
+        tracing::warn!(
+            "get_next_frame: audio clock still zero during reject window (current_pos={:?}, next_pts={:?}, gap={}ms, tolerance={}ms, audio_available={}, epoch_set={}, raw_audio_pos={:?}, sync_audio_pos={:?}, samples_played={}, samples_ms={}, offset_us={})",
+            current_pos,
+            next_pts,
+            gap.as_millis(),
+            ahead_tolerance.as_millis(),
+            audio.is_available(),
+            audio.playback_epoch().is_some(),
+            raw_pos,
+            sync_pos,
+            samples_played,
+            audio.samples_played_duration().as_millis(),
+            audio.stream_pts_offset_us()
+        );
+    }
+
+    fn compute_ahead_tolerance(
+        &self,
+        audio_started: bool,
+        gap: Duration,
+        now: std::time::Instant,
+    ) -> Duration {
+        if !audio_started {
+            return AUDIO_STARTUP_AHEAD_TOLERANCE;
+        }
+
+        let mut tolerance = LIVE_BASE_AHEAD_TOLERANCE;
+
+        if self
+            .burst_tolerance_until
+            .map(|until| now < until)
+            .unwrap_or(false)
+        {
+            return LIVE_MAX_AHEAD_TOLERANCE;
+        }
+
+        let near_boundary = gap > LIVE_BASE_AHEAD_TOLERANCE
+            && gap <= LIVE_BASE_AHEAD_TOLERANCE + LIVE_NEAR_BOUNDARY_RANGE;
+        if near_boundary {
+            tolerance = tolerance.max(gap.saturating_add(LIVE_AHEAD_MARGIN));
+        }
+
+        if let Some(start) = self.rejection_start_time {
+            let stuck_duration = now.duration_since(start);
+            let steps = stuck_duration.as_millis() / 500;
+            let escalated_ms = LIVE_BASE_AHEAD_TOLERANCE
+                .as_millis()
+                .saturating_add(steps.saturating_mul(LIVE_AHEAD_MARGIN.as_millis()))
+                .min(LIVE_MAX_AHEAD_TOLERANCE.as_millis());
+            tolerance = tolerance.max(Duration::from_millis(escalated_ms as u64));
+        }
+
+        tolerance.min(LIVE_MAX_AHEAD_TOLERANCE)
+    }
+
+    fn reset_rejection_tracking(&mut self) {
+        self.rejection_start_time = None;
+        self.rejection_count = 0;
+        self.rejection_peak_gap = Duration::ZERO;
+        self.forced_resyncs_in_window = 0;
+        self.reject_state = RejectHandlingState::Normal;
+        self.catch_up_frames_in_window = 0;
+        self.offset_rebased_in_window = false;
+        self.last_reject_lead = None;
+        self.stable_reject_lead_samples = 0;
+    }
+
+    fn record_reject_window_start(&mut self, now: std::time::Instant) {
+        if let Some(last_start) = self.last_reject_window_start {
+            if now.duration_since(last_start) <= REJECT_BURST_WINDOW {
+                self.reject_burst_count = self.reject_burst_count.saturating_add(1);
+            } else {
+                self.reject_burst_count = 1;
+            }
+        } else {
+            self.reject_burst_count = 1;
+        }
+        self.last_reject_window_start = Some(now);
+
+        if self.reject_burst_count >= REJECT_BURST_THRESHOLD {
+            let hold_until = now + REJECT_BURST_TOLERANCE_HOLD;
+            let already_active = self
+                .burst_tolerance_until
+                .map(|until| now < until)
+                .unwrap_or(false);
+            self.burst_tolerance_until = Some(hold_until);
+            if !already_active {
+                tracing::warn!(
+                    "get_next_frame: reject burst detected (count={}), enabling burst tolerance for {:?}",
+                    self.reject_burst_count,
+                    REJECT_BURST_TOLERANCE_HOLD
+                );
+            }
+        }
+    }
+
+    fn maybe_rebase_offset_for_stable_lead(
+        &mut self,
+        current_pos: Duration,
+        next_pts: Duration,
+        lead: Duration,
+    ) -> bool {
+        let stable = match self.last_reject_lead {
+            Some(prev_lead) => lead.abs_diff(prev_lead) <= OFFSET_REBASE_STABILITY_TOLERANCE,
+            None => false,
+        };
+
+        self.last_reject_lead = Some(lead);
+        if stable {
+            self.stable_reject_lead_samples = self.stable_reject_lead_samples.saturating_add(1);
+        } else {
+            self.stable_reject_lead_samples = 1;
+        }
+
+        if self.offset_rebased_in_window
+            || lead < OFFSET_REBASE_MIN_LEAD
+            || self.stable_reject_lead_samples < OFFSET_REBASE_MIN_STABLE_SAMPLES
+        {
+            return false;
+        }
+
+        let bias_delta = lead.saturating_sub(OFFSET_REBASE_TARGET_LEAD);
+        if bias_delta.is_zero() {
+            return false;
+        }
+
+        let previous_bias = self.video_pts_bias;
+        self.video_pts_bias = std::cmp::min(
+            self.video_pts_bias.saturating_add(bias_delta),
+            MAX_VIDEO_PTS_BIAS,
+        );
+        self.offset_rebased_in_window = true;
+        self.reject_state = RejectHandlingState::CatchUp;
+
+        tracing::warn!(
+            "get_next_frame: applied one-shot offset rebase (lead={}ms, stable_samples={}, current_pos={:?}, next_pts={:?}, bias {}ms -> {}ms)",
+            lead.as_millis(),
+            self.stable_reject_lead_samples,
+            current_pos,
+            next_pts,
+            previous_bias.as_millis(),
+            self.video_pts_bias.as_millis()
+        );
+
+        true
+    }
+
     /// Gets the next frame to display from the queue.
     ///
     /// This will return the appropriate frame based on the current playback
@@ -1270,16 +1647,33 @@ impl FrameScheduler {
             self.on_frame_received(frame.pts);
             self.current_frame = Some(frame.clone());
             self.stalled = false;
+            self.last_frame_accept_time = Some(std::time::Instant::now());
             // Record sync metrics for first frame
             self.record_sync(frame.pts);
             return Some(frame);
         }
 
+        // Frame-rate pacing: prevent burst consumption of group-boundary deliveries.
+        // For live streams with known frame rate, don't advance to the next frame
+        // sooner than 1/fps since the last acceptance. This keeps display smooth
+        // even when the transport delivers entire groups at once.
+        // Allow 4ms of jitter to avoid missing frames at boundary.
+        if !self.frame_pacing_interval.is_zero() {
+            if let Some(last) = self.last_frame_accept_time {
+                let since_last = last.elapsed();
+                if since_last
+                    < self
+                        .frame_pacing_interval
+                        .saturating_sub(Duration::from_millis(4))
+                {
+                    return self.current_frame.clone();
+                }
+            }
+        }
+
         // Use AUDIO POSITION as master clock when available.
         // This is the key to A/V sync: video presentation follows audio playback.
         // Wall-clock is only used as fallback when audio is not available.
-        let current_pos = self.sync_position();
-
         // Keep popping frames until we find one that should be displayed now
         loop {
             let Some(next_pts) = queue.peek_pts() else {
@@ -1290,93 +1684,181 @@ impl FrameScheduler {
 
             // We have frames - clear stall state and resync clock if needed
             self.clear_stall_if_needed();
+            let raw_sync_pos = self.sync_position();
+            let current_pos = raw_sync_pos.saturating_add(self.video_pts_bias);
 
+            let now = std::time::Instant::now();
             // Accept frame if:
             // 1. It's at or before current position (normal case), OR
-            // 2. It's within tolerance AHEAD of current position (allows for A/V desync after seek)
-            // 3. We have no current frame (after seek) - accept ANY frame to restart clock
-            //
-            // The ahead tolerance varies based on audio state:
-            // - If audio is available but not started: use tight 100ms tolerance to prevent
-            //   video from racing ahead while waiting for audio to buffer
-            // - After audio starts: use 2000ms tolerance for seek recovery where audio
-            //   may lag behind video frames due to keyframe alignment
-            let audio_started = self
-                .audio_handle
-                .as_ref()
-                .map(|h| {
-                    // If audio isn't available, treat as "no audio" (use normal tolerance)
-                    // to prevent post-seek stalls when audio handle exists but fails
-                    if !h.is_available() {
-                        return true;
-                    }
-                    // Audio is available - check if it has started producing samples
-                    h.position_for_sync() > Duration::ZERO
-                })
-                .unwrap_or(true); // No audio handle = treat as started
-            let ahead_tolerance = if audio_started {
-                Duration::from_millis(2000) // Normal tolerance for seek recovery
-            } else {
-                Duration::from_millis(100) // Tight tolerance while waiting for audio
-            };
+            // 2. It's within tolerance AHEAD of current position (adaptive for live jitter), OR
+            // 3. We have no current frame (after seek) - accept ANY frame to restart clock.
+            let audio_started = self.audio_started_for_timing();
+            let gap = next_pts.abs_diff(current_pos);
+            let ahead_tolerance = self.compute_ahead_tolerance(audio_started, gap, now);
+            let accept_tolerance = ahead_tolerance.saturating_add(LIVE_ACCEPT_JITTER_TOLERANCE);
             let should_accept =
-                next_pts <= current_pos + ahead_tolerance || self.current_frame.is_none();
+                next_pts <= current_pos + accept_tolerance || self.current_frame.is_none();
 
             if !should_accept {
-                // Track when rejection streak started (wall-clock based)
-                let now = std::time::Instant::now();
                 let rejection_start = *self.rejection_start_time.get_or_insert(now);
                 let stuck_duration = now.duration_since(rejection_start);
+                self.rejection_count = self.rejection_count.saturating_add(1);
+                self.rejection_peak_gap = self.rejection_peak_gap.max(gap);
+                let lead = next_pts.saturating_sub(current_pos);
+                let audio_pos = self.audio_position();
 
-                // Use absolute PTS delta to avoid negative/wrapped PTS quirks
-                let gap = next_pts.abs_diff(current_pos);
-
-                // Detect stuck state using wall-clock time, not frame count.
-                // Only resync if gap is reasonable (< 10s); larger gaps indicate stale frames.
-                let gap_is_reasonable = gap < Duration::from_secs(10);
-
-                if stuck_duration >= STUCK_TIMEOUT && gap_is_reasonable {
+                if self.rejection_count == 1 {
+                    self.record_reject_window_start(now);
                     tracing::warn!(
-                        "get_next_frame: STUCK for {:?}, forcing resync. \
-                         current_pos={:?}, next_pts={:?}, gap={:?}ms, seek_gen={}",
-                        stuck_duration,
+                        "get_next_frame: reject window start sync_pos={:?}, effective_pos={:?}, next_pts={:?}, gap={}ms, lead={}ms, tolerance={}ms, bias={}ms, state={:?}, audio_pos={:?}, seek_gen={}",
+                        raw_sync_pos,
                         current_pos,
                         next_pts,
                         gap.as_millis(),
+                        lead.as_millis(),
+                        accept_tolerance.as_millis(),
+                        self.video_pts_bias.as_millis(),
+                        self.reject_state,
+                        audio_pos,
                         self.seek_generation
                     );
-                    // Force accept: pop the frame and resync clock to it
-                    if let Some(frame) = queue.pop() {
-                        self.rejection_start_time = None;
-                        self.current_position = frame.pts;
-                        self.current_frame = Some(frame.clone());
-                        self.playback_start_time = Some(std::time::Instant::now());
-                        self.playback_start_position = frame.pts;
-                        return Some(frame);
+                    if audio_pos == Duration::ZERO {
+                        self.maybe_log_audio_zero_diag(
+                            now,
+                            current_pos,
+                            next_pts,
+                            gap,
+                            ahead_tolerance,
+                        );
                     }
-                } else if stuck_duration >= STUCK_TIMEOUT && !gap_is_reasonable {
-                    // Gap too large - likely stale frame from before seek. Drop it.
+                }
+
+                if self.maybe_rebase_offset_for_stable_lead(current_pos, next_pts, lead) {
+                    continue;
+                }
+
+                let near_boundary = audio_started
+                    && gap > LIVE_BASE_AHEAD_TOLERANCE
+                    && gap <= LIVE_BASE_AHEAD_TOLERANCE + LIVE_NEAR_BOUNDARY_RANGE;
+                let force_timeout = if near_boundary {
+                    NEAR_BOUNDARY_FORCE_TIMEOUT
+                } else {
+                    STUCK_TIMEOUT
+                };
+                let gap_is_stale = gap >= STALE_GAP_THRESHOLD;
+
+                if stuck_duration >= force_timeout && gap_is_stale {
                     tracing::warn!(
-                        "get_next_frame: Dropping stale frame (gap={:?}s > 10s). \
-                         current_pos={:?}, next_pts={:?}, seek_gen={}",
-                        gap.as_secs(),
+                        "get_next_frame: dropping stale frame after reject window stuck={:?}, gap={}ms, current_pos={:?}, next_pts={:?}, seek_gen={}",
+                        stuck_duration,
+                        gap.as_millis(),
                         current_pos,
                         next_pts,
                         self.seek_generation
                     );
-                    let _ = queue.pop(); // Drop stale frame
-                    self.rejection_start_time = None; // Reset to check next frame
-                    continue; // Try next frame in queue
+                    let _ = queue.pop();
+                    self.reset_rejection_tracking();
+                    continue;
+                }
+
+                if stuck_duration >= force_timeout {
+                    if self.reject_state == RejectHandlingState::Normal {
+                        self.reject_state = RejectHandlingState::CatchUp;
+                        tracing::warn!(
+                            "get_next_frame: entering catch-up mode (stuck={:?}, lead={}ms, gap={}ms, tolerance={}ms, bias={}ms)",
+                            stuck_duration,
+                            lead.as_millis(),
+                            gap.as_millis(),
+                            accept_tolerance.as_millis(),
+                            self.video_pts_bias.as_millis()
+                        );
+                    }
+
+                    if self.reject_state == RejectHandlingState::CatchUp {
+                        let catch_up_timed_out =
+                            stuck_duration >= force_timeout.saturating_add(CATCH_UP_MAX_DURATION);
+                        if catch_up_timed_out
+                            || self.catch_up_frames_in_window >= CATCH_UP_MAX_FRAMES
+                        {
+                            self.reject_state = RejectHandlingState::Resync;
+                            tracing::warn!(
+                                "get_next_frame: escalating catch-up to resync (stuck={:?}, catch_up_frames={}, lead={}ms)",
+                                stuck_duration,
+                                self.catch_up_frames_in_window,
+                                lead.as_millis()
+                            );
+                        } else if let Some(frame) = queue.pop() {
+                            self.catch_up_frames_in_window =
+                                self.catch_up_frames_in_window.saturating_add(1);
+                            tracing::debug!(
+                                "get_next_frame: catch-up accepted frame pts={:?} (count={}, lead={}ms, bias={}ms)",
+                                frame.pts,
+                                self.catch_up_frames_in_window,
+                                lead.as_millis(),
+                                self.video_pts_bias.as_millis()
+                            );
+                            self.current_position = frame.pts;
+                            self.current_frame = Some(frame.clone());
+                            self.playback_start_time = Some(std::time::Instant::now());
+                            self.playback_start_position = frame.pts;
+                            self.last_frame_accept_time = Some(std::time::Instant::now());
+                            self.record_sync(frame.pts);
+                            self.track_recovery_frame();
+                            return Some(frame);
+                        }
+                    }
+
+                    if self.reject_state == RejectHandlingState::Resync
+                        && self.forced_resyncs_in_window < MAX_FORCED_RESYNCS_PER_WINDOW
+                    {
+                        self.forced_resyncs_in_window += 1;
+                        tracing::warn!(
+                            "get_next_frame: forcing resync attempt {}/{} (stuck={:?}, near_boundary={}, gap={}ms, tolerance={}ms, audio_pos={:?})",
+                            self.forced_resyncs_in_window,
+                            MAX_FORCED_RESYNCS_PER_WINDOW,
+                            stuck_duration,
+                            near_boundary,
+                            gap.as_millis(),
+                            accept_tolerance.as_millis(),
+                            audio_pos
+                        );
+                        if let Some(frame) = queue.pop() {
+                            self.current_position = frame.pts;
+                            self.current_frame = Some(frame.clone());
+                            self.playback_start_time = Some(std::time::Instant::now());
+                            self.playback_start_position = frame.pts;
+                            self.last_frame_accept_time = Some(std::time::Instant::now());
+                            return Some(frame);
+                        }
+                    } else if self.reject_state == RejectHandlingState::Resync {
+                        if let Some(dropped_frame) = queue.pop() {
+                            tracing::warn!(
+                                "get_next_frame: forced-resync limit reached; dropping head frame pts={:?} after {:?} (rejects={}, peak_gap={}ms, audio_pos={:?})",
+                                dropped_frame.pts,
+                                stuck_duration,
+                                self.rejection_count,
+                                self.rejection_peak_gap.as_millis(),
+                                audio_pos
+                            );
+                            self.reset_rejection_tracking();
+                            continue;
+                        }
+                    }
                 }
 
                 // Log rejection details periodically (every ~1 second)
                 if stuck_duration.as_millis() % 1000 < 20 {
                     tracing::debug!(
-                        "get_next_frame: rejecting, stuck={:?}, current_pos={:?}, next_pts={:?}, gap={:?}ms",
+                        "get_next_frame: rejecting, stuck={:?}, current_pos={:?}, next_pts={:?}, gap={:?}ms, tolerance={}ms, bias={}ms, state={:?}, audio_pos={:?}, rejects={}",
                         stuck_duration,
                         current_pos,
                         next_pts,
-                        gap.as_millis()
+                        gap.as_millis(),
+                        accept_tolerance.as_millis(),
+                        self.video_pts_bias.as_millis(),
+                        self.reject_state,
+                        audio_pos,
+                        self.rejection_count
                     );
                 }
                 // We're ahead of schedule, return current frame
@@ -1384,7 +1866,20 @@ impl FrameScheduler {
             }
 
             // Frame accepted - reset rejection tracking
-            self.rejection_start_time = None;
+            if let Some(rejection_start) = self.rejection_start_time {
+                let stuck_duration = now.duration_since(rejection_start);
+                if stuck_duration >= Duration::from_millis(200) {
+                    tracing::info!(
+                        "get_next_frame: reject window ended after {:?} (rejects={}, peak_gap={}ms, tolerance={}ms, audio_pos={:?})",
+                        stuck_duration,
+                        self.rejection_count,
+                        self.rejection_peak_gap.as_millis(),
+                        accept_tolerance.as_millis(),
+                        self.audio_position()
+                    );
+                }
+            }
+            self.reset_rejection_tracking();
 
             let Some(frame) = queue.pop() else { continue };
 
@@ -1397,6 +1892,7 @@ impl FrameScheduler {
 
             self.current_position = frame.pts;
             self.current_frame = Some(frame.clone());
+            self.last_frame_accept_time = Some(std::time::Instant::now());
 
             // NOTE: We previously tried setting native_position from frame.pts for macOS,
             // but this creates a circular dependency: sync_position() reads audio.position
@@ -1463,6 +1959,37 @@ impl FrameScheduler {
                     .unwrap_or(Duration::ZERO);
                 let audio_delta = audio_pos.saturating_sub(self.audio_start_pos);
                 self.sync_metrics.record_frame(elapsed, audio_delta);
+
+                // 10s clock-source diagnostic: log wall-clock vs audio-clock deltas
+                // to determine whether drift is from audio sample counting or video pacing.
+                let now = std::time::Instant::now();
+                let should_log = match self.last_clock_delta_log {
+                    None => elapsed > Duration::from_secs(1), // emit first diagnostic after 1s
+                    Some(last) => now.duration_since(last) >= Duration::from_secs(10),
+                };
+                if should_log {
+                    let (prev_elapsed, prev_audio) = self
+                        .last_clock_delta_values
+                        .unwrap_or((Duration::ZERO, Duration::ZERO));
+                    let d_wall = elapsed.saturating_sub(prev_elapsed);
+                    let d_audio = audio_delta.saturating_sub(prev_audio);
+                    let d_wall_s = d_wall.as_secs_f64();
+                    let d_audio_s = d_audio.as_secs_f64();
+                    let rate = if d_wall_s > 0.0 {
+                        d_audio_s / d_wall_s
+                    } else {
+                        1.0
+                    };
+                    tracing::info!(
+                        "A/V clock delta (10s): wall={}ms, audio={}ms, rate={:.4} (1.0=perfect), drift_now={}ms",
+                        d_wall.as_millis(),
+                        d_audio.as_millis(),
+                        rate,
+                        elapsed.as_millis() as i64 - audio_delta.as_millis() as i64
+                    );
+                    self.last_clock_delta_log = Some(now);
+                    self.last_clock_delta_values = Some((elapsed, audio_delta));
+                }
             }
         }
     }

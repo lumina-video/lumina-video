@@ -10,6 +10,7 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use super::audio::{AudioConfig, AudioHandle, AudioPlayer, AudioSamples};
+use super::audio_ring_buffer::RingBufferConfig;
 use super::moq_decoder::{MoqAudioShared, MoqAudioStatus};
 
 /// A raw encoded audio frame received from MoQ transport, ready for AAC decoding.
@@ -105,6 +106,9 @@ impl SymphoniaAacDecoder {
     }
 
     /// Decodes a single AAC frame into interleaved f32 samples.
+    ///
+    /// If the decoded output has fewer channels than `self.channels` (e.g. mono AAC
+    /// but stereo playback), upmixes by duplicating each sample across channels.
     fn decode_frame(&mut self, data: &[u8], timestamp_us: u64) -> Result<AudioSamples, String> {
         use symphonia_core::formats::Packet;
 
@@ -115,20 +119,44 @@ impl SymphoniaAacDecoder {
             .map_err(|e| format!("AAC decode error: {e}"))?;
 
         let spec = *decoded.spec();
-        let num_channels = spec.channels.count();
+        let decoded_channels = spec.channels.count();
         let num_frames = decoded.frames();
 
-        if num_frames == 0 || num_channels == 0 {
+        if num_frames == 0 || decoded_channels == 0 {
             return Err("Empty decoded buffer".to_string());
         }
 
         let mut sample_buf =
             symphonia_core::audio::SampleBuffer::<f32>::new(num_frames as u64, spec);
         sample_buf.copy_interleaved_ref(decoded);
-        let interleaved = sample_buf.samples().to_vec();
+        let raw = sample_buf.samples();
+
+        // Upmix if decoded channels < target channels (e.g. mono → stereo)
+        let target_ch = self.channels as usize;
+        let data = if decoded_channels < target_ch {
+            let mut upmixed = Vec::with_capacity(num_frames * target_ch);
+            for frame_samples in raw.chunks(decoded_channels) {
+                // Duplicate each decoded sample across target channels
+                for ch in 0..target_ch {
+                    upmixed.push(frame_samples[ch.min(decoded_channels - 1)]);
+                }
+            }
+            upmixed
+        } else if decoded_channels > target_ch {
+            // Downmix: take only the first target_ch channels per frame
+            let mut downmixed = Vec::with_capacity(num_frames * target_ch);
+            for frame_samples in raw.chunks(decoded_channels) {
+                for sample in frame_samples.iter().take(target_ch) {
+                    downmixed.push(*sample);
+                }
+            }
+            downmixed
+        } else {
+            raw.to_vec()
+        };
 
         Ok(AudioSamples {
-            data: interleaved,
+            data,
             sample_rate: self.sample_rate,
             channels: self.channels,
             pts: Duration::from_micros(timestamp_us),
@@ -190,6 +218,7 @@ impl Drop for MoqAudioThread {
                 *self.audio_shared.audio_status.lock() = MoqAudioStatus::Error;
             }
         }
+        self.audio_shared.alive.store(false, Ordering::Release);
         self.audio_shared
             .internal_audio_ready
             .store(false, Ordering::Relaxed);
@@ -206,7 +235,15 @@ impl Drop for MoqAudioThread {
 /// Maximum consecutive decode errors before downgrading to `Error` status.
 const MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 100;
 
-/// Audio thread main loop: receives AAC frames, decodes via symphonia, plays via rodio.
+/// Gap detection threshold: if two consecutive frames have a PTS gap larger than
+/// this, insert silence to keep the ring buffer timeline correct.
+const GAP_THRESHOLD_US: u64 = 32_000; // 32ms
+
+/// Audio thread main loop: receives AAC frames, decodes via symphonia, writes to ring buffer.
+///
+/// Uses a single continuous `RingBufferSource` appended once to the rodio Sink,
+/// eliminating per-source transitions, resampler state resets, and queue mutex
+/// contention that caused clicks/pops in the previous batch+append approach.
 fn moq_audio_thread_main(
     audio_rx: crossbeam_channel::Receiver<MoqAudioFrame>,
     sample_rate: u32,
@@ -216,13 +253,21 @@ fn moq_audio_thread_main(
     stop_flag: Arc<AtomicBool>,
     audio_shared: Arc<MoqAudioShared>,
 ) {
-    let mut player = match AudioPlayer::new_with_handle(
-        AudioConfig::default(),
+    let ring_config = RingBufferConfig::for_format(sample_rate, channels.min(2) as u16);
+    let audio_config = AudioConfig {
+        sample_rate,
+        channels: channels.min(2) as u16,
+        ..Default::default()
+    };
+
+    let (mut player, producer) = match AudioPlayer::new_ring_buffer(
+        audio_config,
+        ring_config,
         Some(audio_handle.clone()),
     ) {
-        Ok(p) => p,
+        Ok(pair) => pair,
         Err(e) => {
-            tracing::warn!("MoQ audio: failed to create AudioPlayer: {e}");
+            tracing::warn!("MoQ audio: failed to create ring buffer AudioPlayer: {e}");
             #[cfg(target_os = "linux")]
             tracing::warn!("MoQ audio: on Linux, ensure libasound2-dev is installed and an audio device is available");
             *audio_shared.audio_status.lock() = MoqAudioStatus::Error;
@@ -253,17 +298,24 @@ fn moq_audio_thread_main(
     audio_shared
         .internal_audio_ready
         .store(true, Ordering::Relaxed);
+    audio_shared.alive.store(true, Ordering::Release);
     *audio_shared.audio_status.lock() = MoqAudioStatus::Running;
     player.play();
 
     tracing::info!(
-        "MoQ audio: thread started ({}Hz, {}ch, description={})",
+        "MoQ audio: ring buffer thread started ({}Hz, {}ch, description={})",
         sample_rate,
         channels,
         description.as_ref().map(|d| d.len()).unwrap_or(0),
     );
 
     let mut consecutive_errors: u32 = 0;
+    let mut last_pts_us: Option<u64> = None;
+    let ch = channels.min(2) as usize;
+    let mut frames_since_metrics: u32 = 0;
+    let mut total_frames_decoded: u64 = 0;
+    let thread_start = std::time::Instant::now();
+    let mut first_frame_logged = false;
 
     loop {
         if stop_flag.load(Ordering::Relaxed) {
@@ -274,8 +326,68 @@ fn moq_audio_thread_main(
         match audio_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(frame) => match aac_decoder.decode_frame(&frame.data, frame.timestamp_us) {
                 Ok(samples) => {
-                    player.queue_samples(samples);
                     consecutive_errors = 0;
+                    total_frames_decoded += 1;
+
+                    // Log first decoded frame details
+                    if !first_frame_logged {
+                        first_frame_logged = true;
+                        audio_handle.set_audio_base_pts(samples.pts);
+                        tracing::info!(
+                            "MoQ audio: first frame base_pts={:?}, {} interleaved samples, {}ch declared",
+                            samples.pts,
+                            samples.data.len(),
+                            samples.channels,
+                        );
+                    }
+
+                    // Set base PTS on first decoded frame
+                    if last_pts_us.is_none() {
+                        audio_handle.set_audio_base_pts(samples.pts);
+                    }
+
+                    // Gap detection: insert silence for PTS discontinuities > 32ms
+                    if let Some(prev_pts) = last_pts_us {
+                        let expected_next = prev_pts
+                            + (samples.data.len() as u64 * 1_000_000)
+                                / (sample_rate as u64 * ch as u64);
+                        let actual = frame.timestamp_us;
+                        if actual > expected_next + GAP_THRESHOLD_US {
+                            let gap_us = actual - expected_next;
+                            let silence_samples =
+                                (gap_us as usize * sample_rate as usize * ch) / 1_000_000;
+                            let silence = vec![0.0f32; silence_samples.min(48000 * ch)]; // Cap at 1s
+                            producer.write(&silence);
+                            tracing::debug!(
+                                "MoQ audio: inserted {}ms silence ({} samples) for PTS gap",
+                                gap_us / 1000,
+                                silence_samples,
+                            );
+                        }
+                    }
+                    last_pts_us = Some(frame.timestamp_us);
+
+                    // Write decoded PCM directly to ring buffer (lock-free)
+                    producer.write(&samples.data);
+
+                    // Periodically flush ring buffer metrics for UI observability (~1/sec)
+                    frames_since_metrics += 1;
+                    if frames_since_metrics >= 50 {
+                        frames_since_metrics = 0;
+                        let m = producer.metrics();
+                        let elapsed = thread_start.elapsed().as_secs_f64();
+                        let fps = total_frames_decoded as f64 / elapsed.max(0.001);
+                        tracing::debug!(
+                            "MoQ audio: {:.1} fps, fill={}% ({}/{}), wrote={}, read={}, overflows={}, stalls={}, samples/frame={}",
+                            fps,
+                            m.fill_samples * 100 / m.capacity_samples.max(1),
+                            m.fill_samples, m.capacity_samples,
+                            m.total_written, m.total_read,
+                            m.overflow_count, m.stall_count,
+                            samples.data.len(),
+                        );
+                        *audio_shared.ring_buffer_metrics.lock() = m;
+                    }
                 }
                 Err(e) => {
                     consecutive_errors += 1;
@@ -303,6 +415,10 @@ fn moq_audio_thread_main(
         }
     }
 
+    // Drop producer before cleanup so consumer knows we're done
+    drop(producer);
+
+    audio_shared.alive.store(false, Ordering::Release);
     audio_shared
         .internal_audio_ready
         .store(false, Ordering::Relaxed);
@@ -326,7 +442,6 @@ pub(crate) fn select_preferred_audio_rendition(
 
     catalog
         .audio
-        .as_ref()?
         .renditions
         .iter()
         .filter(|(_, cfg)| matches!(cfg.codec, AudioCodec::AAC(_)))
@@ -355,17 +470,9 @@ mod tests {
 
     #[test]
     fn test_live_edge_sender_channel_closed() {
-        // In production, LiveEdgeSender holds rx_drain from the same channel as tx.
-        // The channel disconnects only when ALL receivers (including rx_drain) are
-        // dropped, which happens when the LiveEdgeSender itself is dropped.
-        //
-        // To test the ChannelClosed code path, we create a fully disconnected tx
-        // (all receivers dropped) and pair it with a separate drain receiver.
-        // This validates that try_send() correctly propagates Disconnected.
         let (tx, rx) = crossbeam_channel::bounded::<u32>(2);
-        drop(rx); // tx is now disconnected — no receivers left
+        drop(rx);
 
-        // rx_drain is from a separate channel (only used for drain logic, not delivery)
         let (_drain_tx, drain_rx) = crossbeam_channel::bounded::<u32>(2);
         let sender = LiveEdgeSender::new(tx, drain_rx);
         assert!(sender.send(1).is_err());
@@ -373,30 +480,67 @@ mod tests {
 
     #[test]
     fn test_live_edge_sender_same_channel_lifecycle() {
-        // Production wiring: tx and rx_drain are from the SAME channel.
-        // LiveEdgeSender keeps the channel alive via rx_drain. After dropping
-        // the sender (which drops rx_drain), the channel becomes disconnected.
         let (tx, rx) = crossbeam_channel::bounded::<u32>(2);
         let rx_drain = rx.clone();
 
         let sender = LiveEdgeSender::new(tx, rx_drain);
 
-        // Sender works while channel is alive
         assert!(sender.send(1).is_ok());
         assert!(sender.send(2).is_ok());
-        // Full channel — drain + retry, should still Ok
         assert!(sender.send(3).is_ok());
 
-        // Consumer can still receive
         assert!(rx.try_recv().is_ok());
 
-        // Drop sender (and its rx_drain) — channel disconnects
         drop(sender);
 
-        // Verify channel is now closed from consumer side
-        // Drain remaining items first
         while rx.try_recv().is_ok() {}
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_select_audio_empty_renditions() {
+        let catalog = hang::catalog::Catalog::default();
+        assert!(select_preferred_audio_rendition(&catalog).is_none());
+    }
+
+    #[test]
+    fn test_select_audio_prefers_highest_sample_rate() {
+        use std::collections::BTreeMap;
+
+        let mut renditions = BTreeMap::new();
+        renditions.insert(
+            "audio0".to_string(),
+            hang::catalog::AudioConfig {
+                codec: hang::catalog::AudioCodec::AAC(hang::catalog::AAC { profile: 2 }),
+                sample_rate: 44100,
+                channel_count: 2,
+                bitrate: None,
+                description: None,
+                container: hang::catalog::Container::Legacy,
+                jitter: None,
+            },
+        );
+        renditions.insert(
+            "audio1".to_string(),
+            hang::catalog::AudioConfig {
+                codec: hang::catalog::AudioCodec::AAC(hang::catalog::AAC { profile: 2 }),
+                sample_rate: 48000,
+                channel_count: 2,
+                bitrate: None,
+                description: None,
+                container: hang::catalog::Container::Legacy,
+                jitter: None,
+            },
+        );
+
+        let catalog = hang::catalog::Catalog {
+            audio: hang::catalog::Audio { renditions },
+            ..Default::default()
+        };
+
+        let (name, cfg) = select_preferred_audio_rendition(&catalog).unwrap();
+        assert_eq!(name, "audio1");
+        assert_eq!(cfg.sample_rate, 48000);
     }
 
     #[test]
@@ -404,11 +548,9 @@ mod tests {
         let (tx, rx) = crossbeam_channel::bounded(3);
         let sender = LiveEdgeSender::new(tx.clone(), rx.clone());
 
-        // Send more than capacity
         for i in 0..10u32 {
             assert!(sender.send(i).is_ok());
         }
-        // Channel should never exceed capacity
         assert!(rx.len() <= 3);
     }
 }

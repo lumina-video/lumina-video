@@ -147,17 +147,17 @@ optional = true
 # MoQ crates from kixelated/moq (the active repo, moq-rs is archived)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.moq-lite]
 git = "https://github.com/kixelated/moq"
-rev = "eb3fbf1fd1b12e8304306470752a98c0a11767fd"
+rev = "77ab4bfa473a7f5fc22e82ad38b606ab12faa18c"
 optional = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.moq-native]
 git = "https://github.com/kixelated/moq"
-rev = "eb3fbf1fd1b12e8304306470752a98c0a11767fd"
+rev = "77ab4bfa473a7f5fc22e82ad38b606ab12faa18c"
 optional = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.hang]
 git = "https://github.com/kixelated/moq"
-rev = "eb3fbf1fd1b12e8304306470752a98c0a11767fd"
+rev = "77ab4bfa473a7f5fc22e82ad38b606ab12faa18c"
 optional = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.async-channel]
