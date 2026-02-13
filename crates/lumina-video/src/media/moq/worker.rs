@@ -409,44 +409,19 @@ pub(crate) async fn run_moq_worker(
 
     // -- Phase 5.5: Spawn dedicated audio forwarding task --
     //
-    // IMPORTANT: OrderedConsumer::read() (hang crate) is NOT cancellation-safe —
-    // its internal read_unbuffered() has two await points (next_frame + read_chunks).
-    // If tokio::select! cancels the future between them, the frame is consumed from
-    // QUIC but never returned → lost. Running audio in the shared select! loop
-    // caused ~50% audio frame loss (25 fps instead of 47 fps).
-    //
-    // Fix: audio gets its own task so read() is never cancelled.
-    let audio_task = match (audio_consumer_opt, audio_sender_opt) {
-        (Some(mut audio_consumer), Some(audio_sender)) => {
-            let label_owned = label.to_string();
-            Some(tokio::spawn(async move {
-                let mut buf = BytesMut::with_capacity(4096);
-                loop {
-                    match audio_consumer.read().await {
-                        Ok(Some(frame)) => {
-                            let data = assemble_payload(&frame.payload, &mut buf);
-                            let moq_frame = MoqAudioFrame {
-                                timestamp_us: frame.timestamp.as_micros() as u64,
-                                data,
-                            };
-                            if let Err(ChannelClosed) = audio_sender.send(moq_frame) {
-                                tracing::warn!("MoQ {}: Audio channel closed", label_owned);
-                                break;
-                            }
-                        }
-                        Ok(None) => {
-                            tracing::info!("MoQ {}: Audio track ended", label_owned);
-                            break;
-                        }
-                        Err(e) => {
-                            tracing::warn!("MoQ {}: Audio read error: {e}", label_owned);
-                            break;
-                        }
-                    }
-                }
-            }))
-        }
-        _ => None,
+    // IMPORTANT: OrderedConsumer::read() (hang crate) is NOT cancellation-safe.
+    // Audio gets its own task so read() is never cancelled by tokio::select!.
+    let mut audio_task = spawn_audio_forward_task(audio_consumer_opt, audio_sender_opt, label);
+
+    // Audio track name for re-subscribing when the audio task finishes
+    // (track end, error, or stream loop).
+    let audio_track_for_resub: Option<moq_lite::Track> = if audio_task.is_some() {
+        select_preferred_audio_rendition(&cat.catalog).map(|(name, _)| moq_lite::Track {
+            name: name.to_string(),
+            priority: 2,
+        })
+    } else {
+        None
     };
 
     // -- Phase 5b: Frame dump hook (diagnostic, env-gated) --
@@ -514,6 +489,43 @@ pub(crate) async fn run_moq_worker(
         if loop_iter <= 50 || loop_iter.is_multiple_of(100) {
             tracing::info!("MoQ {}: select loop iter #{}", label, loop_iter);
         }
+
+        // -- Audio re-subscribe: detect when audio task has finished --
+        //
+        // The dedicated audio task exits on track end (Ok(None)) or read error.
+        // Without re-subscribing, looped/recovered streams continue video-only.
+        // Check each iteration and re-setup audio when needed.
+        if let Some(ref task) = audio_task {
+            if task.is_finished() {
+                // Await the finished task to collect it
+                if let Some(finished) = audio_task.take() {
+                    let _ = finished.await;
+                }
+                // Teardown the old audio decode thread (sender was moved into the task,
+                // so the crossbeam channel is already disconnected)
+                teardown_audio(None, moq_audio_thread_opt.take(), &shared, label).await;
+
+                // Re-subscribe audio if we know the track name
+                if let Some(ref at) = audio_track_for_resub {
+                    tracing::info!(
+                        "MoQ {}: Re-subscribing audio track '{}' after task exit",
+                        label,
+                        at.name,
+                    );
+                    let (new_consumer, new_sender, new_thread) = setup_audio(
+                        &cat.catalog,
+                        &moq_broadcast,
+                        cat.max_latency,
+                        &config,
+                        &shared,
+                        label,
+                    );
+                    moq_audio_thread_opt = new_thread;
+                    audio_task = spawn_audio_forward_task(new_consumer, new_sender, label);
+                }
+            }
+        }
+
         tokio::select! {
             // No biased — fair scheduling prevents audio starvation
             video_result = video_consumer.read() => {
@@ -1314,6 +1326,51 @@ fn setup_audio(
             (None, None, None)
         }
     }
+}
+
+/// Spawn a dedicated tokio task that forwards audio frames from the MoQ
+/// `OrderedConsumer` to the crossbeam `LiveEdgeSender`.
+///
+/// Returns `None` if consumer or sender is `None` (audio disabled / unavailable).
+///
+/// IMPORTANT: `OrderedConsumer::read()` is NOT cancellation-safe — it must run
+/// in its own dedicated task, never in a shared `tokio::select!` loop.
+fn spawn_audio_forward_task(
+    consumer: Option<hang::container::OrderedConsumer>,
+    sender: Option<LiveEdgeSender<MoqAudioFrame>>,
+    label: &str,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let (mut audio_consumer, audio_sender) = match (consumer, sender) {
+        (Some(c), Some(s)) => (c, s),
+        _ => return None,
+    };
+    let label_owned = label.to_string();
+    Some(tokio::spawn(async move {
+        let mut buf = BytesMut::with_capacity(4096);
+        loop {
+            match audio_consumer.read().await {
+                Ok(Some(frame)) => {
+                    let data = assemble_payload(&frame.payload, &mut buf);
+                    let moq_frame = MoqAudioFrame {
+                        timestamp_us: frame.timestamp.as_micros() as u64,
+                        data,
+                    };
+                    if let Err(ChannelClosed) = audio_sender.send(moq_frame) {
+                        tracing::warn!("MoQ {}: Audio channel closed", label_owned);
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    tracing::info!("MoQ {}: Audio track ended", label_owned);
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!("MoQ {}: Audio read error: {e}", label_owned);
+                    break;
+                }
+            }
+        }
+    }))
 }
 
 /// Assemble a hang payload (chunked BufList) into a contiguous `Bytes`,

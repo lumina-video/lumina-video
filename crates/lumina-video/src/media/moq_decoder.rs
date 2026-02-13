@@ -310,15 +310,18 @@ impl MoqStatsHandle {
         let metadata = self.shared.metadata.lock().clone();
 
         #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
-        let rb_metrics = self.shared.audio.ring_buffer_metrics.lock().clone();
-        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
-        let rb_metrics = super::audio_ring_buffer::RingBufferMetrics::default();
-
-        let fill_pct = if rb_metrics.capacity_samples > 0 {
-            rb_metrics.fill_samples as f32 * 100.0 / rb_metrics.capacity_samples as f32
-        } else {
-            0.0
+        let (ring_buffer_fill_percent, ring_buffer_stall_count, ring_buffer_overflow_count) = {
+            let rb = self.shared.audio.ring_buffer_metrics.lock().clone();
+            let fill_pct = if rb.capacity_samples > 0 {
+                rb.fill_samples as f32 * 100.0 / rb.capacity_samples as f32
+            } else {
+                0.0
+            };
+            (fill_pct, rb.stall_count, rb.overflow_count)
         };
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+        let (ring_buffer_fill_percent, ring_buffer_stall_count, ring_buffer_overflow_count) =
+            (0.0f32, 0u64, 0u64);
 
         MoqStatsSnapshot {
             state: *self.shared.state.lock(),
@@ -332,9 +335,9 @@ impl MoqStatsHandle {
             has_codec_description: self.shared.codec_description.lock().is_some(),
             transport_protocol: self.shared.transport_protocol.lock().clone(),
             audio_status: *self.shared.audio.audio_status.lock(),
-            ring_buffer_fill_percent: fill_pct,
-            ring_buffer_stall_count: rb_metrics.stall_count,
-            ring_buffer_overflow_count: rb_metrics.overflow_count,
+            ring_buffer_fill_percent,
+            ring_buffer_stall_count,
+            ring_buffer_overflow_count,
         }
     }
 }
