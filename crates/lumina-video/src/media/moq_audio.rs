@@ -336,7 +336,8 @@ fn moq_audio_thread_main(
                         );
                     }
 
-                    // Set base PTS on first decoded frame
+                    // Set base PTS on first decoded frame (raw publisher time —
+                    // matches video PTS and FrameScheduler's playback_start_position)
                     if last_pts_us.is_none() {
                         audio_handle.set_audio_base_pts(samples.pts);
                     }
@@ -361,6 +362,20 @@ fn moq_audio_thread_main(
                         }
                     }
                     last_pts_us = Some(frame.timestamp_us);
+
+                    // Backpressure: if ring buffer is >75% full, sleep to match
+                    // real-time playback rate. Without this, the initial MoQ burst
+                    // decodes at 4000+ fps, overflows the buffer, then the buffer
+                    // drains empty during the post-burst network stall, causing
+                    // tens of thousands of underrun stalls (silence samples) that
+                    // permanently desync samples_played from wall-clock time.
+                    let backpressure_threshold = producer.capacity() * 3 / 4;
+                    while producer.fill_level() > backpressure_threshold {
+                        if stop_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
 
                     // Write decoded PCM directly to ring buffer (lock-free)
                     producer.write(&samples.data);
