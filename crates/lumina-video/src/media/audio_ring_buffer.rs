@@ -1,8 +1,8 @@
-//! Lock-free SPSC ring buffer for continuous MoQ audio playback.
+//! Lock-free SPSC ring buffer for continuous audio playback.
 //!
-//! Replaces per-source `sink.append(SamplesBuffer)` with a single continuous
-//! `RingBufferSource` that never exhausts, eliminating rodio resampler state
-//! resets and queue mutex contention that cause clicks/pops.
+//! Used by both MoQ live streaming and FFmpeg VOD paths. Provides a single
+//! continuous sample stream to the cpal audio callback, eliminating per-source
+//! transitions and queue mutex contention.
 //!
 //! Design: true SPSC — only the producer modifies `write_pos`, only the consumer
 //! modifies `read_pos`. On overflow the producer overwrites old data (advancing
@@ -21,7 +21,16 @@ pub struct RingBufferConfig {
 }
 
 impl RingBufferConfig {
-    /// Creates config for the given audio format with default timing.
+    /// Creates config tuned for VOD playback (shorter prefill for fast seek recovery).
+    pub fn for_vod(sample_rate: u32, channels: u16) -> Self {
+        let sps = sample_rate as usize * channels as usize;
+        Self {
+            capacity_samples: sps / 2, // 500ms
+            prefill_samples: sps / 20, // 50ms — fast seek recovery
+        }
+    }
+
+    /// Creates config for the given audio format with default timing (MoQ live).
     pub fn for_format(sample_rate: u32, channels: u16) -> Self {
         let samples_per_sec = sample_rate as usize * channels as usize;
         Self {
@@ -68,6 +77,19 @@ struct RingBufferShared {
     underrun_count: AtomicU64,
     /// Whether the producer is still alive.
     alive: AtomicBool,
+    /// Flush generation counter — incremented by producer on seek/flush.
+    flush_generation: AtomicU64,
+}
+
+/// Result of reading a sample from the ring buffer consumer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ReadSample {
+    /// A valid audio sample.
+    Sample(f32),
+    /// The producer requested a flush (seek). Consumer has snapped to write position.
+    Flushed,
+    /// No data available (prefill not reached or buffer empty).
+    Empty,
 }
 
 /// Producer half of the ring buffer. Owned by the audio decode thread.
@@ -75,9 +97,11 @@ pub struct RingBufferProducer {
     shared: Arc<RingBufferShared>,
 }
 
-/// Consumer half of the ring buffer. Owned by the rodio Source.
+/// Consumer half of the ring buffer. Owned by the cpal audio callback.
 pub struct RingBufferConsumer {
     shared: Arc<RingBufferShared>,
+    /// Tracks the last observed flush generation.
+    consumer_generation: u64,
 }
 
 /// Metrics snapshot for observability.
@@ -129,17 +153,32 @@ pub fn audio_ring_buffer(config: RingBufferConfig) -> (RingBufferProducer, RingB
         overflow_count: AtomicU64::new(0),
         underrun_count: AtomicU64::new(0),
         alive: AtomicBool::new(true),
+        flush_generation: AtomicU64::new(0),
     });
 
     (
         RingBufferProducer {
             shared: shared.clone(),
         },
-        RingBufferConsumer { shared },
+        RingBufferConsumer {
+            shared,
+            consumer_generation: 0,
+        },
     )
 }
 
 impl RingBufferProducer {
+    /// Requests a flush (for seek). The consumer will snap its read position
+    /// to the current write position on the next `read_sample()` call, discarding
+    /// all buffered data. Prefill is reset so new data must accumulate before
+    /// playback resumes.
+    pub fn request_flush(&self) {
+        let s = &self.shared;
+        s.prefilled.store(false, Ordering::Relaxed);
+        // Generation increment is the Release point — consumer's Acquire sees prefilled=false
+        s.flush_generation.fetch_add(1, Ordering::Release);
+    }
+
     /// Writes samples into the ring buffer.
     ///
     /// Always succeeds. If the buffer is full, old data is overwritten
@@ -195,6 +234,19 @@ impl RingBufferProducer {
         }
     }
 
+    /// Returns the current fill level in samples (cheap — only 2 atomic loads).
+    pub fn fill_level(&self) -> usize {
+        let s = &self.shared;
+        let wp = s.write_pos.load(Ordering::Relaxed);
+        let rp = s.read_pos.load(Ordering::Relaxed);
+        wp.wrapping_sub(rp).min(s.capacity)
+    }
+
+    /// Returns the buffer capacity in samples.
+    pub fn capacity(&self) -> usize {
+        self.shared.capacity
+    }
+
     /// Returns current metrics for observability.
     pub fn metrics(&self) -> RingBufferMetrics {
         let s = &self.shared;
@@ -223,17 +275,28 @@ impl Drop for RingBufferProducer {
 impl RingBufferConsumer {
     /// Reads a single sample from the ring buffer.
     ///
-    /// Returns `Some(sample)` if data is available, or `None` during initial
-    /// prefill or if the buffer is empty.
+    /// Returns `ReadSample::Sample(f32)` if data is available,
+    /// `ReadSample::Flushed` if the producer requested a flush (seek),
+    /// or `ReadSample::Empty` during initial prefill or buffer empty.
     ///
     /// If the producer has overwritten our read position (consumer fell behind),
     /// we skip forward to the oldest valid data.
-    pub fn read_sample(&self) -> Option<f32> {
+    pub fn read_sample(&mut self) -> ReadSample {
         let s = &self.shared;
 
-        // Initial stall: return None until prefill threshold is reached
+        // Check flush BEFORE prefill gate (flush clears prefilled)
+        let gen = s.flush_generation.load(Ordering::Acquire);
+        if gen != self.consumer_generation {
+            self.consumer_generation = gen;
+            // Snap read_pos to write_pos (discard all buffered data)
+            let wp = s.write_pos.load(Ordering::Acquire);
+            s.read_pos.store(wp, Ordering::Release);
+            return ReadSample::Flushed;
+        }
+
+        // Initial stall: return Empty until prefill threshold is reached
         if !s.prefilled.load(Ordering::Acquire) {
-            return None;
+            return ReadSample::Empty;
         }
 
         let mut rp = s.read_pos.load(Ordering::Relaxed);
@@ -242,7 +305,7 @@ impl RingBufferConsumer {
         // Buffer empty
         if rp == wp {
             s.underrun_count.fetch_add(1, Ordering::Relaxed);
-            return None;
+            return ReadSample::Empty;
         }
 
         // Check if producer has lapped us (overflow overwrote our data).
@@ -260,7 +323,7 @@ impl RingBufferConsumer {
         s.read_pos.store(rp.wrapping_add(1), Ordering::Release);
         s.total_read.fetch_add(1, Ordering::Relaxed);
 
-        Some(sample)
+        ReadSample::Sample(sample)
     }
 
     /// Returns current metrics for observability.
@@ -298,24 +361,24 @@ mod tests {
             capacity_samples: 1024,
             prefill_samples: 4,
         };
-        let (producer, consumer) = audio_ring_buffer(config);
+        let (producer, mut consumer) = audio_ring_buffer(config);
 
         // Write some samples (>= prefill threshold of 4)
         producer.write(&[1.0, 2.0, 3.0, 4.0, 5.0]);
 
         // Read them back
-        assert_eq!(consumer.read_sample(), Some(1.0));
-        assert_eq!(consumer.read_sample(), Some(2.0));
-        assert_eq!(consumer.read_sample(), Some(3.0));
-        assert_eq!(consumer.read_sample(), Some(4.0));
-        assert_eq!(consumer.read_sample(), Some(5.0));
-        // Empty — returns None but does NOT re-enter stall mode
-        assert_eq!(consumer.read_sample(), None);
+        assert_eq!(consumer.read_sample(), ReadSample::Sample(1.0));
+        assert_eq!(consumer.read_sample(), ReadSample::Sample(2.0));
+        assert_eq!(consumer.read_sample(), ReadSample::Sample(3.0));
+        assert_eq!(consumer.read_sample(), ReadSample::Sample(4.0));
+        assert_eq!(consumer.read_sample(), ReadSample::Sample(5.0));
+        // Empty — returns Empty but does NOT re-enter stall mode
+        assert_eq!(consumer.read_sample(), ReadSample::Empty);
 
         // Writing more should be immediately readable (no re-prefill needed)
         producer.write(&[6.0, 7.0]);
-        assert_eq!(consumer.read_sample(), Some(6.0));
-        assert_eq!(consumer.read_sample(), Some(7.0));
+        assert_eq!(consumer.read_sample(), ReadSample::Sample(6.0));
+        assert_eq!(consumer.read_sample(), ReadSample::Sample(7.0));
     }
 
     #[test]
@@ -324,20 +387,20 @@ mod tests {
             capacity_samples: 1024,
             prefill_samples: 10,
         };
-        let (producer, consumer) = audio_ring_buffer(config);
+        let (producer, mut consumer) = audio_ring_buffer(config);
 
         // Write less than prefill threshold
         producer.write(&[1.0, 2.0, 3.0]);
 
-        // Consumer should stall (returns None)
-        assert_eq!(consumer.read_sample(), None);
+        // Consumer should stall (returns Empty)
+        assert_eq!(consumer.read_sample(), ReadSample::Empty);
 
         // Write enough to reach prefill
         producer.write(&[4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]);
 
         // Now reads should succeed
-        assert_eq!(consumer.read_sample(), Some(1.0));
-        assert_eq!(consumer.read_sample(), Some(2.0));
+        assert_eq!(consumer.read_sample(), ReadSample::Sample(1.0));
+        assert_eq!(consumer.read_sample(), ReadSample::Sample(2.0));
     }
 
     #[test]
@@ -371,7 +434,7 @@ mod tests {
             capacity_samples: 1024,
             prefill_samples: 4,
         };
-        let (producer, consumer) = audio_ring_buffer(config);
+        let (producer, mut consumer) = audio_ring_buffer(config);
         let cap = 1024; // power-of-2
 
         // Write enough for prefill
@@ -379,8 +442,8 @@ mod tests {
         producer.write(&data);
 
         // Read a few to establish read position
-        assert_eq!(consumer.read_sample(), Some(0.0));
-        assert_eq!(consumer.read_sample(), Some(1.0));
+        assert_eq!(consumer.read_sample(), ReadSample::Sample(0.0));
+        assert_eq!(consumer.read_sample(), ReadSample::Sample(1.0));
 
         // Now write way more than capacity (lap the consumer)
         let big_data: Vec<f32> = (0..cap * 2).map(|i| (100 + i) as f32).collect();
@@ -388,7 +451,10 @@ mod tests {
 
         // Consumer should detect the lap and skip forward
         let sample = consumer.read_sample();
-        assert!(sample.is_some(), "should get a sample after skip");
+        assert!(
+            matches!(sample, ReadSample::Sample(_)),
+            "should get a sample after skip"
+        );
     }
 
     #[test]
@@ -397,16 +463,16 @@ mod tests {
             capacity_samples: 1024,
             prefill_samples: 4,
         };
-        let (producer, consumer) = audio_ring_buffer(config);
+        let (producer, mut consumer) = audio_ring_buffer(config);
 
         // Write and read many rounds to force multiple wraparounds
         for round in 0..300 {
             let base = round as f32 * 4.0;
             producer.write(&[base, base + 1.0, base + 2.0, base + 3.0]);
-            assert_eq!(consumer.read_sample(), Some(base));
-            assert_eq!(consumer.read_sample(), Some(base + 1.0));
-            assert_eq!(consumer.read_sample(), Some(base + 2.0));
-            assert_eq!(consumer.read_sample(), Some(base + 3.0));
+            assert_eq!(consumer.read_sample(), ReadSample::Sample(base));
+            assert_eq!(consumer.read_sample(), ReadSample::Sample(base + 1.0));
+            assert_eq!(consumer.read_sample(), ReadSample::Sample(base + 2.0));
+            assert_eq!(consumer.read_sample(), ReadSample::Sample(base + 3.0));
         }
     }
 
@@ -416,7 +482,7 @@ mod tests {
             capacity_samples: 1024,
             prefill_samples: 2,
         };
-        let (producer, consumer) = audio_ring_buffer(config);
+        let (producer, mut consumer) = audio_ring_buffer(config);
 
         producer.write(&[1.0, 2.0, 3.0]);
         assert!(consumer.is_producer_alive());
@@ -425,7 +491,7 @@ mod tests {
         assert!(!consumer.is_producer_alive());
 
         // Can still read remaining samples
-        assert_eq!(consumer.read_sample(), Some(1.0));
+        assert_eq!(consumer.read_sample(), ReadSample::Sample(1.0));
     }
 
     #[test]
@@ -434,7 +500,7 @@ mod tests {
             capacity_samples: 1024,
             prefill_samples: 4,
         };
-        let (producer, consumer) = audio_ring_buffer(config);
+        let (producer, mut consumer) = audio_ring_buffer(config);
 
         producer.write(&[1.0, 2.0, 3.0, 4.0, 5.0]);
 
@@ -473,11 +539,12 @@ mod tests {
         });
 
         let reader = thread::spawn(move || {
+            let mut consumer = consumer;
             let mut read_count = 0u64;
             let mut last_val = -1.0f32;
             loop {
                 match consumer.read_sample() {
-                    Some(val) => {
+                    ReadSample::Sample(val) => {
                         // Values should be monotonically increasing
                         // (may skip values due to overflow, but never go backwards)
                         assert!(
@@ -489,7 +556,7 @@ mod tests {
                         last_val = val;
                         read_count += 1;
                     }
-                    None => {
+                    ReadSample::Empty | ReadSample::Flushed => {
                         if !consumer.is_producer_alive() {
                             break;
                         }
@@ -508,5 +575,84 @@ mod tests {
             "should have read some samples, got {}",
             read_count
         );
+    }
+
+    #[test]
+    fn test_flush_basic() {
+        let config = RingBufferConfig {
+            capacity_samples: 1024,
+            prefill_samples: 4,
+        };
+        let (producer, mut consumer) = audio_ring_buffer(config);
+
+        // Write and read some data
+        producer.write(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(consumer.read_sample(), ReadSample::Sample(1.0));
+        assert_eq!(consumer.read_sample(), ReadSample::Sample(2.0));
+
+        // Request flush
+        producer.request_flush();
+
+        // Next read should return Flushed
+        assert_eq!(consumer.read_sample(), ReadSample::Flushed);
+
+        // After flush, buffer is empty (prefill reset) — should return Empty
+        assert_eq!(consumer.read_sample(), ReadSample::Empty);
+
+        // Write new data past prefill threshold, should be readable
+        producer.write(&[10.0, 11.0, 12.0, 13.0]);
+        assert_eq!(consumer.read_sample(), ReadSample::Sample(10.0));
+        assert_eq!(consumer.read_sample(), ReadSample::Sample(11.0));
+    }
+
+    #[test]
+    fn test_flush_resets_prefill() {
+        let config = RingBufferConfig {
+            capacity_samples: 1024,
+            prefill_samples: 10,
+        };
+        let (producer, mut consumer) = audio_ring_buffer(config);
+
+        // Fill past prefill threshold
+        let data: Vec<f32> = (0..15).map(|i| i as f32).collect();
+        producer.write(&data);
+        assert_eq!(consumer.read_sample(), ReadSample::Sample(0.0));
+
+        // Flush resets prefill
+        producer.request_flush();
+        assert_eq!(consumer.read_sample(), ReadSample::Flushed);
+
+        // Write less than prefill — should still be in stall mode
+        producer.write(&[100.0, 101.0, 102.0]);
+        assert_eq!(consumer.read_sample(), ReadSample::Empty);
+
+        // Write enough to reach prefill
+        producer.write(&[103.0, 104.0, 105.0, 106.0, 107.0, 108.0, 109.0]);
+        assert_eq!(consumer.read_sample(), ReadSample::Sample(100.0));
+    }
+
+    #[test]
+    fn test_multiple_rapid_flushes() {
+        let config = RingBufferConfig {
+            capacity_samples: 1024,
+            prefill_samples: 4,
+        };
+        let (producer, mut consumer) = audio_ring_buffer(config);
+
+        producer.write(&[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(consumer.read_sample(), ReadSample::Sample(1.0));
+
+        // Multiple rapid flushes — consumer should land on latest generation
+        producer.request_flush();
+        producer.request_flush();
+        producer.request_flush();
+
+        // Only one Flushed signal should appear (consumer catches up to latest gen)
+        assert_eq!(consumer.read_sample(), ReadSample::Flushed);
+        assert_eq!(consumer.read_sample(), ReadSample::Empty);
+
+        // New data works fine
+        producer.write(&[50.0, 51.0, 52.0, 53.0]);
+        assert_eq!(consumer.read_sample(), ReadSample::Sample(50.0));
     }
 }

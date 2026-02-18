@@ -1,4 +1,4 @@
-//! MoQ audio pipeline: crossbeam handoff → symphonia AAC decode → rodio playback.
+//! MoQ audio pipeline: crossbeam handoff → symphonia AAC decode → cpal playback.
 //!
 //! This module is gated on `cfg(all(feature = "moq", any(target_os = "macos", target_os = "linux", target_os = "android")))`.
 //! Android uses cpal/Oboe (same pipeline as desktop). Windows has no MoQ decoder yet.
@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use super::audio::{AudioConfig, AudioHandle, AudioPlayer, AudioSamples};
+use super::audio::{AudioHandle, AudioPlayer, AudioSamples};
 use super::audio_ring_buffer::RingBufferConfig;
 use super::moq_decoder::{MoqAudioShared, MoqAudioStatus};
 
@@ -241,9 +241,9 @@ const GAP_THRESHOLD_US: u64 = 32_000; // 32ms
 
 /// Audio thread main loop: receives AAC frames, decodes via symphonia, writes to ring buffer.
 ///
-/// Uses a single continuous `RingBufferSource` appended once to the rodio Sink,
-/// eliminating per-source transitions, resampler state resets, and queue mutex
-/// contention that caused clicks/pops in the previous batch+append approach.
+/// Uses a lock-free ring buffer read by the cpal audio callback,
+/// eliminating per-source transitions and queue mutex contention
+/// that caused clicks/pops in the previous batch+append approach.
 fn moq_audio_thread_main(
     audio_rx: crossbeam_channel::Receiver<MoqAudioFrame>,
     sample_rate: u32,
@@ -254,16 +254,11 @@ fn moq_audio_thread_main(
     audio_shared: Arc<MoqAudioShared>,
 ) {
     let ring_config = RingBufferConfig::for_format(sample_rate, channels.min(2) as u16);
-    let audio_config = AudioConfig {
-        sample_rate,
-        channels: channels.min(2) as u16,
-        ..Default::default()
-    };
 
     let (mut player, producer) = match AudioPlayer::new_ring_buffer(
-        audio_config,
         ring_config,
         Some(audio_handle.clone()),
+        Some(sample_rate),
     ) {
         Ok(pair) => pair,
         Err(e) => {
@@ -341,7 +336,8 @@ fn moq_audio_thread_main(
                         );
                     }
 
-                    // Set base PTS on first decoded frame
+                    // Set base PTS on first decoded frame (raw publisher time —
+                    // matches video PTS and FrameScheduler's playback_start_position)
                     if last_pts_us.is_none() {
                         audio_handle.set_audio_base_pts(samples.pts);
                     }
@@ -366,6 +362,20 @@ fn moq_audio_thread_main(
                         }
                     }
                     last_pts_us = Some(frame.timestamp_us);
+
+                    // Backpressure: if ring buffer is >75% full, sleep to match
+                    // real-time playback rate. Without this, the initial MoQ burst
+                    // decodes at 4000+ fps, overflows the buffer, then the buffer
+                    // drains empty during the post-burst network stall, causing
+                    // tens of thousands of underrun stalls (silence samples) that
+                    // permanently desync samples_played from wall-clock time.
+                    let backpressure_threshold = producer.capacity() * 3 / 4;
+                    while producer.fill_level() > backpressure_threshold {
+                        if stop_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
 
                     // Write decoded PCM directly to ring buffer (lock-free)
                     producer.write(&samples.data);

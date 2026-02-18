@@ -59,8 +59,8 @@ wgpu-hal = { version = "24", features = ["vulkan"] }
 wgpu = { version = "24" }
 # libc for FD close() in zero-copy fence sync
 libc = { version = "0.2" }
-# Audio playback for MoQ (cpal wraps Oboe NDK on Android — same pipeline as desktop)
-rodio = { workspace = true }
+# Audio playback via cpal (wraps Oboe NDK on Android — same pipeline as desktop)
+cpal = { workspace = true }
 symphonia-codec-aac = { workspace = true }
 symphonia-core = { workspace = true }
 
@@ -79,7 +79,7 @@ libc = { version = "0.2" }
 drm-fourcc = { version = "2.2" }
 # wgpu with HAL access for zero-copy Vulkan DMABuf import
 wgpu = { version = "24", features = ["vulkan-portability"] }
-rodio = { workspace = true }
+cpal = { workspace = true }
 symphonia-core = { workspace = true }
 symphonia-codec-aac = { workspace = true }
 
@@ -102,7 +102,7 @@ profiling = { version = "1.0" }
 # FFmpeg for MKV/WebM container support (AVFoundation doesn't support these)
 # Requires one-time setup: ./scripts/setup-macos-ffmpeg.sh
 ffmpeg-next = { workspace = true }
-rodio = { workspace = true }
+cpal = { workspace = true }
 symphonia-core = { workspace = true }
 symphonia-codec-aac = { workspace = true }
 
@@ -119,7 +119,7 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security",
 ], optional = true }
-rodio = { workspace = true, optional = true }
+rodio = { version = "0.21", default-features = false, features = ["playback", "symphonia-all"], optional = true }
 
 # Native-only dependencies (not available on wasm32)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -147,17 +147,17 @@ optional = true
 # MoQ crates from kixelated/moq (the active repo, moq-rs is archived)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.moq-lite]
 git = "https://github.com/kixelated/moq"
-rev = "77ab4bfa473a7f5fc22e82ad38b606ab12faa18c"
+rev = "baabd55c7a8dd6c85d6e1e329a776208bd1107ca"
 optional = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.moq-native]
 git = "https://github.com/kixelated/moq"
-rev = "77ab4bfa473a7f5fc22e82ad38b606ab12faa18c"
+rev = "baabd55c7a8dd6c85d6e1e329a776208bd1107ca"
 optional = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.hang]
 git = "https://github.com/kixelated/moq"
-rev = "77ab4bfa473a7f5fc22e82ad38b606ab12faa18c"
+rev = "baabd55c7a8dd6c85d6e1e329a776208bd1107ca"
 optional = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.async-channel]
