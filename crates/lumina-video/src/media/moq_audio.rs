@@ -60,6 +60,84 @@ impl<T> LiveEdgeSender<T> {
     }
 }
 
+/// Codec type for the MoQ audio decoder, determined from the catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MoqAudioCodec {
+    Aac,
+    Opus,
+}
+
+/// Dispatching decoder that handles both AAC and Opus streams.
+enum MoqAudioDecoder {
+    Aac(SymphoniaAacDecoder),
+    Opus(OpusDecoder),
+}
+
+impl MoqAudioDecoder {
+    fn decode_frame(&mut self, data: &[u8], timestamp_us: u64) -> Result<AudioSamples, String> {
+        match self {
+            MoqAudioDecoder::Aac(d) => d.decode_frame(data, timestamp_us),
+            MoqAudioDecoder::Opus(d) => d.decode_frame(data, timestamp_us),
+        }
+    }
+}
+
+/// Opus decoder using the `opus` crate, producing interleaved f32 `AudioSamples`.
+struct OpusDecoder {
+    decoder: opus::Decoder,
+    sample_rate: u32,
+    channels: u16,
+    /// Scratch buffer for decoded samples (reused across frames to avoid allocation).
+    decode_buf: Vec<f32>,
+}
+
+impl OpusDecoder {
+    /// Creates a new Opus decoder.
+    ///
+    /// Opus always operates at 48kHz internally; the `sample_rate` parameter
+    /// is stored for `AudioSamples` metadata and must be 48000, 24000, 16000,
+    /// 12000, or 8000.
+    fn new(sample_rate: u32, channels: u32) -> Result<Self, String> {
+        if channels == 0 {
+            return Err("Opus decoder requires at least 1 channel".to_string());
+        }
+        let ch = match channels.min(2) {
+            1 => opus::Channels::Mono,
+            _ => opus::Channels::Stereo,
+        };
+
+        let decoder = opus::Decoder::new(sample_rate, ch)
+            .map_err(|e| format!("Failed to create Opus decoder: {e}"))?;
+
+        // Max Opus frame: 120ms at 48kHz stereo = 5760 * 2 = 11520 samples
+        let max_samples = 5760 * channels.min(2) as usize;
+
+        Ok(Self {
+            decoder,
+            sample_rate,
+            channels: channels.min(2) as u16,
+            decode_buf: vec![0.0f32; max_samples],
+        })
+    }
+
+    /// Decodes a single Opus packet into interleaved f32 samples.
+    fn decode_frame(&mut self, data: &[u8], timestamp_us: u64) -> Result<AudioSamples, String> {
+        let decoded_samples = self
+            .decoder
+            .decode_float(data, &mut self.decode_buf, false)
+            .map_err(|e| format!("Opus decode error: {e}"))?;
+
+        let total = decoded_samples * self.channels as usize;
+
+        Ok(AudioSamples {
+            data: self.decode_buf[..total].to_vec(),
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            pts: Duration::from_micros(timestamp_us),
+        })
+    }
+}
+
 /// AAC-LC decoder using symphonia, producing interleaved f32 `AudioSamples`.
 struct SymphoniaAacDecoder {
     decoder: Box<dyn symphonia_core::codecs::Decoder>,
@@ -178,6 +256,7 @@ impl MoqAudioThread {
         sample_rate: u32,
         channels: u32,
         description: Option<Bytes>,
+        codec: MoqAudioCodec,
         audio_handle: AudioHandle,
         audio_shared: Arc<MoqAudioShared>,
     ) -> Result<Self, String> {
@@ -194,6 +273,7 @@ impl MoqAudioThread {
                     sample_rate,
                     channels,
                     description,
+                    codec,
                     audio_handle_clone,
                     stop_flag_clone,
                     audio_shared_clone,
@@ -249,6 +329,7 @@ fn moq_audio_thread_main(
     sample_rate: u32,
     channels: u32,
     description: Option<Bytes>,
+    codec: MoqAudioCodec,
     audio_handle: AudioHandle,
     stop_flag: Arc<AtomicBool>,
     audio_shared: Arc<MoqAudioShared>,
@@ -274,11 +355,25 @@ fn moq_audio_thread_main(
         }
     };
 
-    let mut aac_decoder =
-        match SymphoniaAacDecoder::new(sample_rate, channels, description.as_ref()) {
-            Ok(d) => d,
+    let mut decoder = match codec {
+        MoqAudioCodec::Aac => {
+            match SymphoniaAacDecoder::new(sample_rate, channels, description.as_ref()) {
+                Ok(d) => MoqAudioDecoder::Aac(d),
+                Err(e) => {
+                    tracing::warn!("MoQ audio: failed to create AAC decoder: {e}");
+                    *audio_shared.audio_status.lock() = MoqAudioStatus::Error;
+                    audio_shared
+                        .internal_audio_ready
+                        .store(false, Ordering::Relaxed);
+                    *audio_shared.moq_audio_handle.lock() = None;
+                    return;
+                }
+            }
+        }
+        MoqAudioCodec::Opus => match OpusDecoder::new(sample_rate, channels) {
+            Ok(d) => MoqAudioDecoder::Opus(d),
             Err(e) => {
-                tracing::warn!("MoQ audio: failed to create AAC decoder: {e}");
+                tracing::warn!("MoQ audio: failed to create Opus decoder: {e}");
                 *audio_shared.audio_status.lock() = MoqAudioStatus::Error;
                 audio_shared
                     .internal_audio_ready
@@ -286,7 +381,8 @@ fn moq_audio_thread_main(
                 *audio_shared.moq_audio_handle.lock() = None;
                 return;
             }
-        };
+        },
+    };
 
     audio_handle.set_audio_format(sample_rate, channels);
 
@@ -298,7 +394,8 @@ fn moq_audio_thread_main(
     player.play();
 
     tracing::info!(
-        "MoQ audio: ring buffer thread started ({}Hz, {}ch, description={})",
+        "MoQ audio: ring buffer thread started ({:?}, {}Hz, {}ch, description={})",
+        codec,
         sample_rate,
         channels,
         description.as_ref().map(|d| d.len()).unwrap_or(0),
@@ -319,7 +416,7 @@ fn moq_audio_thread_main(
         }
 
         match audio_rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(frame) => match aac_decoder.decode_frame(&frame.data, frame.timestamp_us) {
+            Ok(frame) => match decoder.decode_frame(&frame.data, frame.timestamp_us) {
                 Ok(samples) => {
                     consecutive_errors = 0;
                     total_frames_decoded += 1;
@@ -404,8 +501,9 @@ fn moq_audio_thread_main(
                     tracing::debug!("MoQ audio: decode error #{}: {e}", consecutive_errors);
                     if consecutive_errors >= MAX_CONSECUTIVE_DECODE_ERRORS {
                         tracing::warn!(
-                            "MoQ audio: {} consecutive decode errors, likely unsupported AAC profile",
-                            consecutive_errors
+                            "MoQ audio: {} consecutive {:?} decode errors, likely unsupported codec profile",
+                            consecutive_errors,
+                            codec,
                         );
                         *audio_shared.audio_status.lock() = MoqAudioStatus::Error;
                         audio_shared
@@ -444,7 +542,8 @@ fn moq_audio_thread_main(
 
 /// Selects the preferred audio rendition from a MoQ catalog.
 ///
-/// Filters to AAC-only tracks and returns the one with the highest sample rate.
+/// Accepts AAC and Opus tracks. Prefers Opus over AAC (lower latency), then
+/// highest sample rate as tiebreaker.
 pub(crate) fn select_preferred_audio_rendition(
     catalog: &hang::catalog::Catalog,
 ) -> Option<(&str, &hang::catalog::AudioConfig)> {
@@ -454,9 +553,27 @@ pub(crate) fn select_preferred_audio_rendition(
         .audio
         .renditions
         .iter()
-        .filter(|(_, cfg)| matches!(cfg.codec, AudioCodec::AAC(_)))
-        .max_by_key(|(_, cfg)| cfg.sample_rate)
+        .filter(|(_, cfg)| {
+            matches!(cfg.codec, AudioCodec::AAC(_) | AudioCodec::Opus)
+        })
+        .max_by_key(|(_, cfg)| {
+            let codec_priority = match cfg.codec {
+                AudioCodec::Opus => 1u32, // prefer Opus (lower latency)
+                AudioCodec::AAC(_) => 0,
+                _ => 0,
+            };
+            (codec_priority, cfg.sample_rate)
+        })
         .map(|(name, cfg)| (name.as_str(), cfg))
+}
+
+/// Determines the `MoqAudioCodec` from a hang catalog `AudioConfig`.
+pub(crate) fn audio_codec_from_config(cfg: &hang::catalog::AudioConfig) -> MoqAudioCodec {
+    use hang::catalog::AudioCodec;
+    match cfg.codec {
+        AudioCodec::Opus => MoqAudioCodec::Opus,
+        _ => MoqAudioCodec::Aac,
+    }
 }
 
 #[cfg(test)]
@@ -511,6 +628,98 @@ mod tests {
     fn test_select_audio_empty_renditions() {
         let catalog = hang::catalog::Catalog::default();
         assert!(select_preferred_audio_rendition(&catalog).is_none());
+    }
+
+    #[test]
+    fn test_select_audio_prefers_opus_over_aac() {
+        use std::collections::BTreeMap;
+
+        let mut renditions = BTreeMap::new();
+        renditions.insert(
+            "aac".to_string(),
+            hang::catalog::AudioConfig {
+                codec: hang::catalog::AudioCodec::AAC(hang::catalog::AAC { profile: 2 }),
+                sample_rate: 48000,
+                channel_count: 2,
+                bitrate: None,
+                description: None,
+                container: hang::catalog::Container::Legacy,
+                jitter: None,
+            },
+        );
+        renditions.insert(
+            "opus".to_string(),
+            hang::catalog::AudioConfig {
+                codec: hang::catalog::AudioCodec::Opus,
+                sample_rate: 48000,
+                channel_count: 2,
+                bitrate: None,
+                description: None,
+                container: hang::catalog::Container::Legacy,
+                jitter: None,
+            },
+        );
+
+        let catalog = hang::catalog::Catalog {
+            audio: hang::catalog::Audio { renditions },
+            ..Default::default()
+        };
+
+        let (name, cfg) = select_preferred_audio_rendition(&catalog).unwrap();
+        assert_eq!(name, "opus");
+        assert!(matches!(cfg.codec, hang::catalog::AudioCodec::Opus));
+    }
+
+    #[test]
+    fn test_select_audio_accepts_opus_only() {
+        use std::collections::BTreeMap;
+
+        let mut renditions = BTreeMap::new();
+        renditions.insert(
+            "opus".to_string(),
+            hang::catalog::AudioConfig {
+                codec: hang::catalog::AudioCodec::Opus,
+                sample_rate: 48000,
+                channel_count: 2,
+                bitrate: None,
+                description: None,
+                container: hang::catalog::Container::Legacy,
+                jitter: None,
+            },
+        );
+
+        let catalog = hang::catalog::Catalog {
+            audio: hang::catalog::Audio { renditions },
+            ..Default::default()
+        };
+
+        let (name, _) = select_preferred_audio_rendition(&catalog).unwrap();
+        assert_eq!(name, "opus");
+    }
+
+    #[test]
+    fn test_audio_codec_from_config() {
+        let aac_cfg = hang::catalog::AudioConfig {
+            codec: hang::catalog::AudioCodec::AAC(hang::catalog::AAC { profile: 2 }),
+            sample_rate: 48000,
+            channel_count: 2,
+            bitrate: None,
+            description: None,
+            container: hang::catalog::Container::Legacy,
+            jitter: None,
+        };
+        assert_eq!(audio_codec_from_config(&aac_cfg), MoqAudioCodec::Aac);
+
+        let opus_cfg = hang::catalog::AudioConfig {
+            codec: hang::catalog::AudioCodec::Opus,
+            sample_rate: 48000,
+            channel_count: 2,
+            bitrate: None,
+            description: None,
+            container: hang::catalog::Container::Legacy,
+            jitter: None,
+        };
+        assert_eq!(audio_codec_from_config(&opus_cfg), MoqAudioCodec::Opus);
     }
 
     #[test]

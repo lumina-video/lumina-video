@@ -23,6 +23,7 @@ ffmpeg-next = "8.0"
 cpal = "0.16"
 symphonia-core = "0.5"
 symphonia-codec-aac = "0.5"
+opus = "0.3"
 
 # Async/threading
 poll-promise = { version = "0.3.0", features = ["tokio"] }

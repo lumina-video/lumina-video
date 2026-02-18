@@ -330,6 +330,27 @@ impl AudioHandle {
             .store(now_us, Ordering::Release);
     }
 
+    /// Enables the playback epoch gate without resetting samples_played.
+    ///
+    /// Use this for late-binding (e.g., MoQ audio handle acquired after video
+    /// already started). The cpal callback has been incrementing samples_played
+    /// since audio began — resetting would erase real playback time and create
+    /// a permanent offset.
+    pub fn enable_playback_epoch(&self) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Don't reset samples_played — preserve the count from cpal callback
+        if self.inner.playback_epoch_us.load(Ordering::Acquire) == 0 {
+            let now_us = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as u64;
+            self.inner
+                .playback_epoch_us
+                .store(now_us, Ordering::Release);
+        }
+    }
+
     /// Returns the playback epoch as an Instant-like duration since UNIX epoch.
     /// Returns None if epoch hasn't been set yet.
     pub fn playback_epoch(&self) -> Option<u64> {

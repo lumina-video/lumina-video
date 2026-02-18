@@ -22,7 +22,8 @@ use moq_native::ClientConfig;
 
 use crate::media::moq::MoqUrl;
 use crate::media::moq_audio::{
-    select_preferred_audio_rendition, ChannelClosed, LiveEdgeSender, MoqAudioFrame, MoqAudioThread,
+    audio_codec_from_config, select_preferred_audio_rendition, ChannelClosed, LiveEdgeSender,
+    MoqAudioFrame, MoqAudioThread,
 };
 use crate::media::moq_decoder::{
     MoqAudioStatus, MoqDecoder, MoqDecoderConfig, MoqDecoderState, MoqSharedState, MoqVideoFrame,
@@ -1282,7 +1283,7 @@ fn setup_audio(
     let (track_name, audio_cfg) = match select_preferred_audio_rendition(catalog) {
         Some(pair) => pair,
         None => {
-            tracing::info!("MoQ {}: No AAC audio track in catalog", label);
+            tracing::info!("MoQ {}: No supported audio track in catalog", label);
             *shared.audio.audio_status.lock() = MoqAudioStatus::Unavailable;
             return (None, None, None);
         }
@@ -1319,19 +1320,23 @@ fn setup_audio(
     audio_handle.clear_audio_base_pts();
     audio_handle.clear_stream_pts_offset();
 
+    let audio_codec = audio_codec_from_config(audio_cfg);
+
     match MoqAudioThread::spawn(
         rx,
         audio_cfg.sample_rate,
         audio_cfg.channel_count,
         audio_cfg.description.clone(),
+        audio_codec,
         audio_handle.clone(),
         shared.audio.clone(),
     ) {
         Ok(thread) => {
             tracing::info!(
-                "MoQ {}: Audio subscribed to track '{}' ({}Hz, {}ch)",
+                "MoQ {}: Audio subscribed to track '{}' ({:?}, {}Hz, {}ch)",
                 label,
                 track_name,
+                audio_codec,
                 audio_cfg.sample_rate,
                 audio_cfg.channel_count,
             );

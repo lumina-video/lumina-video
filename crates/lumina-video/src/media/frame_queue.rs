@@ -1129,6 +1129,10 @@ pub struct FrameScheduler {
     /// Minimum interval between frame acceptances (1/fps), derived from metadata.
     /// Zero disables pacing (e.g., for VOD or unknown frame rate).
     frame_pacing_interval: Duration,
+    /// When true, audio position drives frame selection (VOD/FFmpeg).
+    /// When false, wall-clock drives frame selection but audio is still
+    /// tracked for sync metrics (MoQ live).
+    use_audio_as_sync_master: bool,
 }
 
 impl FrameScheduler {
@@ -1166,6 +1170,7 @@ impl FrameScheduler {
             video_pts_bias: Duration::ZERO,
             last_frame_accept_time: None,
             frame_pacing_interval: Duration::ZERO,
+            use_audio_as_sync_master: true,
         }
     }
 
@@ -1177,11 +1182,31 @@ impl FrameScheduler {
         s
     }
 
-    /// Sets the audio handle for sync tracking.
+    /// Sets the audio handle for sync tracking and uses audio as master clock.
     pub fn set_audio_handle(&mut self, audio_handle: AudioHandle) {
         self.audio_handle = Some(audio_handle);
         self.last_audio_zero_diag = None;
         self.sync_metrics.set_using_audio_clock(true);
+        self.use_audio_as_sync_master = true;
+    }
+
+    /// Sets the audio handle for sync metrics only (wall-clock drives frame pacing).
+    /// Used for MoQ live where audio handle arrives late and the handoff to
+    /// audio-as-master-clock would cause a position discontinuity.
+    pub fn set_audio_handle_metrics_only(&mut self, audio_handle: AudioHandle) {
+        self.audio_handle = Some(audio_handle);
+        self.last_audio_zero_diag = None;
+        self.sync_metrics.set_using_audio_clock(true);
+        self.use_audio_as_sync_master = false;
+    }
+
+    /// Clears the audio handle, falling back to wall-clock for frame pacing.
+    pub fn clear_audio_handle(&mut self) {
+        self.audio_handle = None;
+        self.sync_metrics.set_using_audio_clock(false);
+        self.use_audio_as_sync_master = true; // reset to default
+        self.audio_start_time = None;
+        self.audio_start_pos = Duration::ZERO;
     }
 
     /// Sets frame-rate pacing for live streams. When fps > 0, the scheduler
@@ -1254,6 +1279,12 @@ impl FrameScheduler {
     fn sync_position(&self) -> Duration {
         // Get wall-clock position as baseline
         let wall_clock_pos = self.position();
+
+        // Only use audio as master clock when explicitly enabled (VOD/FFmpeg).
+        // MoQ live uses wall-clock for frame pacing to avoid late-bind discontinuity.
+        if !self.use_audio_as_sync_master {
+            return wall_clock_pos;
+        }
 
         // Try to use audio as master clock
         if let Some(ref audio) = self.audio_handle {
@@ -1959,6 +1990,27 @@ impl FrameScheduler {
                 if self.audio_start_time.is_none() {
                     self.audio_start_time = Some(std::time::Instant::now());
                     self.audio_start_pos = audio_pos;
+                    if let Some(ref h) = self.audio_handle {
+                        let ch = h.channels();
+                        if ch > 0 {
+                            tracing::info!(
+                                "record_sync: first measurement audio_pos={:?}, samples_played={}, raw_pos={:?}, samples_dur={:?}, channels={}",
+                                audio_pos,
+                                h.samples_played(),
+                                h.position(),
+                                h.samples_played_duration(),
+                                ch,
+                            );
+                        } else {
+                            tracing::info!(
+                                "record_sync: first measurement audio_pos={:?}, samples_played={}, raw_pos={:?}, samples_dur={:?} (channels not yet set)",
+                                audio_pos,
+                                h.samples_played(),
+                                h.position(),
+                                h.samples_played_duration(),
+                            );
+                        }
+                    }
                 }
                 // Calculate drift as: elapsed_time - audio_progress_since_start
                 // This is seek-aware: after seek to 50s, audio_pos=50s, audio_start_pos=50s
