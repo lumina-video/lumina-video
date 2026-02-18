@@ -1171,43 +1171,10 @@ impl FrameScheduler {
 
     /// Creates a new frame scheduler with audio handle for sync tracking.
     pub fn with_audio_handle(audio_handle: AudioHandle) -> Self {
-        let sync_metrics = SyncMetrics::new();
-        // Audio handle presence implies using audio clock for sync metrics
-        sync_metrics.set_using_audio_clock(true);
-
-        Self {
-            current_position: Duration::ZERO,
-            current_frame: None,
-            playback_start_time: None,
-            playback_start_position: Duration::ZERO,
-            waiting_for_first_frame: false,
-            playback_requested: false,
-            stalled: false,
-            sync_metrics,
-            audio_handle: Some(audio_handle),
-            frames_since_recovery: 0,
-            rejection_start_time: None,
-            seek_generation: 0,
-            audio_start_time: None,
-            audio_start_pos: Duration::ZERO,
-            last_clock_delta_log: None,
-            last_clock_delta_values: None,
-            rejection_count: 0,
-            rejection_peak_gap: Duration::ZERO,
-            forced_resyncs_in_window: 0,
-            last_reject_window_start: None,
-            reject_burst_count: 0,
-            burst_tolerance_until: None,
-            last_audio_zero_diag: None,
-            reject_state: RejectHandlingState::Normal,
-            catch_up_frames_in_window: 0,
-            offset_rebased_in_window: false,
-            last_reject_lead: None,
-            stable_reject_lead_samples: 0,
-            video_pts_bias: Duration::ZERO,
-            last_frame_accept_time: None,
-            frame_pacing_interval: Duration::ZERO,
-        }
+        let mut s = Self::new();
+        s.audio_handle = Some(audio_handle);
+        s.sync_metrics.set_using_audio_clock(true);
+        s
     }
 
     /// Sets the audio handle for sync tracking.

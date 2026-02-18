@@ -764,11 +764,17 @@ mod cpal_impl {
                             } else {
                                 (left + right) * 0.5
                             };
-                            frame[0] = T::from_sample(mono * vol);
+                            if let Some(s) = frame.get_mut(0) {
+                                *s = T::from_sample(mono * vol);
+                            }
                         } else {
                             // Mono->stereo upmix or stereo passthrough.
-                            frame[0] = T::from_sample(left * vol);
-                            frame[1] = T::from_sample(right * vol);
+                            if let Some(s) = frame.get_mut(0) {
+                                *s = T::from_sample(left * vol);
+                            }
+                            if let Some(s) = frame.get_mut(1) {
+                                *s = T::from_sample(right * vol);
+                            }
                         }
 
                         if pending >= FLUSH_SAMPLES {
