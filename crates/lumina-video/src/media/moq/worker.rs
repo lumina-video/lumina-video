@@ -1315,12 +1315,14 @@ fn setup_audio(
         }
     };
     audio_handle.set_available(false);
+    audio_handle.set_audio_stalled(false);
     audio_handle.clear_playback_epoch();
     audio_handle.reset_samples_played();
     audio_handle.clear_audio_base_pts();
     audio_handle.clear_stream_pts_offset();
 
     let audio_codec = audio_codec_from_config(audio_cfg);
+    *shared.audio_codec_name.lock() = Some(format!("{:?}", audio_codec));
 
     match MoqAudioThread::spawn(
         rx,
@@ -1451,6 +1453,7 @@ async fn teardown_audio(
             .store(false, Ordering::Release);
         if let Some(handle) = shared_for_teardown.audio.moq_audio_handle.lock().as_ref() {
             handle.set_available(false);
+            handle.set_audio_stalled(false);
             handle.clear_playback_epoch();
             handle.reset_samples_played();
             handle.clear_audio_base_pts();

@@ -1131,6 +1131,7 @@ impl VideoPlayer {
 
                 // Clear FrameScheduler's audio handle so it falls back to wall-clock
                 self.scheduler.clear_audio_handle();
+                self.scheduler.clear_audio_stall();
 
                 self.moq_audio_bound = false;
             }
@@ -1262,8 +1263,10 @@ impl VideoPlayer {
                 // Show buffering overlay only when playing AND buffering < 100%
                 // Don't show when paused/ready - let user see the preview frame
                 let buffering = self.buffering_percent();
-                if buffering < 100 && self.is_playing() {
-                    self.render_buffering_overlay(ui, rect, buffering);
+                let is_audio_stall = self.scheduler.is_audio_stall();
+                if (buffering < 100 || is_audio_stall) && self.is_playing() {
+                    let pct = if is_audio_stall { 90 } else { buffering };
+                    self.render_buffering_overlay(ui, rect, pct);
                 }
 
                 // Render subtitles overlay if enabled and available

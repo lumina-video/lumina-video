@@ -1133,6 +1133,8 @@ pub struct FrameScheduler {
     /// When false, wall-clock drives frame selection but audio is still
     /// tracked for sync metrics (MoQ live).
     use_audio_as_sync_master: bool,
+    /// True when frozen due to audio ring buffer underrun (separate from queue-empty `stalled`).
+    audio_stalled: bool,
 }
 
 impl FrameScheduler {
@@ -1171,14 +1173,14 @@ impl FrameScheduler {
             last_frame_accept_time: None,
             frame_pacing_interval: Duration::ZERO,
             use_audio_as_sync_master: true,
+            audio_stalled: false,
         }
     }
 
     /// Creates a new frame scheduler with audio handle for sync tracking.
     pub fn with_audio_handle(audio_handle: AudioHandle) -> Self {
         let mut s = Self::new();
-        s.audio_handle = Some(audio_handle);
-        s.sync_metrics.set_using_audio_clock(true);
+        s.set_audio_handle(audio_handle);
         s
     }
 
@@ -1407,9 +1409,9 @@ impl FrameScheduler {
 
     /// Returns the current playback position.
     pub fn position(&self) -> Duration {
-        // If stalled (queue empty during playback), return the last known position
-        // to prevent the scroll bar from advancing during buffering
-        if self.stalled {
+        // If stalled (queue empty or audio underrun), return the last known position
+        // to prevent the scroll bar / subtitles from advancing during buffering
+        if self.stalled || self.audio_stalled {
             return self.current_position;
         }
 
@@ -1443,6 +1445,32 @@ impl FrameScheduler {
     /// Returns true if playback has been requested (even if buffering).
     pub fn is_playback_requested(&self) -> bool {
         self.playback_requested
+    }
+
+    /// Returns true when stalled due to either queue-empty or audio ring buffer underrun.
+    pub fn is_stalled(&self) -> bool {
+        self.stalled || self.audio_stalled
+    }
+
+    /// Returns true when frozen specifically due to audio ring buffer underrun.
+    pub fn is_audio_stall(&self) -> bool {
+        self.audio_stalled
+    }
+
+    /// Clears audio stall state (called when audio handle becomes stale/unavailable).
+    pub fn clear_audio_stall(&mut self) {
+        if self.audio_stalled {
+            self.audio_stalled = false;
+            if self.playback_requested {
+                self.playback_start_time = Some(std::time::Instant::now());
+                self.playback_start_position = self.current_position;
+            }
+            self.frames_since_recovery = 0;
+            tracing::debug!(
+                "Cleared audio stall (handle removed) at {:?}",
+                self.current_position
+            );
+        }
     }
 
     /// Called when a frame is received to sync the clock.
@@ -1708,6 +1736,27 @@ impl FrameScheduler {
                         .saturating_sub(Duration::from_millis(4))
                 {
                     return self.current_frame.clone();
+                }
+            }
+        }
+
+        // Audio-stall gate: if audio ring buffer is underrunning and we're using
+        // wall-clock pacing (MoQ live), freeze video to prevent A/V drift.
+        // VOD (audio-as-master) naturally pauses via stale sync_position().
+        // The position_for_sync() > ZERO guard prevents false stalls during startup:
+        // set_available(true) fires at bind time before first decoded audio arrives,
+        // so empty callbacks are expected until position advances.
+        if !self.use_audio_as_sync_master {
+            if let Some(ref ah) = self.audio_handle {
+                let audio_producing = ah.is_available()
+                    && ah.position_for_sync() > Duration::ZERO;
+                if audio_producing && ah.is_audio_stalled() {
+                    if !self.audio_stalled {
+                        self.enter_audio_stall();
+                    }
+                    return self.current_frame.clone();
+                } else if self.audio_stalled {
+                    self.exit_audio_stall();
                 }
             }
         }
@@ -2012,6 +2061,37 @@ impl FrameScheduler {
                         }
                     }
                 }
+
+                // Re-baseline drift measurement when it exceeds threshold.
+                // Handles: (1) initial ring buffer prefill offset (~200ms at startup),
+                // (2) publisher restarts / IDR drops that stall audio delivery,
+                // (3) complete audio stalls (ring buffer underrun).
+                // Cooldown: audio_start_time resets on each re-baseline, and we require
+                // 2s since last baseline before checking again.
+                if let Some(start) = self.audio_start_time {
+                    let since_start = start.elapsed();
+                    if since_start >= Duration::from_secs(2) {
+                        let audio_delta = audio_pos.saturating_sub(self.audio_start_pos);
+                        let drift_abs = if since_start > audio_delta {
+                            since_start - audio_delta
+                        } else {
+                            audio_delta - since_start
+                        };
+                        if drift_abs > Duration::from_millis(200) {
+                            let old_pos = self.audio_start_pos;
+                            self.audio_start_time = Some(std::time::Instant::now());
+                            self.audio_start_pos = audio_pos;
+                            self.sync_metrics.reset();
+                            tracing::info!(
+                                "record_sync: re-baselined drift (was {:?}, old_start={:?}, new_start={:?})",
+                                drift_abs,
+                                old_pos,
+                                audio_pos,
+                            );
+                        }
+                    }
+                }
+
                 // Calculate drift as: elapsed_time - audio_progress_since_start
                 // This is seek-aware: after seek to 50s, audio_pos=50s, audio_start_pos=50s
                 // so audio_delta=0, and we compare against elapsed=0 → drift=0
@@ -2094,6 +2174,37 @@ impl FrameScheduler {
         // Reset frame counter for tracking recovery completion
         self.frames_since_recovery = 0;
         tracing::debug!("Resuming from stall at {:?}", self.current_position);
+    }
+
+    /// Enters audio-induced stall (ring buffer underrun during MoQ live).
+    fn enter_audio_stall(&mut self) {
+        if self.audio_stalled || !self.playback_requested {
+            return;
+        }
+        if let Some(start_time) = self.playback_start_time {
+            self.current_position = self.playback_start_position + start_time.elapsed();
+        }
+        self.playback_start_time = None;
+        self.audio_stalled = true;
+        self.sync_metrics.record_underrun();
+        self.sync_metrics.record_stall(StallType::Network);
+        self.sync_metrics.start_recovery();
+        tracing::debug!(
+            "Audio stall at {:?} (ring buffer underrun)",
+            self.current_position
+        );
+    }
+
+    /// Exits audio stall — called when cpal callback reports data flowing again.
+    fn exit_audio_stall(&mut self) {
+        self.audio_stalled = false;
+        self.playback_start_time = Some(std::time::Instant::now());
+        self.playback_start_position = self.current_position;
+        self.frames_since_recovery = 0;
+        tracing::debug!(
+            "Resuming from audio stall at {:?}",
+            self.current_position
+        );
     }
 
     /// Tracks a frame displayed during recovery and ends recovery when stabilized.

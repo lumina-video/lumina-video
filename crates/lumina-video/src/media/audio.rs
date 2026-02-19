@@ -90,6 +90,9 @@ struct AudioHandleInner {
     /// When non-zero, position() returns this value instead of calculating from samples.
     /// This allows native players (AVPlayer, GStreamer) to directly report their position.
     native_position_us: AtomicU64,
+    /// True when cpal callback detects sustained ring buffer underrun.
+    /// Set by cpal callback (audio thread), read by FrameScheduler (UI thread).
+    audio_stalled: AtomicBool,
 }
 
 impl AudioHandle {
@@ -108,6 +111,7 @@ impl AudioHandle {
                 stream_pts_offset_us: AtomicI64::new(0),
                 video_start_time_us_plus1: AtomicU64::new(0),
                 native_position_us: AtomicU64::new(0),
+                audio_stalled: AtomicBool::new(false),
             }),
         }
     }
@@ -310,6 +314,16 @@ impl AudioHandle {
         self.inner.available.store(available, Ordering::Relaxed);
     }
 
+    /// Returns true when cpal callback detects sustained ring buffer underrun.
+    pub fn is_audio_stalled(&self) -> bool {
+        self.inner.audio_stalled.load(Ordering::Acquire)
+    }
+
+    /// Sets the audio stall state (called from cpal callback or lifecycle resets).
+    pub fn set_audio_stalled(&self, stalled: bool) {
+        self.inner.audio_stalled.store(stalled, Ordering::Release);
+    }
+
     /// Starts the shared playback epoch (call when first video frame is displayed).
     /// This coordinates audio and video clocks so they start from the same moment.
     ///
@@ -509,6 +523,10 @@ mod cpal_impl {
     /// Number of samples to accumulate before flushing to atomic counter.
     /// Batching avoids per-sample atomic ops which can cause glitches at 48-96kHz.
     const FLUSH_SAMPLES: u64 = 256;
+
+    /// Consecutive all-empty callbacks before declaring audio stall.
+    /// At 48kHz with ~480-sample callbacks (~10ms each), 3 ≈ 30ms of silence.
+    const STALL_CALLBACK_THRESHOLD: u32 = 3;
 
     /// cpal-based audio player backed by a ring buffer.
     pub struct AudioPlayer {
@@ -744,6 +762,7 @@ mod cpal_impl {
     {
         let mut pending: u64 = 0;
         let output_channels = config.channels as usize;
+        let mut empty_callback_count: u32 = 0;
 
         let stream = device
             .build_output_stream(
@@ -758,6 +777,7 @@ mod cpal_impl {
                     let vol = handle.effective_volume();
                     let source_channels = handle.channels().clamp(1, 2) as usize;
                     let zero = T::from_sample(0.0f32);
+                    let mut any_valid_in_callback = false;
 
                     for frame in data.chunks_mut(output_channels) {
                         let (left, right, valid) = if source_channels == 1 {
@@ -773,6 +793,10 @@ mod cpal_impl {
                                 _ => (0.0, 0.0, false),
                             }
                         };
+
+                        if valid {
+                            any_valid_in_callback = true;
+                        }
 
                         if !valid {
                             for sample in frame.iter_mut() {
@@ -807,6 +831,19 @@ mod cpal_impl {
                     if pending > 0 {
                         handle.add_samples_played(pending);
                         pending = 0;
+                    }
+
+                    // Stall detection: track consecutive empty callbacks
+                    if !any_valid_in_callback {
+                        empty_callback_count = empty_callback_count.saturating_add(1);
+                        if empty_callback_count >= STALL_CALLBACK_THRESHOLD {
+                            handle.set_audio_stalled(true);
+                        }
+                    } else {
+                        if empty_callback_count >= STALL_CALLBACK_THRESHOLD {
+                            handle.set_audio_stalled(false);
+                        }
+                        empty_callback_count = 0;
                     }
                 },
                 |err| tracing::error!("cpal audio error: {err}"),
