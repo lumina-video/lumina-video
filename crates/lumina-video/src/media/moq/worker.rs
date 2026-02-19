@@ -391,7 +391,7 @@ pub(crate) async fn run_moq_worker(
     // -- Phase 4: Subscribe to video track --
     let video_track = moq_lite::Track {
         name: cat.video_track_name.clone(),
-        priority: 1,
+        priority: 100,
     };
     let mut video_consumer = hang::container::OrderedConsumer::new(
         moq_broadcast.subscribe_track(&video_track),
@@ -419,7 +419,7 @@ pub(crate) async fn run_moq_worker(
     let audio_track_for_resub: Option<moq_lite::Track> = if audio_task.is_some() {
         select_preferred_audio_rendition(&cat.catalog).map(|(name, _)| moq_lite::Track {
             name: name.to_string(),
-            priority: 2,
+            priority: 50,
         })
     } else {
         None
@@ -1293,7 +1293,7 @@ fn setup_audio(
 
     let audio_track = moq_lite::Track {
         name: track_name.to_string(),
-        priority: 2,
+        priority: 50,
     };
     let audio_consumer = hang::container::OrderedConsumer::new(
         moq_broadcast.subscribe_track(&audio_track),
