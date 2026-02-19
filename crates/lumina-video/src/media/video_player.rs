@@ -1106,14 +1106,12 @@ impl VideoPlayer {
                 self.scheduler
                     .set_audio_handle_metrics_only(self.audio_handle.clone());
 
-                // Enable playback epoch so AudioHandle::position() returns non-zero,
-                // allowing sync metrics to measure drift.
-                if self.scheduler.is_playing() {
-                    self.audio_handle.enable_playback_epoch();
-                    tracing::info!(
-                        "MoQ audio: late bind (metrics only, wall-clock pacing)"
-                    );
-                }
+                // Don't enable playback epoch here — let the FrameScheduler's
+                // clock rebase enable it, so cpal stays gated until video is ready.
+                // This prevents audio from playing before the A/V clocks are aligned.
+                tracing::info!(
+                    "MoQ audio: late bind (metrics only, wall-clock pacing, epoch deferred)"
+                );
 
                 self.moq_audio_bound = true;
                 tracing::info!("MoQ audio handle bound to VideoPlayer + FrameScheduler");

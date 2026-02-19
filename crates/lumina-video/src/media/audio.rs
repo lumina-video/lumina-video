@@ -211,6 +211,16 @@ impl AudioHandle {
             .store(us.saturating_add(1), Ordering::Relaxed);
     }
 
+    /// Returns the base PTS if set, or None.
+    pub fn audio_base_pts(&self) -> Option<Duration> {
+        let v = self.inner.audio_base_pts_us_plus1.load(Ordering::Relaxed);
+        if v == 0 {
+            None
+        } else {
+            Some(Duration::from_micros(v - 1))
+        }
+    }
+
     /// Clears the base PTS (for seek/stop).
     pub fn clear_audio_base_pts(&self) {
         self.inner
@@ -769,6 +779,16 @@ mod cpal_impl {
                 config,
                 move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
                     if !playing.load(Ordering::Acquire) {
+                        let zero = T::from_sample(0.0f32);
+                        data.fill(zero);
+                        return;
+                    }
+
+                    // Gate on playback epoch: don't consume ring buffer samples
+                    // until video is ready. For MoQ live, audio starts before video
+                    // is ready; without this gate, cpal plays 2+ seconds of audio
+                    // before the video clock rebase, creating a permanent A/V offset.
+                    if handle.playback_epoch().is_none() {
                         let zero = T::from_sample(0.0f32);
                         data.fill(zero);
                         return;
