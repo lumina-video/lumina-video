@@ -1050,6 +1050,17 @@ const OFFSET_REBASE_MIN_STABLE_SAMPLES: u32 = 6;
 const OFFSET_REBASE_STABILITY_TOLERANCE: Duration = Duration::from_millis(220);
 /// Clamp to avoid unbounded scheduler bias.
 const MAX_VIDEO_PTS_BIAS: Duration = Duration::from_secs(8);
+/// Rendering gap threshold: if get_next_frame() hasn't been called for this long,
+/// the app was likely backgrounded (alt-tabbed). Audio continues via cpal but video
+/// frame consumption stalls, causing A/V drift equal to the gap duration.
+/// Normal call interval is ~16ms (60fps vsync); 100ms catches throttled rendering
+/// (macOS backgrounds apps at ~5-10fps) without false-triggering during normal playback.
+const RENDERING_GAP_THRESHOLD: Duration = Duration::from_millis(100);
+/// Stale frame threshold: skip frames whose PTS lags audio by more than this.
+/// Prevents displaying old content (and recording false drift) during catch-up
+/// after app backgrounding. Matches SYNC_DRIFT_THRESHOLD_MS (100ms) so we never
+/// display a frame that would register as out-of-sync.
+const STALE_FRAME_LAG_THRESHOLD: Duration = Duration::from_millis(100);
 /// Max number of aggressive catch-up frame admissions before escalating.
 const CATCH_UP_MAX_FRAMES: u32 = 10;
 /// If catch-up does not recover quickly, escalate to forced resync.
@@ -1123,12 +1134,43 @@ pub struct FrameScheduler {
     stable_reject_lead_samples: u32,
     /// Scheduler-only bias to account for persistent video PTS lead over audio.
     video_pts_bias: Duration,
-    /// Wall-clock time when the last frame was accepted for display.
-    /// Used for frame-rate pacing to prevent burst consumption of queued frames.
-    last_frame_accept_time: Option<std::time::Instant>,
+    /// Accumulated clock-drift correction in microseconds (signed).
+    /// Applied alongside `video_pts_bias` at the frame acceptance point.
+    /// Combined total is clamped to ±MAX_VIDEO_PTS_BIAS.
+    clock_drift_correction_us: i64,
+    /// Last wall-clock time the drift controller ran.
+    last_drift_update: Option<std::time::Instant>,
+    /// True when drift correction is actively slewing (hysteresis state).
+    drift_correction_active: bool,
+    /// EMA-smoothed drift signal (microseconds) for controller input.
+    smoothed_drift_us: f64,
+    /// Deadline accumulator for frame-rate pacing.
+    /// Advances by `frame_pacing_interval` on each accept, producing a natural
+    /// 2-3 tick cadence (e.g., 24fps on 60Hz) instead of hard 3-tick quantization.
+    next_frame_due: Option<std::time::Instant>,
     /// Minimum interval between frame acceptances (1/fps), derived from metadata.
     /// Zero disables pacing (e.g., for VOD or unknown frame rate).
     frame_pacing_interval: Duration,
+    /// When true, audio position drives frame selection (VOD/FFmpeg).
+    /// When false, wall-clock drives frame selection but audio is still
+    /// tracked for sync metrics (MoQ live).
+    use_audio_as_sync_master: bool,
+    /// True when frozen due to audio ring buffer underrun (separate from queue-empty `stalled`).
+    audio_stalled: bool,
+    /// Wall-clock time when audio stall started (for timeout).
+    audio_stall_start: Option<std::time::Instant>,
+    /// Latched bypass: after a stall timeout, skip re-entering stall until audio
+    /// truly recovers (i.e. `is_audio_stalled()` returns false).
+    ignore_audio_stall_until_recovered: bool,
+    /// True once the initial audio-video PTS bias has been computed (one-shot).
+    initial_pts_bias_applied: bool,
+    /// Deferred epoch: the PTS threshold at which to enable the cpal playback epoch.
+    /// Set during MoQ rebase so audio stays gated while old GOP frames are consumed.
+    /// Cleared once a frame with PTS >= this value is accepted.
+    deferred_epoch_pts: Option<Duration>,
+    /// Last time get_next_frame() was called (for rendering gap detection).
+    /// A gap > RENDERING_GAP_THRESHOLD indicates the app was backgrounded.
+    last_get_next_frame_time: Option<std::time::Instant>,
 }
 
 impl FrameScheduler {
@@ -1164,24 +1206,89 @@ impl FrameScheduler {
             last_reject_lead: None,
             stable_reject_lead_samples: 0,
             video_pts_bias: Duration::ZERO,
-            last_frame_accept_time: None,
+            clock_drift_correction_us: 0,
+            last_drift_update: None,
+            drift_correction_active: false,
+            smoothed_drift_us: 0.0,
+            next_frame_due: None,
             frame_pacing_interval: Duration::ZERO,
+            use_audio_as_sync_master: true,
+            audio_stalled: false,
+            audio_stall_start: None,
+            ignore_audio_stall_until_recovered: false,
+            initial_pts_bias_applied: false,
+            deferred_epoch_pts: None,
+            last_get_next_frame_time: None,
         }
     }
 
     /// Creates a new frame scheduler with audio handle for sync tracking.
     pub fn with_audio_handle(audio_handle: AudioHandle) -> Self {
         let mut s = Self::new();
-        s.audio_handle = Some(audio_handle);
-        s.sync_metrics.set_using_audio_clock(true);
+        s.set_audio_handle(audio_handle);
         s
     }
 
-    /// Sets the audio handle for sync tracking.
+    /// Sets the audio handle for sync tracking and uses audio as master clock.
     pub fn set_audio_handle(&mut self, audio_handle: AudioHandle) {
         self.audio_handle = Some(audio_handle);
         self.last_audio_zero_diag = None;
         self.sync_metrics.set_using_audio_clock(true);
+        self.use_audio_as_sync_master = true;
+    }
+
+    /// Sets the audio handle for sync metrics only (wall-clock drives frame pacing).
+    /// Used for MoQ live where audio handle arrives late and the handoff to
+    /// audio-as-master-clock would cause a position discontinuity.
+    pub fn set_audio_handle_metrics_only(&mut self, audio_handle: AudioHandle) {
+        self.audio_handle = Some(audio_handle);
+        self.last_audio_zero_diag = None;
+        self.sync_metrics.set_using_audio_clock(true);
+        self.use_audio_as_sync_master = false;
+    }
+
+    /// Clears the audio handle, falling back to wall-clock for frame pacing.
+    pub fn clear_audio_handle(&mut self) {
+        self.audio_handle = None;
+        self.sync_metrics.set_using_audio_clock(false);
+        self.use_audio_as_sync_master = true; // reset to default
+        self.audio_start_time = None;
+        self.audio_start_pos = Duration::ZERO;
+        self.initial_pts_bias_applied = false;
+        self.deferred_epoch_pts = None;
+        self.audio_stalled = false;
+        self.audio_stall_start = None;
+        self.ignore_audio_stall_until_recovered = false;
+        self.last_get_next_frame_time = None;
+        self.reset_drift_correction();
+    }
+
+    /// Resets drift correction state: zeroes the accumulated correction and
+    /// clears the EMA filter so the controller restarts cleanly.
+    fn reset_drift_correction(&mut self) {
+        self.clock_drift_correction_us = 0;
+        self.last_drift_update = None;
+        self.drift_correction_active = false;
+        self.smoothed_drift_us = 0.0;
+    }
+
+    /// Returns the PTS used to anchor the playback clock (first video frame PTS).
+    pub fn playback_start_position(&self) -> Duration {
+        self.playback_start_position
+    }
+
+    /// Sets the initial video PTS bias to compensate for audio-video PTS offset
+    /// when subscribing mid-stream (e.g., MoQ join where first video frame is at
+    /// the start of a GOP but first audio frame is at the live edge).
+    pub fn set_initial_pts_bias(&mut self, bias: Duration) {
+        let clamped = std::cmp::min(bias, MAX_VIDEO_PTS_BIAS);
+        if !clamped.is_zero() {
+            tracing::info!(
+                "Initial video PTS bias: {}ms (audio ahead of video at join)",
+                clamped.as_millis()
+            );
+            self.video_pts_bias = clamped;
+        }
     }
 
     /// Sets frame-rate pacing for live streams. When fps > 0, the scheduler
@@ -1219,8 +1326,31 @@ impl FrameScheduler {
         if !self.frame_pacing_interval.is_zero() {
             tracing::info!("Frame-rate pacing disabled");
             self.frame_pacing_interval = Duration::ZERO;
-            self.last_frame_accept_time = None;
+            self.next_frame_due = None;
         }
+    }
+
+    /// Advances the frame-pacing deadline accumulator.
+    /// Uses `due + interval` (not `now + interval`) to maintain a smooth cadence.
+    /// Snaps forward if the deadline fell behind by more than one interval
+    /// (e.g., after a stall) to prevent burst catch-up.
+    fn advance_frame_pacing(&mut self) {
+        if self.frame_pacing_interval.is_zero() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        self.next_frame_due = Some(match self.next_frame_due {
+            Some(due) => {
+                let next = due + self.frame_pacing_interval;
+                // Snap forward if we fell behind by more than one interval
+                if next + self.frame_pacing_interval < now {
+                    now + self.frame_pacing_interval
+                } else {
+                    next
+                }
+            }
+            None => now + self.frame_pacing_interval,
+        });
     }
 
     /// Returns the sync metrics tracker.
@@ -1254,6 +1384,12 @@ impl FrameScheduler {
     fn sync_position(&self) -> Duration {
         // Get wall-clock position as baseline
         let wall_clock_pos = self.position();
+
+        // Only use audio as master clock when explicitly enabled (VOD/FFmpeg).
+        // MoQ live uses wall-clock for frame pacing to avoid late-bind discontinuity.
+        if !self.use_audio_as_sync_master {
+            return wall_clock_pos;
+        }
 
         // Try to use audio as master clock
         if let Some(ref audio) = self.audio_handle {
@@ -1314,6 +1450,11 @@ impl FrameScheduler {
         self.audio_start_pos = Duration::ZERO;
         self.last_clock_delta_log = None;
         self.last_clock_delta_values = None;
+        // Preserve clock_drift_correction_us across pause/resume — the
+        // accumulated correction is still valid since the clock pair hasn't changed.
+        self.last_drift_update = None;
+        self.drift_correction_active = false;
+        self.smoothed_drift_us = 0.0;
         if let Some(start) = self.playback_start_time.take() {
             // Calculate wall-clock position
             let wall_clock_pos = self.playback_start_position + start.elapsed();
@@ -1348,6 +1489,10 @@ impl FrameScheduler {
         self.reset_rejection_tracking();
         self.seek_generation = self.seek_generation.wrapping_add(1);
         self.video_pts_bias = Duration::ZERO;
+        self.reset_drift_correction();
+        self.initial_pts_bias_applied = false;
+        self.deferred_epoch_pts = None;
+        self.last_get_next_frame_time = None;
 
         // Reset sync metrics on seek to clear max_drift from transient spikes
         self.sync_metrics.reset();
@@ -1376,9 +1521,9 @@ impl FrameScheduler {
 
     /// Returns the current playback position.
     pub fn position(&self) -> Duration {
-        // If stalled (queue empty during playback), return the last known position
-        // to prevent the scroll bar from advancing during buffering
-        if self.stalled {
+        // If stalled (queue empty or audio underrun), return the last known position
+        // to prevent the scroll bar / subtitles from advancing during buffering
+        if self.stalled || self.audio_stalled {
             return self.current_position;
         }
 
@@ -1414,6 +1559,34 @@ impl FrameScheduler {
         self.playback_requested
     }
 
+    /// Returns true when stalled due to either queue-empty or audio ring buffer underrun.
+    pub fn is_stalled(&self) -> bool {
+        self.stalled || self.audio_stalled
+    }
+
+    /// Returns true when frozen specifically due to audio ring buffer underrun.
+    pub fn is_audio_stall(&self) -> bool {
+        self.audio_stalled
+    }
+
+    /// Clears audio stall state (called when audio handle becomes stale/unavailable).
+    pub fn clear_audio_stall(&mut self) {
+        self.ignore_audio_stall_until_recovered = false;
+        if self.audio_stalled {
+            self.audio_stalled = false;
+            self.audio_stall_start = None;
+            if self.playback_requested {
+                self.playback_start_time = Some(std::time::Instant::now());
+                self.playback_start_position = self.current_position;
+            }
+            self.frames_since_recovery = 0;
+            tracing::debug!(
+                "Cleared audio stall (handle removed) at {:?}",
+                self.current_position
+            );
+        }
+    }
+
     /// Called when a frame is received to sync the clock.
     /// If we were waiting for the first frame, this starts the clock.
     fn on_frame_received(&mut self, frame_pts: Duration) {
@@ -1423,15 +1596,26 @@ impl FrameScheduler {
             self.playback_start_position = frame_pts;
             self.waiting_for_first_frame = false;
 
-            // Also start the shared audio playback epoch so A/V clocks are synchronized
-            if let Some(ref audio) = self.audio_handle {
-                audio.start_playback_epoch();
+            // Start the shared audio playback epoch so A/V clocks are synchronized.
+            // Skip for MoQ (wall-clock mode): the rebase block in get_next_frame()
+            // will enable the epoch after aligning the video clock to audio_base_pts.
+            // Setting it here would let cpal consume ring buffer samples before the
+            // rebase, creating a permanent A/V content offset.
+            if self.use_audio_as_sync_master {
+                if let Some(ref audio) = self.audio_handle {
+                    audio.start_playback_epoch();
+                    tracing::debug!(
+                        "Clock started at frame PTS {:?}, audio epoch synchronized",
+                        frame_pts
+                    );
+                } else {
+                    tracing::debug!("Clock started at frame PTS {:?}", frame_pts);
+                }
+            } else {
                 tracing::debug!(
-                    "Clock started at frame PTS {:?}, audio epoch synchronized",
+                    "Clock started at frame PTS {:?} (epoch deferred for MoQ rebase)",
                     frame_pts
                 );
-            } else {
-                tracing::debug!("Clock started at frame PTS {:?}", frame_pts);
             }
         }
     }
@@ -1492,6 +1676,123 @@ impl FrameScheduler {
             audio.samples_played_duration().as_millis(),
             audio.stream_pts_offset_us()
         );
+    }
+
+    /// Time-based proportional controller that compensates for clock drift
+    /// between the system monotonic clock (video pacing) and the cpal hardware
+    /// clock (audio position). Updates at 200ms cadence with hysteresis deadband.
+    fn update_clock_drift_correction(&mut self) {
+        if self.use_audio_as_sync_master {
+            return;
+        }
+
+        // Skip for native audio (externally managed sync).
+        let uses_native = self
+            .audio_handle
+            .as_ref()
+            .map(|h| h.is_using_native_position())
+            .unwrap_or(false);
+        if uses_native || self.sync_metrics.is_sync_externally_managed() {
+            return;
+        }
+
+        // Gate: no correction during stall.
+        // Reset EMA/hysteresis so stale drift doesn't bias post-stall correction.
+        // Note: is_in_recovery() intentionally excluded — recovery can persist if
+        // stalls recur faster than RECOVERY_FRAME_THRESHOLD, creating a chicken-and-egg
+        // where the controller can never run to fix the drift causing the stalls.
+        if self.stalled || self.audio_stalled {
+            self.last_drift_update = None;
+            self.drift_correction_active = false;
+            self.smoothed_drift_us = 0.0;
+            return;
+        }
+
+        if self.audio_position() == Duration::ZERO {
+            return;
+        }
+
+        // Warmup: 5s after audio starts
+        match self.audio_start_time {
+            Some(start) if start.elapsed() >= Duration::from_secs(5) => {}
+            _ => return,
+        }
+
+        // Time-based rate limiting: every 200ms, dt capped at 500ms
+        let now = std::time::Instant::now();
+        let dt = match self.last_drift_update {
+            Some(last) => {
+                let elapsed = now.duration_since(last);
+                if elapsed < Duration::from_millis(200) {
+                    return;
+                }
+                std::cmp::min(elapsed, Duration::from_millis(500))
+            }
+            None => {
+                self.last_drift_update = Some(now);
+                return;
+            }
+        };
+        self.last_drift_update = Some(now);
+
+        // EMA-smooth the raw drift signal (alpha=0.3, ~1s window at 200ms intervals)
+        let raw_drift = self.sync_metrics.current_drift_us() as f64;
+
+        // Step detection: large drift (>200ms) indicates sudden desync from app
+        // backgrounding or similar disruption. The proportional controller's 10ms/s
+        // max slew would take ~100s to correct a 1s step. Instead, resync the wall
+        // clock to the audio position immediately.
+        const STEP_THRESHOLD_US: f64 = 100_000.0; // 100ms — matches SYNC_DRIFT_THRESHOLD_MS
+        if raw_drift.abs() > STEP_THRESHOLD_US {
+            let audio_pos = self.audio_position();
+            if audio_pos > Duration::ZERO {
+                tracing::info!(
+                    "Drift controller: step drift {}ms detected, resyncing wall clock to audio ({:?})",
+                    raw_drift as i64 / 1000,
+                    audio_pos
+                );
+                self.playback_start_position = audio_pos;
+                self.playback_start_time = Some(now);
+                self.current_position = audio_pos;
+                self.reset_drift_correction();
+                self.sync_metrics.set_grace_period(10);
+                return;
+            }
+        }
+
+        const EMA_ALPHA: f64 = 0.3;
+        self.smoothed_drift_us = self.smoothed_drift_us * (1.0 - EMA_ALPHA) + raw_drift * EMA_ALPHA;
+        let drift_us = self.smoothed_drift_us as i64;
+
+        // Hysteresis deadband: enter at |drift| > 40ms, exit at < 20ms
+        const ENTER_US: i64 = 40_000;
+        const EXIT_US: i64 = 20_000;
+
+        if self.drift_correction_active {
+            if drift_us.abs() < EXIT_US {
+                self.drift_correction_active = false;
+                return;
+            }
+        } else {
+            if drift_us.abs() < ENTER_US {
+                return;
+            }
+            self.drift_correction_active = true;
+        }
+
+        // Proportional controller: slew at most 10ms/s (1% speed change)
+        const MAX_SLEW_US_PER_SEC: f64 = 10_000.0;
+        const GAIN: f64 = 0.1;
+
+        let dt_secs = dt.as_secs_f64();
+        let desired_rate = -(drift_us as f64) * GAIN;
+        let clamped_rate = desired_rate.clamp(-MAX_SLEW_US_PER_SEC, MAX_SLEW_US_PER_SEC);
+        let delta = (clamped_rate * dt_secs) as i64;
+
+        self.clock_drift_correction_us += delta;
+
+        let max_us = MAX_VIDEO_PTS_BIAS.as_micros() as i64;
+        self.clock_drift_correction_us = self.clock_drift_correction_us.clamp(-max_us, max_us);
     }
 
     fn compute_ahead_tolerance(
@@ -1611,6 +1912,10 @@ impl FrameScheduler {
         );
         self.offset_rebased_in_window = true;
         self.reject_state = RejectHandlingState::CatchUp;
+        // Filter reset — bias jumped, stale EMA/hysteresis could produce wrong-way correction.
+        self.last_drift_update = None;
+        self.drift_correction_active = false;
+        self.smoothed_drift_us = 0.0;
 
         tracing::warn!(
             "get_next_frame: applied one-shot offset rebase (lead={}ms, stable_samples={}, current_pos={:?}, next_pts={:?}, bias {}ms -> {}ms)",
@@ -1657,26 +1962,138 @@ impl FrameScheduler {
             self.on_frame_received(frame.pts);
             self.current_frame = Some(frame.clone());
             self.stalled = false;
-            self.last_frame_accept_time = Some(std::time::Instant::now());
+            self.advance_frame_pacing();
             // Record sync metrics for first frame
             self.record_sync(frame.pts);
             return Some(frame);
         }
 
+        // Rendering gap detection: when the app is backgrounded (alt-tab), egui stops
+        // or throttles repainting, but cpal audio continues playing. This creates A/V
+        // drift equal to the gap duration. Detect the gap and resync immediately.
+        if !self.use_audio_as_sync_master && self.playback_start_time.is_some() {
+            let now = std::time::Instant::now();
+            if let Some(last) = self.last_get_next_frame_time {
+                let gap = now.duration_since(last);
+                if gap > RENDERING_GAP_THRESHOLD {
+                    let audio_pos = self.audio_position();
+                    if audio_pos > Duration::ZERO {
+                        // Drain stale frames — they'd show old content while audio is
+                        // at the live edge, creating a drift spike during catch-up.
+                        let mut drained = 0;
+                        while queue.pop().is_some() {
+                            drained += 1;
+                        }
+                        tracing::info!(
+                            "Rendering gap {}ms: drained {} stale frames, resyncing wall clock to audio ({:?})",
+                            gap.as_millis(),
+                            drained,
+                            audio_pos
+                        );
+                        // Resync wall clock to audio position
+                        self.playback_start_position = audio_pos;
+                        self.playback_start_time = Some(now);
+                        self.current_position = audio_pos;
+                        self.reset_drift_correction();
+                        // Reset pacing so next fresh frame is accepted immediately
+                        self.next_frame_due = None;
+                        // Grace period to filter transient drift spikes during recovery
+                        self.sync_metrics.set_grace_period(10);
+                    }
+                }
+            }
+            self.last_get_next_frame_time = Some(now);
+        }
+
         // Frame-rate pacing: prevent burst consumption of group-boundary deliveries.
-        // For live streams with known frame rate, don't advance to the next frame
-        // sooner than 1/fps since the last acceptance. This keeps display smooth
-        // even when the transport delivers entire groups at once.
-        // Allow 4ms of jitter to avoid missing frames at boundary.
+        // Uses a deadline accumulator (next_due += interval) instead of elapsed-since-last
+        // to avoid UI refresh aliasing. At 24fps on 60Hz, the old elapsed check quantized
+        // to 50ms/frame (20fps); the accumulator produces a 2-3 tick cadence averaging 24fps.
         if !self.frame_pacing_interval.is_zero() {
-            if let Some(last) = self.last_frame_accept_time {
-                let since_last = last.elapsed();
-                if since_last
-                    < self
-                        .frame_pacing_interval
-                        .saturating_sub(Duration::from_millis(4))
-                {
+            let now = std::time::Instant::now();
+            if let Some(due) = self.next_frame_due {
+                if now < due {
                     return self.current_frame.clone();
+                }
+            }
+        }
+
+        // Deferred clock rebase: when subscribing mid-stream, the first video frame
+        // comes from the GOP start (older PTS) while the first audio frame is at the
+        // live edge (newer PTS). Rebase the playback clock to audio's start PTS so that
+        // all old GOP frames are consumed instantly. The queue will empty during catch-up,
+        // triggering handle_stall() which freezes the clock until real-time frames arrive.
+        // This prevents wall-clock from advancing while the decode pipeline chews through
+        // the old GOP, keeping video aligned with audio when playback resumes.
+        if !self.initial_pts_bias_applied && !self.use_audio_as_sync_master {
+            if let Some(ref ah) = self.audio_handle {
+                if let Some(audio_start) = ah.audio_base_pts() {
+                    self.initial_pts_bias_applied = true;
+                    let video_start = self.playback_start_position;
+                    let offset = audio_start.saturating_sub(video_start);
+                    if offset > Duration::from_millis(100) {
+                        tracing::info!(
+                            "MoQ join rebase: video_start={:?}, audio_start={:?}, offset={}ms — rebasing clock",
+                            video_start, audio_start, offset.as_millis()
+                        );
+                        self.playback_start_position = audio_start;
+                        self.playback_start_time = Some(std::time::Instant::now());
+                        self.current_position = audio_start;
+                    }
+                    // Defer the playback epoch until video catches up to the live edge.
+                    // Old GOP frames (PTS < audio_start) are still being consumed at paced
+                    // rate. If we enable audio now, cpal plays live-edge audio while video
+                    // shows stale GOP content, creating a permanent offset equal to the
+                    // catch-up duration. Instead, gate cpal until the first frame with
+                    // PTS >= audio_start is accepted.
+                    self.deferred_epoch_pts = Some(audio_start);
+                    self.reset_drift_correction();
+                    tracing::info!("MoQ: epoch deferred until video PTS >= {:?}", audio_start);
+                }
+            }
+        }
+
+        // Audio-stall gate: if audio ring buffer is underrunning and we're using
+        // wall-clock pacing (MoQ live), freeze video to prevent A/V drift.
+        // VOD (audio-as-master) naturally pauses via stale sync_position().
+        // The position_for_sync() > ZERO guard prevents false stalls during startup:
+        // set_available(true) fires at bind time before first decoded audio arrives,
+        // so empty callbacks are expected until position advances.
+        if !self.use_audio_as_sync_master {
+            if let Some(ref ah) = self.audio_handle {
+                let audio_producing = ah.is_available() && ah.position_for_sync() > Duration::ZERO;
+                if audio_producing && ah.is_audio_stalled() {
+                    if self.ignore_audio_stall_until_recovered {
+                        // Latch active: skip stall gate until audio truly recovers.
+                    } else {
+                        // Timeout: if audio stall lasts >3s, give up and resume wall-clock.
+                        // This handles publisher stream loops or permanent audio loss.
+                        let timed_out = self
+                            .audio_stall_start
+                            .map(|t| t.elapsed() > Duration::from_secs(3))
+                            .unwrap_or(false);
+                        if timed_out {
+                            tracing::warn!(
+                                "Audio stall timeout (>3s) at {:?}, resuming wall-clock",
+                                self.current_position
+                            );
+                            self.exit_audio_stall();
+                            self.ignore_audio_stall_until_recovered = true;
+                        } else {
+                            if !self.audio_stalled {
+                                self.enter_audio_stall();
+                            }
+                            return self.current_frame.clone();
+                        }
+                    }
+                } else {
+                    // Audio recovered (no longer stalled) — clear latch and stall state.
+                    if self.ignore_audio_stall_until_recovered {
+                        self.ignore_audio_stall_until_recovered = false;
+                    }
+                    if self.audio_stalled {
+                        self.exit_audio_stall();
+                    }
                 }
             }
         }
@@ -1694,8 +2111,18 @@ impl FrameScheduler {
 
             // We have frames - clear stall state and resync clock if needed
             self.clear_stall_if_needed();
+            self.update_clock_drift_correction();
             let raw_sync_pos = self.sync_position();
-            let current_pos = raw_sync_pos.saturating_add(self.video_pts_bias);
+            let total_bias_us =
+                self.video_pts_bias.as_micros() as i64 + self.clock_drift_correction_us;
+            let max_bias_us = MAX_VIDEO_PTS_BIAS.as_micros() as i64;
+            let clamped_bias_us = total_bias_us.clamp(-max_bias_us, max_bias_us);
+            let effective_bias_ms = clamped_bias_us / 1000;
+            let current_pos = if clamped_bias_us >= 0 {
+                raw_sync_pos.saturating_add(Duration::from_micros(clamped_bias_us as u64))
+            } else {
+                raw_sync_pos.saturating_sub(Duration::from_micros((-clamped_bias_us) as u64))
+            };
 
             let now = std::time::Instant::now();
             // Accept frame if:
@@ -1720,14 +2147,14 @@ impl FrameScheduler {
                 if self.rejection_count == 1 {
                     self.record_reject_window_start(now);
                     tracing::warn!(
-                        "get_next_frame: reject window start sync_pos={:?}, effective_pos={:?}, next_pts={:?}, gap={}ms, lead={}ms, tolerance={}ms, bias={}ms, state={:?}, audio_pos={:?}, seek_gen={}",
+                        "get_next_frame: reject window start sync_pos={:?}, effective_pos={:?}, next_pts={:?}, gap={}ms, lead={}ms, tolerance={}ms, eff_bias={}ms, state={:?}, audio_pos={:?}, seek_gen={}",
                         raw_sync_pos,
                         current_pos,
                         next_pts,
                         gap.as_millis(),
                         lead.as_millis(),
                         accept_tolerance.as_millis(),
-                        self.video_pts_bias.as_millis(),
+                        effective_bias_ms,
                         self.reject_state,
                         audio_pos,
                         self.seek_generation
@@ -1775,12 +2202,12 @@ impl FrameScheduler {
                     if self.reject_state == RejectHandlingState::Normal {
                         self.reject_state = RejectHandlingState::CatchUp;
                         tracing::warn!(
-                            "get_next_frame: entering catch-up mode (stuck={:?}, lead={}ms, gap={}ms, tolerance={}ms, bias={}ms)",
+                            "get_next_frame: entering catch-up mode (stuck={:?}, lead={}ms, gap={}ms, tolerance={}ms, eff_bias={}ms)",
                             stuck_duration,
                             lead.as_millis(),
                             gap.as_millis(),
                             accept_tolerance.as_millis(),
-                            self.video_pts_bias.as_millis()
+                            effective_bias_ms
                         );
                     }
 
@@ -1801,17 +2228,17 @@ impl FrameScheduler {
                             self.catch_up_frames_in_window =
                                 self.catch_up_frames_in_window.saturating_add(1);
                             tracing::debug!(
-                                "get_next_frame: catch-up accepted frame pts={:?} (count={}, lead={}ms, bias={}ms)",
+                                "get_next_frame: catch-up accepted frame pts={:?} (count={}, lead={}ms, eff_bias={}ms)",
                                 frame.pts,
                                 self.catch_up_frames_in_window,
                                 lead.as_millis(),
-                                self.video_pts_bias.as_millis()
+                                effective_bias_ms
                             );
                             self.current_position = frame.pts;
                             self.current_frame = Some(frame.clone());
                             self.playback_start_time = Some(std::time::Instant::now());
                             self.playback_start_position = frame.pts;
-                            self.last_frame_accept_time = Some(std::time::Instant::now());
+                            self.advance_frame_pacing();
                             self.record_sync(frame.pts);
                             self.track_recovery_frame();
                             return Some(frame);
@@ -1837,7 +2264,7 @@ impl FrameScheduler {
                             self.current_frame = Some(frame.clone());
                             self.playback_start_time = Some(std::time::Instant::now());
                             self.playback_start_position = frame.pts;
-                            self.last_frame_accept_time = Some(std::time::Instant::now());
+                            self.advance_frame_pacing();
                             return Some(frame);
                         }
                     } else if self.reject_state == RejectHandlingState::Resync {
@@ -1859,13 +2286,13 @@ impl FrameScheduler {
                 // Log rejection details periodically (every ~1 second)
                 if stuck_duration.as_millis() % 1000 < 20 {
                     tracing::debug!(
-                        "get_next_frame: rejecting, stuck={:?}, current_pos={:?}, next_pts={:?}, gap={:?}ms, tolerance={}ms, bias={}ms, state={:?}, audio_pos={:?}, rejects={}",
+                        "get_next_frame: rejecting, stuck={:?}, current_pos={:?}, next_pts={:?}, gap={:?}ms, tolerance={}ms, eff_bias={}ms, state={:?}, audio_pos={:?}, rejects={}",
                         stuck_duration,
                         current_pos,
                         next_pts,
                         gap.as_millis(),
                         accept_tolerance.as_millis(),
-                        self.video_pts_bias.as_millis(),
+                        effective_bias_ms,
                         self.reject_state,
                         audio_pos,
                         self.rejection_count
@@ -1900,9 +2327,47 @@ impl FrameScheduler {
                 }
             }
 
+            // Skip stale frames in wall-clock mode: if frame PTS lags audio by more
+            // than STALE_FRAME_LAG_THRESHOLD, the frame would show old content while
+            // audio is at the live edge. Drop it and try the next queued frame.
+            // This is a safety net for cases the rendering gap detection didn't catch
+            // (e.g., reduced-rate rendering during background, gradual accumulation).
+            if !self.use_audio_as_sync_master {
+                let audio_pos = self.audio_position();
+                if audio_pos > Duration::ZERO {
+                    let lag = audio_pos.saturating_sub(frame.pts);
+                    if lag > STALE_FRAME_LAG_THRESHOLD {
+                        tracing::debug!(
+                            "Skipping stale frame PTS={:?} (audio at {:?}, lag={}ms)",
+                            frame.pts,
+                            audio_pos,
+                            lag.as_millis()
+                        );
+                        continue;
+                    }
+                }
+            }
+
             self.current_position = frame.pts;
             self.current_frame = Some(frame.clone());
-            self.last_frame_accept_time = Some(std::time::Instant::now());
+            self.advance_frame_pacing();
+
+            // Deferred epoch: enable audio once video reaches the live edge.
+            // This fires once, when the first frame with PTS >= the rebase target
+            // is accepted, ensuring audio and video start from the same content point.
+            if let Some(threshold) = self.deferred_epoch_pts {
+                if frame.pts >= threshold {
+                    if let Some(ref ah) = self.audio_handle {
+                        ah.start_playback_epoch();
+                        tracing::info!(
+                            "MoQ: epoch enabled at video PTS {:?} (threshold {:?})",
+                            frame.pts,
+                            threshold
+                        );
+                    }
+                    self.deferred_epoch_pts = None;
+                }
+            }
 
             // NOTE: We previously tried setting native_position from frame.pts for macOS,
             // but this creates a circular dependency: sync_position() reads audio.position
@@ -1926,7 +2391,7 @@ impl FrameScheduler {
     }
 
     /// Records A/V sync metrics for a displayed frame.
-    fn record_sync(&mut self, _video_pts: Duration) {
+    fn record_sync(&mut self, video_pts: Duration) {
         // Always copy stream PTS offset for reporting (even before audio starts)
         if let Some(ref handle) = self.audio_handle {
             let offset = handle.stream_pts_offset_us();
@@ -1952,14 +2417,107 @@ impl FrameScheduler {
                 // Mark sync as externally managed so UI shows appropriate message.
                 self.sync_metrics.set_sync_externally_managed(true);
                 self.sync_metrics.record_frame(audio_pos, audio_pos);
-            } else {
+            } else if !self.use_audio_as_sync_master {
+                // MoQ wall-clock mode: compare displayed video PTS directly against
+                // audio content position. This captures both rate drift AND any
+                // constant content offset (e.g., audio started ahead of video).
+                // The previous approach compared wall-clock vs audio-clock rate,
+                // which only detected rate drift and missed constant offsets.
                 self.sync_metrics.set_sync_externally_managed(false);
-                // FFmpeg audio: audio_pos is sample-counted from base_pts after seek.
-                // Track when audio actually started and its position at that time.
+
                 if self.audio_start_time.is_none() {
                     self.audio_start_time = Some(std::time::Instant::now());
                     self.audio_start_pos = audio_pos;
+                    tracing::info!(
+                        "record_sync(MoQ): first measurement video_pts={:?}, audio_pos={:?}, offset={}ms",
+                        video_pts,
+                        audio_pos,
+                        video_pts.as_millis() as i64 - audio_pos.as_millis() as i64,
+                    );
                 }
+
+                self.sync_metrics.record_frame(video_pts, audio_pos);
+
+                // 10s diagnostic: log content alignment and clock rates
+                let now = std::time::Instant::now();
+                let elapsed = self
+                    .audio_start_time
+                    .map(|t| t.elapsed())
+                    .unwrap_or(Duration::ZERO);
+                let should_log = match self.last_clock_delta_log {
+                    None => elapsed > Duration::from_secs(1),
+                    Some(last) => now.duration_since(last) >= Duration::from_secs(10),
+                };
+                if should_log {
+                    let drift_ms = video_pts.as_millis() as i64 - audio_pos.as_millis() as i64;
+                    tracing::info!(
+                        "A/V content sync (10s): video_pts={:?}, audio_pos={:?}, drift={}ms, drift_corr={}ms, eff_bias={}ms",
+                        video_pts,
+                        audio_pos,
+                        drift_ms,
+                        self.clock_drift_correction_us / 1000,
+                        (self.video_pts_bias.as_micros() as i64 + self.clock_drift_correction_us)
+                            .clamp(-(MAX_VIDEO_PTS_BIAS.as_micros() as i64), MAX_VIDEO_PTS_BIAS.as_micros() as i64) / 1000,
+                    );
+                    self.last_clock_delta_log = Some(now);
+                }
+            } else {
+                self.sync_metrics.set_sync_externally_managed(false);
+                // VOD (audio-as-master): audio drives video pacing, so measure
+                // audio clock rate accuracy vs wall-clock. Any rate drift here
+                // IS the A/V drift since video follows audio by construction.
+                if self.audio_start_time.is_none() {
+                    self.audio_start_time = Some(std::time::Instant::now());
+                    self.audio_start_pos = audio_pos;
+                    if let Some(ref h) = self.audio_handle {
+                        let ch = h.channels();
+                        if ch > 0 {
+                            tracing::info!(
+                                "record_sync: first measurement audio_pos={:?}, samples_played={}, raw_pos={:?}, samples_dur={:?}, channels={}",
+                                audio_pos,
+                                h.samples_played(),
+                                h.position(),
+                                h.samples_played_duration(),
+                                ch,
+                            );
+                        } else {
+                            tracing::info!(
+                                "record_sync: first measurement audio_pos={:?}, samples_played={}, raw_pos={:?}, samples_dur={:?} (channels not yet set)",
+                                audio_pos,
+                                h.samples_played(),
+                                h.position(),
+                                h.samples_played_duration(),
+                            );
+                        }
+                    }
+                }
+
+                // Re-baseline drift measurement when it exceeds threshold.
+                // Handles: (1) initial ring buffer prefill offset (~200ms at startup),
+                // (2) publisher restarts / IDR drops that stall audio delivery,
+                // (3) complete audio stalls (ring buffer underrun).
+                // Cooldown: audio_start_time resets on each re-baseline, and we require
+                // 2s since last baseline before checking again.
+                if let Some(start) = self.audio_start_time {
+                    let since_start = start.elapsed();
+                    if since_start >= Duration::from_secs(2) {
+                        let audio_delta = audio_pos.saturating_sub(self.audio_start_pos);
+                        let drift_abs = since_start.abs_diff(audio_delta);
+                        if drift_abs > Duration::from_millis(200) {
+                            let old_pos = self.audio_start_pos;
+                            self.audio_start_time = Some(std::time::Instant::now());
+                            self.audio_start_pos = audio_pos;
+                            self.sync_metrics.reset();
+                            tracing::info!(
+                                "record_sync: re-baselined drift (was {:?}, old_start={:?}, new_start={:?})",
+                                drift_abs,
+                                old_pos,
+                                audio_pos,
+                            );
+                        }
+                    }
+                }
+
                 // Calculate drift as: elapsed_time - audio_progress_since_start
                 // This is seek-aware: after seek to 50s, audio_pos=50s, audio_start_pos=50s
                 // so audio_delta=0, and we compare against elapsed=0 → drift=0
@@ -1974,7 +2532,7 @@ impl FrameScheduler {
                 // to determine whether drift is from audio sample counting or video pacing.
                 let now = std::time::Instant::now();
                 let should_log = match self.last_clock_delta_log {
-                    None => elapsed > Duration::from_secs(1), // emit first diagnostic after 1s
+                    None => elapsed > Duration::from_secs(1),
                     Some(last) => now.duration_since(last) >= Duration::from_secs(10),
                 };
                 if should_log {
@@ -2016,6 +2574,16 @@ impl FrameScheduler {
         }
         self.stalled = true;
 
+        // MoQ wall-clock mode: pause audio during video stalls so they stay in sync.
+        // Without this, audio continues playing through the ring buffer while the
+        // video clock is frozen, creating a permanent A/V offset equal to the stall
+        // duration. Clearing the epoch gates the cpal callback (outputs silence).
+        if !self.use_audio_as_sync_master {
+            if let Some(ref ah) = self.audio_handle {
+                ah.clear_playback_epoch();
+            }
+        }
+
         // Record buffer underrun in sync metrics
         self.sync_metrics.record_underrun();
 
@@ -2041,7 +2609,48 @@ impl FrameScheduler {
         self.playback_start_position = self.current_position;
         // Reset frame counter for tracking recovery completion
         self.frames_since_recovery = 0;
+
+        // MoQ wall-clock mode: resume audio after stall. Re-enable the epoch
+        // but preserve samples_played so audio position stays correct.
+        // start_playback_epoch() would reset samples_played to 0, making
+        // audio jump back to base_pts while video continues from current_position.
+        if !self.use_audio_as_sync_master {
+            if let Some(ref ah) = self.audio_handle {
+                ah.enable_playback_epoch();
+            }
+        }
+
         tracing::debug!("Resuming from stall at {:?}", self.current_position);
+    }
+
+    /// Enters audio-induced stall (ring buffer underrun during MoQ live).
+    fn enter_audio_stall(&mut self) {
+        if self.audio_stalled || !self.playback_requested {
+            return;
+        }
+        if let Some(start_time) = self.playback_start_time {
+            self.current_position = self.playback_start_position + start_time.elapsed();
+        }
+        self.playback_start_time = None;
+        self.audio_stalled = true;
+        self.audio_stall_start = Some(std::time::Instant::now());
+        self.sync_metrics.record_underrun();
+        self.sync_metrics.record_stall(StallType::Network);
+        self.sync_metrics.start_recovery();
+        tracing::debug!(
+            "Audio stall at {:?} (ring buffer underrun)",
+            self.current_position
+        );
+    }
+
+    /// Exits audio stall — called when cpal callback reports data flowing again.
+    fn exit_audio_stall(&mut self) {
+        self.audio_stalled = false;
+        self.audio_stall_start = None;
+        self.playback_start_time = Some(std::time::Instant::now());
+        self.playback_start_position = self.current_position;
+        self.frames_since_recovery = 0;
+        tracing::debug!("Resuming from audio stall at {:?}", self.current_position);
     }
 
     /// Tracks a frame displayed during recovery and ends recovery when stabilized.
@@ -2141,5 +2750,151 @@ mod tests {
         let pos = scheduler.position();
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(scheduler.position(), pos);
+    }
+
+    /// Bind an AudioHandle with a specific position for drift controller tests.
+    fn bind_test_audio_metrics_only(s: &mut FrameScheduler, pos: Duration) {
+        let h = crate::media::audio::AudioHandle::new();
+        h.set_available(true);
+        h.set_audio_format(48_000, 2);
+        h.set_audio_base_pts(Duration::ZERO);
+        h.enable_playback_epoch();
+        let samples = ((pos.as_secs_f64() * 48_000.0) * 2.0) as u64;
+        h.add_samples_played(samples);
+        s.set_audio_handle_metrics_only(h);
+    }
+
+    #[test]
+    fn test_drift_controller_deadband_enter_exit() {
+        let mut s = FrameScheduler::new();
+        s.use_audio_as_sync_master = false;
+        s.audio_start_time = Some(std::time::Instant::now() - Duration::from_secs(10));
+        s.last_drift_update = Some(std::time::Instant::now() - Duration::from_secs(1));
+        bind_test_audio_metrics_only(&mut s, Duration::from_secs(10));
+
+        // Drive drift to 30ms (below enter threshold of 40ms)
+        s.sync_metrics
+            .record_frame(Duration::from_millis(10_030), Duration::from_millis(10_000));
+        s.update_clock_drift_correction();
+        // EMA starts at 0, first update: 0.0 * 0.7 + 30000.0 * 0.3 = 9000 (9ms) < 40ms
+        assert_eq!(s.clock_drift_correction_us, 0);
+        assert!(!s.drift_correction_active);
+
+        // Drive drift to 80ms, enough for EMA to cross enter threshold (40ms)
+        // but below step detection threshold (100ms)
+        for _ in 0..20 {
+            s.sync_metrics
+                .record_frame(Duration::from_millis(10_080), Duration::from_millis(10_000));
+            s.last_drift_update = Some(std::time::Instant::now() - Duration::from_secs(1));
+            s.update_clock_drift_correction();
+        }
+        assert!(s.drift_correction_active);
+        assert!(s.clock_drift_correction_us < 0); // video ahead → negative correction
+
+        // Phase 2: exit — drive drift below EXIT_US (20ms)
+        for _ in 0..30 {
+            s.sync_metrics
+                .record_frame(Duration::from_millis(10_010), Duration::from_millis(10_000));
+            s.last_drift_update = Some(std::time::Instant::now() - Duration::from_secs(1));
+            s.update_clock_drift_correction();
+        }
+        // EMA converges toward 10ms (10_000us) < EXIT_US → should deactivate
+        assert!(!s.drift_correction_active);
+
+        // Capture correction at deactivation, then verify no further changes
+        let correction_at_deactivation = s.clock_drift_correction_us;
+        for _ in 0..5 {
+            s.sync_metrics
+                .record_frame(Duration::from_millis(10_010), Duration::from_millis(10_000));
+            s.last_drift_update = Some(std::time::Instant::now() - Duration::from_secs(1));
+            s.update_clock_drift_correction();
+        }
+        assert_eq!(s.clock_drift_correction_us, correction_at_deactivation);
+    }
+
+    #[test]
+    fn test_drift_controller_stall_gating() {
+        let mut s = FrameScheduler::new();
+        s.use_audio_as_sync_master = false;
+
+        // Set up some existing state
+        s.last_drift_update = Some(std::time::Instant::now());
+        s.drift_correction_active = true;
+        s.smoothed_drift_us = 50_000.0;
+
+        s.stalled = true;
+        s.update_clock_drift_correction();
+        assert!(s.last_drift_update.is_none());
+        assert!(!s.drift_correction_active);
+        assert_eq!(s.smoothed_drift_us, 0.0);
+
+        // Also test audio_stalled
+        s.stalled = false;
+        s.audio_stalled = true;
+        s.last_drift_update = Some(std::time::Instant::now());
+        s.drift_correction_active = true;
+        s.smoothed_drift_us = 50_000.0;
+        s.update_clock_drift_correction();
+        assert!(s.last_drift_update.is_none());
+        assert!(!s.drift_correction_active);
+        assert_eq!(s.smoothed_drift_us, 0.0);
+    }
+
+    #[test]
+    fn test_drift_controller_dt_cap() {
+        let mut s = FrameScheduler::new();
+        s.use_audio_as_sync_master = false;
+        s.audio_start_time = Some(std::time::Instant::now() - Duration::from_secs(10));
+        bind_test_audio_metrics_only(&mut s, Duration::from_secs(10));
+
+        // Pre-seed controller state to active with drift below step threshold (100ms)
+        // so proportional controller runs instead of step correction.
+        s.smoothed_drift_us = -80_000.0; // -80ms
+        s.drift_correction_active = true;
+        s.sync_metrics
+            .record_frame(Duration::from_millis(9_920), Duration::from_millis(10_000));
+
+        // Set last update 5s ago (will be capped to 500ms)
+        s.last_drift_update = Some(std::time::Instant::now() - Duration::from_secs(5));
+        s.update_clock_drift_correction();
+
+        // dt capped at 500ms, max slew 10ms/s → max delta per step = 5000us
+        assert!(s.clock_drift_correction_us <= 5_000);
+        assert!(s.clock_drift_correction_us > 0); // audio ahead → positive correction
+    }
+
+    #[test]
+    fn test_drift_controller_step_detection() {
+        let mut s = FrameScheduler::new();
+        s.use_audio_as_sync_master = false;
+        s.audio_start_time = Some(std::time::Instant::now() - Duration::from_secs(10));
+        s.playback_start_time = Some(std::time::Instant::now());
+        s.playback_start_position = Duration::from_millis(9_000);
+        bind_test_audio_metrics_only(&mut s, Duration::from_secs(10));
+
+        // Set drift > 100ms step threshold — should trigger immediate resync
+        s.drift_correction_active = true;
+        s.sync_metrics
+            .record_frame(Duration::from_millis(9_000), Duration::from_millis(10_000));
+        s.last_drift_update = Some(std::time::Instant::now() - Duration::from_secs(1));
+        s.update_clock_drift_correction();
+
+        // Step detection should resync and reset correction to 0
+        assert_eq!(s.clock_drift_correction_us, 0);
+        assert!(!s.drift_correction_active);
+        // Wall clock should be resynced near audio position
+        assert!(s.playback_start_position > Duration::from_millis(9_900));
+    }
+
+    #[test]
+    fn test_drift_controller_total_bias_clamp() {
+        let mut s = FrameScheduler::new();
+        s.video_pts_bias = Duration::from_secs(7);
+        s.clock_drift_correction_us = 5_000_000; // +5s
+
+        let total = s.video_pts_bias.as_micros() as i64 + s.clock_drift_correction_us;
+        let max_us = MAX_VIDEO_PTS_BIAS.as_micros() as i64;
+        let clamped = total.clamp(-max_us, max_us);
+        assert_eq!(clamped, max_us); // 12s clamped to 8s
     }
 }

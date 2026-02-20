@@ -90,6 +90,9 @@ struct AudioHandleInner {
     /// When non-zero, position() returns this value instead of calculating from samples.
     /// This allows native players (AVPlayer, GStreamer) to directly report their position.
     native_position_us: AtomicU64,
+    /// True when cpal callback detects sustained ring buffer underrun.
+    /// Set by cpal callback (audio thread), read by FrameScheduler (UI thread).
+    audio_stalled: AtomicBool,
 }
 
 impl AudioHandle {
@@ -108,6 +111,7 @@ impl AudioHandle {
                 stream_pts_offset_us: AtomicI64::new(0),
                 video_start_time_us_plus1: AtomicU64::new(0),
                 native_position_us: AtomicU64::new(0),
+                audio_stalled: AtomicBool::new(false),
             }),
         }
     }
@@ -205,6 +209,16 @@ impl AudioHandle {
         self.inner
             .audio_base_pts_us_plus1
             .store(us.saturating_add(1), Ordering::Relaxed);
+    }
+
+    /// Returns the base PTS if set, or None.
+    pub fn audio_base_pts(&self) -> Option<Duration> {
+        let v = self.inner.audio_base_pts_us_plus1.load(Ordering::Relaxed);
+        if v == 0 {
+            None
+        } else {
+            Some(Duration::from_micros(v - 1))
+        }
     }
 
     /// Clears the base PTS (for seek/stop).
@@ -310,6 +324,16 @@ impl AudioHandle {
         self.inner.available.store(available, Ordering::Relaxed);
     }
 
+    /// Returns true when cpal callback detects sustained ring buffer underrun.
+    pub fn is_audio_stalled(&self) -> bool {
+        self.inner.audio_stalled.load(Ordering::Acquire)
+    }
+
+    /// Sets the audio stall state (called from cpal callback or lifecycle resets).
+    pub fn set_audio_stalled(&self, stalled: bool) {
+        self.inner.audio_stalled.store(stalled, Ordering::Release);
+    }
+
     /// Starts the shared playback epoch (call when first video frame is displayed).
     /// This coordinates audio and video clocks so they start from the same moment.
     ///
@@ -328,6 +352,27 @@ impl AudioHandle {
         self.inner
             .playback_epoch_us
             .store(now_us, Ordering::Release);
+    }
+
+    /// Enables the playback epoch gate without resetting samples_played.
+    ///
+    /// Use this for late-binding (e.g., MoQ audio handle acquired after video
+    /// already started). The cpal callback has been incrementing samples_played
+    /// since audio began — resetting would erase real playback time and create
+    /// a permanent offset.
+    pub fn enable_playback_epoch(&self) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Don't reset samples_played — preserve the count from cpal callback
+        if self.inner.playback_epoch_us.load(Ordering::Acquire) == 0 {
+            let now_us = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as u64;
+            self.inner
+                .playback_epoch_us
+                .store(now_us, Ordering::Release);
+        }
     }
 
     /// Returns the playback epoch as an Instant-like duration since UNIX epoch.
@@ -488,6 +533,10 @@ mod cpal_impl {
     /// Number of samples to accumulate before flushing to atomic counter.
     /// Batching avoids per-sample atomic ops which can cause glitches at 48-96kHz.
     const FLUSH_SAMPLES: u64 = 256;
+
+    /// Consecutive all-empty callbacks before declaring audio stall.
+    /// At 48kHz with ~480-sample callbacks (~10ms each), 3 ≈ 30ms of silence.
+    const STALL_CALLBACK_THRESHOLD: u32 = 3;
 
     /// cpal-based audio player backed by a ring buffer.
     pub struct AudioPlayer {
@@ -723,6 +772,7 @@ mod cpal_impl {
     {
         let mut pending: u64 = 0;
         let output_channels = config.channels as usize;
+        let mut empty_callback_count: u32 = 0;
 
         let stream = device
             .build_output_stream(
@@ -734,9 +784,20 @@ mod cpal_impl {
                         return;
                     }
 
+                    // Gate on playback epoch: don't consume ring buffer samples
+                    // until video is ready. For MoQ live, audio starts before video
+                    // is ready; without this gate, cpal plays 2+ seconds of audio
+                    // before the video clock rebase, creating a permanent A/V offset.
+                    if handle.playback_epoch().is_none() {
+                        let zero = T::from_sample(0.0f32);
+                        data.fill(zero);
+                        return;
+                    }
+
                     let vol = handle.effective_volume();
                     let source_channels = handle.channels().clamp(1, 2) as usize;
                     let zero = T::from_sample(0.0f32);
+                    let mut any_valid_in_callback = false;
 
                     for frame in data.chunks_mut(output_channels) {
                         let (left, right, valid) = if source_channels == 1 {
@@ -752,6 +813,10 @@ mod cpal_impl {
                                 _ => (0.0, 0.0, false),
                             }
                         };
+
+                        if valid {
+                            any_valid_in_callback = true;
+                        }
 
                         if !valid {
                             for sample in frame.iter_mut() {
@@ -786,6 +851,19 @@ mod cpal_impl {
                     if pending > 0 {
                         handle.add_samples_played(pending);
                         pending = 0;
+                    }
+
+                    // Stall detection: track consecutive empty callbacks
+                    if !any_valid_in_callback {
+                        empty_callback_count = empty_callback_count.saturating_add(1);
+                        if empty_callback_count >= STALL_CALLBACK_THRESHOLD {
+                            handle.set_audio_stalled(true);
+                        }
+                    } else {
+                        if empty_callback_count >= STALL_CALLBACK_THRESHOLD {
+                            handle.set_audio_stalled(false);
+                        }
+                        empty_callback_count = 0;
                     }
                 },
                 |err| tracing::error!("cpal audio error: {err}"),

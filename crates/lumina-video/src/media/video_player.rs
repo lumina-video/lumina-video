@@ -1075,11 +1075,10 @@ impl VideoPlayer {
     ///
     /// 1. Migrates current mute/volume state to the new handle
     /// 2. Replaces `self.audio_handle` so UI controls affect MoQ playback
+    /// 3. Binds to FrameScheduler for audio-as-master-clock A/V sync
     ///
-    /// NOTE: We intentionally do NOT bind to FrameScheduler here. The MoQ audio
-    /// PTS (publisher time, e.g. 7200s) has a completely different time base than
-    /// the wall-clock time the scheduler uses. Binding would cause a massive
-    /// position jump that freezes video.
+    /// Binds audio in metrics-only mode (wall-clock still drives frame pacing)
+    /// to avoid a position discontinuity from late-arriving audio.
     ///
     /// When the handle becomes stale (thread torn down), unbinds and reverts.
     #[cfg(feature = "moq")]
@@ -1100,8 +1099,22 @@ impl VideoPlayer {
                 self.audio_handle = moq_ah;
                 self.audio_handle.set_available(true);
 
+                // Bind to FrameScheduler for sync metrics (drift tracking).
+                // Use metrics-only mode: wall-clock drives frame pacing, not audio.
+                // MoQ audio arrives late; switching to audio-as-master would cause
+                // a position discontinuity that freezes or jumps video.
+                self.scheduler
+                    .set_audio_handle_metrics_only(self.audio_handle.clone());
+
+                // Don't enable playback epoch here — let the FrameScheduler's
+                // clock rebase enable it, so cpal stays gated until video is ready.
+                // This prevents audio from playing before the A/V clocks are aligned.
+                tracing::info!(
+                    "MoQ audio: late bind (metrics only, wall-clock pacing, epoch deferred)"
+                );
+
                 self.moq_audio_bound = true;
-                tracing::info!("MoQ audio handle late-bound to VideoPlayer (mute/volume only)");
+                tracing::info!("MoQ audio handle bound to VideoPlayer + FrameScheduler");
             }
         } else {
             // Check if handle went stale (thread torn down)
@@ -1113,6 +1126,9 @@ impl VideoPlayer {
                 placeholder.set_muted(self.audio_handle.is_muted());
                 placeholder.set_volume(self.audio_handle.volume());
                 self.audio_handle = placeholder;
+
+                // Clear FrameScheduler's audio handle so it falls back to wall-clock
+                self.scheduler.clear_audio_handle();
 
                 self.moq_audio_bound = false;
             }
@@ -1244,8 +1260,10 @@ impl VideoPlayer {
                 // Show buffering overlay only when playing AND buffering < 100%
                 // Don't show when paused/ready - let user see the preview frame
                 let buffering = self.buffering_percent();
-                if buffering < 100 && self.is_playing() {
-                    self.render_buffering_overlay(ui, rect, buffering);
+                let is_audio_stall = self.scheduler.is_audio_stall();
+                if (buffering < 100 || is_audio_stall) && self.is_playing() {
+                    let pct = if is_audio_stall { 90 } else { buffering };
+                    self.render_buffering_overlay(ui, rect, pct);
                 }
 
                 // Render subtitles overlay if enabled and available

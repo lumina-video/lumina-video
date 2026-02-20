@@ -22,7 +22,8 @@ use moq_native::ClientConfig;
 
 use crate::media::moq::MoqUrl;
 use crate::media::moq_audio::{
-    select_preferred_audio_rendition, ChannelClosed, LiveEdgeSender, MoqAudioFrame, MoqAudioThread,
+    audio_codec_from_config, select_preferred_audio_rendition, ChannelClosed, LiveEdgeSender,
+    MoqAudioFrame, MoqAudioThread,
 };
 use crate::media::moq_decoder::{
     MoqAudioStatus, MoqDecoder, MoqDecoderConfig, MoqDecoderState, MoqSharedState, MoqVideoFrame,
@@ -216,6 +217,8 @@ enum ResubscribeReason {
     DecoderRecovery,
     /// read_frame() hung beyond timeout — transport stall.
     ReadTimeout,
+    /// read_frame() returned an error — transport/decode error.
+    ReadError,
 }
 
 impl std::fmt::Display for ResubscribeReason {
@@ -225,6 +228,7 @@ impl std::fmt::Display for ResubscribeReason {
             Self::TrackEnded => f.write_str("video track ended"),
             Self::DecoderRecovery => f.write_str("decoder requested recovery"),
             Self::ReadTimeout => f.write_str("read_frame timeout"),
+            Self::ReadError => f.write_str("video read error"),
         }
     }
 }
@@ -390,7 +394,7 @@ pub(crate) async fn run_moq_worker(
     // -- Phase 4: Subscribe to video track --
     let video_track = moq_lite::Track {
         name: cat.video_track_name.clone(),
-        priority: 1,
+        priority: 100,
     };
     let mut video_consumer = hang::container::OrderedConsumer::new(
         moq_broadcast.subscribe_track(&video_track),
@@ -411,14 +415,15 @@ pub(crate) async fn run_moq_worker(
     //
     // IMPORTANT: OrderedConsumer::read() (hang crate) is NOT cancellation-safe.
     // Audio gets its own task so read() is never cancelled by tokio::select!.
-    let mut audio_task = spawn_audio_forward_task(audio_consumer_opt, audio_sender_opt, label);
+    let mut audio_task =
+        spawn_audio_forward_task(audio_consumer_opt, audio_sender_opt, &shared.audio, label);
 
     // Audio track name for re-subscribing when the audio task finishes
     // (track end, error, or stream loop).
     let audio_track_for_resub: Option<moq_lite::Track> = if audio_task.is_some() {
         select_preferred_audio_rendition(&cat.catalog).map(|(name, _)| moq_lite::Track {
             name: name.to_string(),
-            priority: 2,
+            priority: 50,
         })
     } else {
         None
@@ -476,11 +481,26 @@ pub(crate) async fn run_moq_worker(
     const RESUBSCRIBE_WINDOW: Duration = Duration::from_secs(8);
     const RESUBSCRIBE_COOLDOWN: Duration = Duration::from_millis(750);
     const READ_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+    const MAX_READ_ERROR_RECOVERIES_IN_WINDOW: usize = 8;
+    const READ_ERROR_RECOVERY_WINDOW: Duration = Duration::from_secs(30);
 
     // Prevent tight restart loops when audio track has ended or is unstable.
     const AUDIO_RESUBSCRIBE_RETRY_DELAY: Duration = Duration::from_millis(500);
     let mut audio_needs_resubscribe = false;
     let mut next_audio_resubscribe_attempt = Instant::now();
+
+    // External audio health watchdog: if the audio forward task is alive but
+    // hasn't forwarded a frame in this long, force-abort and resubscribe.
+    // This fires as a select! arm (not at loop-top) so it can't be blocked by
+    // video_consumer.read() sitting in the other arm for up to 3s.
+    //
+    // Budget: internal READ_TIMEOUT (8s) + 2s margin = 10s. The internal
+    // timeout should handle most cases; this catches the observed failure mode
+    // where the internal timeout silently fails to fire.
+    const AUDIO_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(10);
+
+    let mut recent_read_error_recoveries: VecDeque<Instant> =
+        VecDeque::with_capacity(MAX_READ_ERROR_RECOVERIES_IN_WINDOW);
 
     // Persistent video deadline: tracks wall-clock time since last video frame.
     // Unlike wrapping read_frame() in tokio::timeout(), this isn't reset when the
@@ -488,10 +508,13 @@ pub(crate) async fn run_moq_worker(
     // continues producing frames.
     let mut video_deadline = tokio::time::Instant::now() + READ_FRAME_TIMEOUT;
 
+    #[allow(unused_assignments)] // defensive default; all break paths assign before breaking
+    let mut exit_reason: &str = "unknown";
     let mut loop_iter: u64 = 0;
     loop {
         loop_iter += 1;
-        if loop_iter <= 50 || loop_iter.is_multiple_of(100) {
+        #[allow(clippy::manual_is_multiple_of)] // MSRV consistency: is_multiple_of requires 1.87+
+        if loop_iter <= 50 || loop_iter % 100 == 0 {
             tracing::info!("MoQ {}: select loop iter #{}", label, loop_iter);
         }
 
@@ -501,14 +524,58 @@ pub(crate) async fn run_moq_worker(
         if let Some(ref task) = audio_task {
             if task.is_finished() {
                 if let Some(finished) = audio_task.take() {
-                    let _ = finished.await;
+                    match finished.await {
+                        Ok(()) => {
+                            tracing::info!("MoQ {}: Audio forward task completed normally", label);
+                        }
+                        Err(e) if e.is_panic() => {
+                            tracing::error!(
+                                "MoQ {}: Audio forward task PANICKED: {:?}",
+                                label,
+                                e.into_panic(),
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("MoQ {}: Audio forward task cancelled: {e}", label);
+                        }
+                    }
                 }
                 // Teardown the old audio decode thread (sender was moved into the task,
                 // so the crossbeam channel is already disconnected)
-                teardown_audio(None, moq_audio_thread_opt.take(), &shared, label).await;
+                teardown_audio(
+                    None,
+                    moq_audio_thread_opt.take(),
+                    &shared,
+                    label,
+                    "audio forward task finished",
+                )
+                .await;
                 audio_needs_resubscribe = true;
             }
         }
+
+        // Compute audio watchdog deadline for the select! arm below.
+        // If no audio task is active, set deadline to far-future (never fires).
+        let audio_watchdog_deadline = if audio_task.as_ref().is_some_and(|t| !t.is_finished()) {
+            let last = *shared.audio.last_audio_forward_frame_at.lock();
+            match last {
+                Some(instant) => {
+                    let elapsed = instant.elapsed();
+                    if elapsed >= AUDIO_WATCHDOG_TIMEOUT {
+                        // Already stale — fire immediately
+                        tokio::time::Instant::now()
+                    } else {
+                        tokio::time::Instant::now() + (AUDIO_WATCHDOG_TIMEOUT - elapsed)
+                    }
+                }
+                // No heartbeat yet (task just spawned). Give it the full
+                // watchdog window to produce its first frame.
+                None => tokio::time::Instant::now() + AUDIO_WATCHDOG_TIMEOUT,
+            }
+        } else {
+            // No audio task — park the watchdog
+            tokio::time::Instant::now() + Duration::from_secs(86400)
+        };
 
         // Throttled audio re-subscribe.
         if audio_needs_resubscribe && Instant::now() >= next_audio_resubscribe_attempt {
@@ -529,7 +596,8 @@ pub(crate) async fn run_moq_worker(
                     label,
                 );
                 moq_audio_thread_opt = new_thread;
-                audio_task = spawn_audio_forward_task(new_consumer, new_sender, label);
+                audio_task =
+                    spawn_audio_forward_task(new_consumer, new_sender, &shared.audio, label);
                 if audio_task.is_some() {
                     audio_needs_resubscribe = false;
                 } else {
@@ -578,6 +646,7 @@ pub(crate) async fn run_moq_worker(
                             )
                             .await
                             {
+                                exit_reason = "resubscribe failed (decoder recovery)";
                                 break;
                             }
                             video_deadline = tokio::time::Instant::now() + READ_FRAME_TIMEOUT;
@@ -708,6 +777,7 @@ pub(crate) async fn run_moq_worker(
                                     )
                                     .await
                                     {
+                                        exit_reason = "resubscribe failed (startup gate)";
                                         break;
                                     }
                                     continue;
@@ -744,6 +814,7 @@ pub(crate) async fn run_moq_worker(
                         tracing::info!("MoQ {}: sending frame #{} to channel ({} bytes, kf={})", label, recv_count, moq_frame.data.len(), moq_frame.is_keyframe);
                         if frame_tx.send(moq_frame).await.is_err() {
                             tracing::warn!("MoQ {}: Frame channel closed, stopping worker", label);
+                            exit_reason = "frame_tx closed (decoder dropped receiver)";
                             break;
                         }
                         tracing::info!("MoQ {}: frame #{} sent to channel OK", label, recv_count);
@@ -771,16 +842,65 @@ pub(crate) async fn run_moq_worker(
                         )
                         .await
                         {
+                            exit_reason = "resubscribe failed (track ended)";
                             break;
                         }
                         video_deadline = tokio::time::Instant::now() + READ_FRAME_TIMEOUT;
                         continue;
                     }
                     Err(e) => {
-                        tracing::error!("MoQ {}: Frame read error: {e}", label);
+                        let detail = format!("Frame read error: {e}");
+                        tracing::warn!("MoQ {}: {detail}", label);
                         shared.frame_stats.log_summary(label);
-                        shared.set_error(format!("Frame read error: {e}"));
-                        break;
+
+                        // Recovery-window storm guard: prune stale entries, then check
+                        let now = Instant::now();
+                        while let Some(front) = recent_read_error_recoveries.front() {
+                            if now.saturating_duration_since(*front) <= READ_ERROR_RECOVERY_WINDOW {
+                                break;
+                            }
+                            recent_read_error_recoveries.pop_front();
+                        }
+                        if recent_read_error_recoveries.len() >= MAX_READ_ERROR_RECOVERIES_IN_WINDOW {
+                            tracing::error!(
+                                "MoQ {}: read error recovery storm ({} in {:?}), giving up",
+                                label,
+                                recent_read_error_recoveries.len(),
+                                READ_ERROR_RECOVERY_WINDOW,
+                            );
+                            shared.set_error(detail);
+                            exit_reason = "read error recovery storm";
+                            break;
+                        }
+
+                        idr_gate_broken_keyframes = 0;
+                        if !resubscribe_video_track(
+                            &shared,
+                            &moq_broadcast,
+                            &video_track,
+                            cat.max_latency,
+                            &mut video_consumer,
+                            idr_gate_enabled,
+                            &mut waiting_for_valid_idr,
+                            &mut idr_gate_groups_seen,
+                            &mut idr_gate_start,
+                            &mut resubscribe_count,
+                            &mut recent_resubscribes,
+                            MAX_RESUBSCRIBES_IN_WINDOW,
+                            RESUBSCRIBE_WINDOW,
+                            RESUBSCRIBE_COOLDOWN,
+                            label,
+                            ResubscribeReason::ReadError,
+                            &detail,
+                        )
+                        .await
+                        {
+                            exit_reason = "resubscribe failed (read error)";
+                            break;
+                        }
+                        recent_read_error_recoveries.push_back(now);
+                        video_deadline = tokio::time::Instant::now() + READ_FRAME_TIMEOUT;
+                        continue;
                     }
                 }
             }
@@ -815,12 +935,82 @@ pub(crate) async fn run_moq_worker(
                 )
                 .await
                 {
+                    exit_reason = "resubscribe failed (read timeout)";
                     break;
                 }
                 // Reset deadline after resubscribe
                 video_deadline = tokio::time::Instant::now() + READ_FRAME_TIMEOUT;
                 continue;
             }
+            // Audio health watchdog: fires when the audio forward task is alive
+            // but its heartbeat (last successful send to crossbeam) has gone stale.
+            // Independent of the forward task's internal tokio::time::timeout,
+            // which was observed to silently fail in production.
+            _ = tokio::time::sleep_until(audio_watchdog_deadline) => {
+                let stale_ms = shared
+                    .audio
+                    .last_audio_forward_frame_at
+                    .lock()
+                    .map(|i| i.elapsed().as_millis() as u64)
+                    .unwrap_or(0);
+                tracing::warn!(
+                    "MoQ {}: AUDIO WATCHDOG: forward task alive but heartbeat stale ({}ms, threshold {}ms) — force-aborting for resubscribe",
+                    label, stale_ms, AUDIO_WATCHDOG_TIMEOUT.as_millis(),
+                );
+                if let Some(task) = audio_task.take() {
+                    task.abort();
+                    match task.await {
+                        Ok(()) => tracing::info!(
+                            "MoQ {}: Watchdog-aborted audio task exited cleanly", label,
+                        ),
+                        Err(e) if e.is_cancelled() => tracing::debug!(
+                            "MoQ {}: Watchdog-aborted audio task cancelled (expected)", label,
+                        ),
+                        Err(e) if e.is_panic() => tracing::error!(
+                            "MoQ {}: Watchdog-aborted audio task PANICKED: {:?}",
+                            label, e.into_panic(),
+                        ),
+                        Err(e) => tracing::warn!(
+                            "MoQ {}: Watchdog-aborted audio task join error: {e}", label,
+                        ),
+                    }
+                }
+                teardown_audio(
+                    None,
+                    moq_audio_thread_opt.take(),
+                    &shared,
+                    label,
+                    "audio watchdog stale heartbeat",
+                )
+                .await;
+                audio_needs_resubscribe = true;
+                continue;
+            }
+        }
+    }
+
+    // Post-loop exit log
+    {
+        let frames = shared.frame_stats.received.load(Ordering::Relaxed);
+        let eof = shared.eof_reached.load(Ordering::Relaxed);
+        if exit_reason == "frame_tx closed (decoder dropped receiver)" {
+            tracing::info!(
+                "MoQ {}: main loop exited — reason='{}', loop_iter={}, frames={}, eof={}",
+                label,
+                exit_reason,
+                loop_iter,
+                frames,
+                eof,
+            );
+        } else {
+            tracing::warn!(
+                "MoQ {}: main loop exited — reason='{}', loop_iter={}, frames={}, eof={}",
+                label,
+                exit_reason,
+                loop_iter,
+                frames,
+                eof,
+            );
         }
     }
 
@@ -828,13 +1018,27 @@ pub(crate) async fn run_moq_worker(
     // Abort the dedicated audio task before tearing down the audio thread
     if let Some(task) = audio_task {
         task.abort();
-        let _ = task.await;
+        match task.await {
+            Ok(()) => tracing::debug!("MoQ {}: Audio task exited cleanly at teardown", label),
+            Err(e) if e.is_cancelled() => {
+                tracing::debug!("MoQ {}: Audio task cancelled at teardown (expected)", label)
+            }
+            Err(e) if e.is_panic() => {
+                tracing::error!(
+                    "MoQ {}: Audio task PANICKED during teardown: {:?}",
+                    label,
+                    e.into_panic(),
+                );
+            }
+            Err(e) => tracing::warn!("MoQ {}: Audio task join error at teardown: {e}", label),
+        }
     }
     teardown_audio(
         None, // sender was moved into the audio task
         moq_audio_thread_opt.take(),
         &shared,
         label,
+        "worker loop exited",
     )
     .await;
 
@@ -850,13 +1054,10 @@ pub(crate) async fn run_moq_worker(
 /// Handles both cdn.moq.dev style (namespace in URL) and zap.stream style
 /// (UUID namespace = broadcast path).
 fn build_connect_url(url: &MoqUrl) -> (String, Option<PathOwned>) {
-    let is_localhost =
-        url.host() == "localhost" || url.host() == "127.0.0.1" || url.host() == "::1";
-    let scheme = if url.use_tls() || !is_localhost {
-        "https"
-    } else {
-        "http"
-    };
+    // moqs:// → https (real TLS), moq:// → http (self-signed cert dance).
+    // Matches transport.rs connect() logic. moq-native uses the scheme to
+    // decide whether to fetch the server's self-signed cert hash via HTTP.
+    let scheme = if url.use_tls() { "https" } else { "http" };
 
     // Check if namespace looks like a UUID (zap.stream broadcast ID)
     let namespace_is_broadcast_id = url.namespace().len() >= 32
@@ -1282,17 +1483,21 @@ fn setup_audio(
     let (track_name, audio_cfg) = match select_preferred_audio_rendition(catalog) {
         Some(pair) => pair,
         None => {
-            tracing::info!("MoQ {}: No AAC audio track in catalog", label);
+            tracing::info!("MoQ {}: No supported audio track in catalog", label);
             *shared.audio.audio_status.lock() = MoqAudioStatus::Unavailable;
+            *shared.audio_codec_name.lock() = None;
             return (None, None, None);
         }
     };
 
     *shared.audio.audio_status.lock() = MoqAudioStatus::Starting;
+    // Reset watchdog heartbeat so stale values from a previous subscription
+    // don't trigger false positives before the new forward task starts.
+    *shared.audio.last_audio_forward_frame_at.lock() = None;
 
     let audio_track = moq_lite::Track {
         name: track_name.to_string(),
-        priority: 2,
+        priority: 50,
     };
     let audio_consumer = hang::container::OrderedConsumer::new(
         moq_broadcast.subscribe_track(&audio_track),
@@ -1314,24 +1519,30 @@ fn setup_audio(
         }
     };
     audio_handle.set_available(false);
+    audio_handle.set_audio_stalled(false);
     audio_handle.clear_playback_epoch();
     audio_handle.reset_samples_played();
     audio_handle.clear_audio_base_pts();
     audio_handle.clear_stream_pts_offset();
+
+    let audio_codec = audio_codec_from_config(audio_cfg);
+    *shared.audio_codec_name.lock() = Some(format!("{:?}", audio_codec));
 
     match MoqAudioThread::spawn(
         rx,
         audio_cfg.sample_rate,
         audio_cfg.channel_count,
         audio_cfg.description.clone(),
+        audio_codec,
         audio_handle.clone(),
         shared.audio.clone(),
     ) {
         Ok(thread) => {
             tracing::info!(
-                "MoQ {}: Audio subscribed to track '{}' ({}Hz, {}ch)",
+                "MoQ {}: Audio subscribed to track '{}' ({:?}, {}Hz, {}ch)",
                 label,
                 track_name,
+                audio_codec,
                 audio_cfg.sample_rate,
                 audio_cfg.channel_count,
             );
@@ -1356,6 +1567,7 @@ fn setup_audio(
 fn spawn_audio_forward_task(
     consumer: Option<hang::container::OrderedConsumer>,
     sender: Option<LiveEdgeSender<MoqAudioFrame>>,
+    audio_shared: &Arc<crate::media::moq_decoder::MoqAudioShared>,
     label: &str,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let (mut audio_consumer, audio_sender) = match (consumer, sender) {
@@ -1363,31 +1575,95 @@ fn spawn_audio_forward_task(
         _ => return None,
     };
     let label_owned = label.to_string();
+    let audio_shared = audio_shared.clone();
+
     Some(tokio::spawn(async move {
+        tracing::info!("MoQ {}: audio forward task started", label_owned);
+        // Initial heartbeat so the watchdog knows we're alive before first frame.
+        *audio_shared.last_audio_forward_frame_at.lock() = Some(Instant::now());
         let mut buf = BytesMut::with_capacity(4096);
+        let mut frames_forwarded: u64 = 0;
+        // Internal timeout: 8s to tolerate Opus DTX / silence suppression
+        // periods where the relay legitimately sends no audio packets.
+        // On timeout, exit immediately — do NOT retry on the same consumer.
+        // OrderedConsumer::read() is not cancellation-safe (two internal await
+        // points: next_frame + read_chunks). Cancelling mid-flight corrupts the
+        // consumer's internal state, so subsequent reads would hang or return
+        // garbage. The main loop re-subscribes with a completely fresh consumer.
+        //
+        // The external watchdog (AUDIO_WATCHDOG_TIMEOUT, 10s) in the main
+        // select! loop provides defense-in-depth if this timeout fails to fire.
+        const READ_TIMEOUT: Duration = Duration::from_secs(8);
+        let mut last_periodic_log = std::time::Instant::now();
         loop {
-            match audio_consumer.read().await {
-                Ok(Some(frame)) => {
+            match tokio::time::timeout(READ_TIMEOUT, audio_consumer.read()).await {
+                Ok(Ok(Some(frame))) => {
                     let data = assemble_payload(&frame.payload, &mut buf);
+                    let pts_us = frame.timestamp.as_micros() as u64;
                     let moq_frame = MoqAudioFrame {
-                        timestamp_us: frame.timestamp.as_micros() as u64,
+                        timestamp_us: pts_us,
                         data,
                     };
-                    if let Err(ChannelClosed) = audio_sender.send(moq_frame) {
-                        tracing::warn!("MoQ {}: Audio channel closed", label_owned);
-                        break;
+                    match audio_sender.send(moq_frame) {
+                        Ok(()) => {
+                            frames_forwarded += 1;
+                            // Heartbeat AFTER successful send — tracks forwarded
+                            // delivery, not just QUIC read liveness.
+                            *audio_shared.last_audio_forward_frame_at.lock() = Some(Instant::now());
+                        }
+                        Err(ChannelClosed) => {
+                            tracing::warn!(
+                                "MoQ {}: Audio channel closed (after {} frames)",
+                                label_owned,
+                                frames_forwarded,
+                            );
+                            break;
+                        }
+                    }
+                    // Periodic log every 5s to confirm liveness
+                    if last_periodic_log.elapsed() >= Duration::from_secs(5) {
+                        last_periodic_log = std::time::Instant::now();
+                        tracing::info!(
+                            "MoQ {}: audio forward alive: {} frames forwarded, last_pts={}us",
+                            label_owned,
+                            frames_forwarded,
+                            pts_us,
+                        );
                     }
                 }
-                Ok(None) => {
-                    tracing::info!("MoQ {}: Audio track ended", label_owned);
+                Ok(Ok(None)) => {
+                    tracing::info!(
+                        "MoQ {}: Audio track ended (after {} frames)",
+                        label_owned,
+                        frames_forwarded,
+                    );
                     break;
                 }
-                Err(e) => {
-                    tracing::warn!("MoQ {}: Audio read error: {e}", label_owned);
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        "MoQ {}: Audio read error (after {} frames): {e}",
+                        label_owned,
+                        frames_forwarded,
+                    );
+                    break;
+                }
+                Err(_elapsed) => {
+                    // Single strike — exit immediately, don't reuse corrupted consumer
+                    tracing::warn!(
+                        "MoQ {}: Audio read timeout ({}s, after {} frames) — consumer stalled, exiting for re-subscribe",
+                        label_owned,
+                        READ_TIMEOUT.as_secs(),
+                        frames_forwarded,
+                    );
                     break;
                 }
             }
         }
+        tracing::info!(
+            "MoQ {}: Audio forward task exiting (total frames forwarded: {})",
+            label_owned,
+            frames_forwarded,
+        );
     }))
 }
 
@@ -1411,7 +1687,15 @@ async fn teardown_audio(
     audio_thread: Option<MoqAudioThread>,
     shared: &Arc<MoqSharedState>,
     label: &str,
+    cause: &str,
 ) {
+    tracing::info!(
+        "MoQ {}: teardown_audio: cause='{}', sender={}, thread={}",
+        label,
+        cause,
+        audio_sender.is_some(),
+        audio_thread.is_some(),
+    );
     drop(audio_sender);
     {
         let mut status = shared.audio.audio_status.lock();
@@ -1444,11 +1728,14 @@ async fn teardown_audio(
             .audio
             .alive
             .store(false, Ordering::Release);
+        *shared_for_teardown.audio.last_audio_forward_frame_at.lock() = None;
         if let Some(handle) = shared_for_teardown.audio.moq_audio_handle.lock().as_ref() {
             handle.set_available(false);
+            handle.set_audio_stalled(false);
             handle.clear_playback_epoch();
             handle.reset_samples_played();
             handle.clear_audio_base_pts();
+            handle.clear_stream_pts_offset();
         }
         {
             let mut status = shared_for_teardown.audio.audio_status.lock();
@@ -1456,6 +1743,7 @@ async fn teardown_audio(
                 *status = MoqAudioStatus::Unavailable;
             }
         }
+        *shared_for_teardown.audio_codec_name.lock() = None;
         let teardown_ms = teardown_start.elapsed().as_millis();
         if teardown_ms > 250 {
             tracing::warn!("MoQ {}: audio teardown took {}ms", label, teardown_ms);
@@ -1519,12 +1807,20 @@ mod tests {
     }
 
     #[test]
-    fn test_build_connect_url_localhost_no_tls() {
+    fn test_build_connect_url_localhost_moq_uses_http() {
+        // moq:// → http (self-signed cert dance), moqs:// → https
         let url = MoqUrl::parse("moq://localhost:4443/test").unwrap();
         let (connect, _path) = build_connect_url(&url);
         assert!(
             connect.starts_with("http://"),
-            "localhost moq:// should use http"
+            "moq:// should use http (moq-native fetches self-signed cert via HTTP)"
+        );
+
+        let url_tls = MoqUrl::parse("moqs://localhost:4443/test").unwrap();
+        let (connect_tls, _) = build_connect_url(&url_tls);
+        assert!(
+            connect_tls.starts_with("https://"),
+            "moqs:// should use https"
         );
     }
 

@@ -61,6 +61,7 @@ wgpu = { version = "24" }
 libc = { version = "0.2" }
 # Audio playback via cpal (wraps Oboe NDK on Android — same pipeline as desktop)
 cpal = { workspace = true }
+opus = { workspace = true }
 symphonia-codec-aac = { workspace = true }
 symphonia-core = { workspace = true }
 
@@ -80,8 +81,9 @@ drm-fourcc = { version = "2.2" }
 # wgpu with HAL access for zero-copy Vulkan DMABuf import
 wgpu = { version = "24", features = ["vulkan-portability"] }
 cpal = { workspace = true }
-symphonia-core = { workspace = true }
+opus = { workspace = true }
 symphonia-codec-aac = { workspace = true }
+symphonia-core = { workspace = true }
 
 # macOS native AVFoundation/VideoToolbox decoder + zero-copy (always enabled on macOS)
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -103,8 +105,9 @@ profiling = { version = "1.0" }
 # Requires one-time setup: ./scripts/setup-macos-ffmpeg.sh
 ffmpeg-next = { workspace = true }
 cpal = { workspace = true }
-symphonia-core = { workspace = true }
+opus = { workspace = true }
 symphonia-codec-aac = { workspace = true }
+symphonia-core = { workspace = true }
 
 # Windows native Media Foundation decoder
 [target.'cfg(target_os = "windows")'.dependencies]

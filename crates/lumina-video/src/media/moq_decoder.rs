@@ -108,6 +108,18 @@ pub(crate) struct MoqAudioShared {
     /// Used by `VideoPlayer::poll_moq_audio_handle()` to detect stale handles
     /// that appear "available" after the thread has been torn down.
     pub alive: std::sync::atomic::AtomicBool,
+    /// External audio health watchdog: monotonic timestamp of the last frame
+    /// successfully forwarded (read from QUIC + sent to crossbeam) by the audio
+    /// forward task. Written by the forward task after each successful `send()`,
+    /// read by the main select loop's watchdog arm. `None` = no frames yet.
+    ///
+    /// Uses monotonic `Instant` (not wall-clock `SystemTime`) so NTP/clock
+    /// adjustments can't spuriously trigger or delay stale detection.
+    ///
+    /// This provides defense-in-depth: even if the forward task's internal
+    /// `tokio::time::timeout` fails to fire (observed in production), the main
+    /// loop detects the stale heartbeat and forces teardown + resubscribe.
+    pub last_audio_forward_frame_at: parking_lot::Mutex<Option<std::time::Instant>>,
     /// Ring buffer metrics updated by the audio thread for observability.
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
     pub ring_buffer_metrics: parking_lot::Mutex<super::audio_ring_buffer::RingBufferMetrics>,
@@ -121,6 +133,7 @@ impl MoqAudioShared {
             moq_audio_handle: parking_lot::Mutex::new(None),
             audio_status: parking_lot::Mutex::new(MoqAudioStatus::Unavailable),
             alive: std::sync::atomic::AtomicBool::new(false),
+            last_audio_forward_frame_at: parking_lot::Mutex::new(None),
             #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
             ring_buffer_metrics: parking_lot::Mutex::new(Default::default()),
         }
@@ -175,6 +188,16 @@ impl Default for MoqDecoderConfig {
             enable_audio: true,
             initial_volume: 1.0,
             audio_buffer_capacity: 120,
+        }
+    }
+}
+
+impl MoqDecoderConfig {
+    /// Auto-enable TLS verification bypass for localhost URLs (self-signed certs).
+    fn apply_localhost_tls_bypass(&mut self, moq_url: &MoqUrl) {
+        let host = moq_url.host();
+        if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+            self.transport.disable_tls_verify = true;
         }
     }
 }
@@ -279,6 +302,8 @@ pub struct MoqStatsSnapshot {
     pub ring_buffer_fill_percent: f32,
     pub ring_buffer_stall_count: u64,
     pub ring_buffer_overflow_count: u64,
+    /// Audio codec name (e.g. "Opus", "AAC") from catalog, if audio track present.
+    pub audio_codec: Option<String>,
 }
 
 /// Handle to MoQ shared state for producing snapshots.
@@ -338,6 +363,7 @@ impl MoqStatsHandle {
             ring_buffer_fill_percent,
             ring_buffer_stall_count,
             ring_buffer_overflow_count,
+            audio_codec: self.shared.audio_codec_name.lock().clone(),
         }
     }
 }
@@ -356,6 +382,8 @@ pub(crate) struct MoqSharedState {
     pub(crate) metadata: Mutex<VideoMetadata>,
     /// Audio track info (if available)
     pub(crate) audio_info: Mutex<Option<AudioTrackInfo>>,
+    /// Audio codec name (e.g. "Opus", "AAC") set by worker after catalog parse.
+    pub(crate) audio_codec_name: Mutex<Option<String>>,
     /// Codec description from catalog (avcC/hvcC box containing SPS/PPS)
     pub(crate) codec_description: Mutex<Option<bytes::Bytes>>,
     /// Frame statistics for debugging
@@ -388,6 +416,7 @@ impl MoqSharedState {
                 start_time: None,
             }),
             audio_info: Mutex::new(None),
+            audio_codec_name: Mutex::new(None),
             codec_description: Mutex::new(None),
             frame_stats: FrameStats::default(),
             transport_protocol: Mutex::new("unknown".to_string()),
@@ -570,7 +599,7 @@ impl MoqDecoder {
     }
 
     /// Creates a new MoQ decoder with explicit configuration.
-    pub fn new_with_config(url: &str, config: MoqDecoderConfig) -> Result<Self, VideoError> {
+    pub fn new_with_config(url: &str, mut config: MoqDecoderConfig) -> Result<Self, VideoError> {
         tracing::info!("MoqDecoder::new_with_config: creating decoder for {}", url);
 
         // Parse the MoQ URL
@@ -578,6 +607,8 @@ impl MoqDecoder {
             tracing::error!("MoQ: failed to parse URL: {}", e);
             VideoError::OpenFailed(e.to_string())
         })?;
+
+        config.apply_localhost_tls_bypass(&moq_url);
 
         // Get existing runtime handle or create a new runtime
         let (owned_runtime, runtime) = match Handle::try_current() {
@@ -1895,6 +1926,12 @@ impl MoqDecoder {
     }
 }
 
+impl Drop for MoqDecoder {
+    fn drop(&mut self) {
+        tracing::debug!("MoQ: MoqDecoder dropped (frame_rx closing)");
+    }
+}
+
 impl VideoDecoderBackend for MoqDecoder {
     fn open(url: &str) -> Result<Self, VideoError>
     where
@@ -1981,6 +2018,9 @@ impl VideoDecoderBackend for MoqDecoder {
             }
             Err(async_channel::TryRecvError::Closed) => {
                 // Channel closed, stream ended
+                tracing::info!(
+                    "MoQ: frame_tx sender dropped (worker ended or shutdown), setting eof"
+                );
                 self.shared.eof_reached.store(true, Ordering::Relaxed);
                 Ok(None)
             }
@@ -3371,8 +3411,12 @@ pub mod android {
         }
 
         /// Creates a new Android MoQ decoder with explicit configuration.
-        pub fn new_with_config(url: &str, config: MoqDecoderConfig) -> Result<Self, VideoError> {
+        pub fn new_with_config(
+            url: &str,
+            mut config: MoqDecoderConfig,
+        ) -> Result<Self, VideoError> {
             let moq_url = MoqUrl::parse(url).map_err(|e| VideoError::OpenFailed(e.to_string()))?;
+            config.apply_localhost_tls_bypass(&moq_url);
 
             // Get existing runtime handle or create a new runtime
             let (owned_runtime, runtime) = match Handle::try_current() {
@@ -3974,7 +4018,7 @@ impl MoqGStreamerDecoder {
     }
 
     /// Creates a new MoQ GStreamer decoder with explicit configuration.
-    pub fn new_with_config(url: &str, config: MoqDecoderConfig) -> Result<Self, VideoError> {
+    pub fn new_with_config(url: &str, mut config: MoqDecoderConfig) -> Result<Self, VideoError> {
         use gstreamer as gst;
         use gstreamer::prelude::*;
         use gstreamer_app as gst_app;
@@ -3984,6 +4028,7 @@ impl MoqGStreamerDecoder {
 
         // Parse the MoQ URL
         let moq_url = MoqUrl::parse(url).map_err(|e| VideoError::OpenFailed(e.to_string()))?;
+        config.apply_localhost_tls_bypass(&moq_url);
 
         // Get existing runtime handle or create a new runtime
         let (owned_runtime, runtime) = match Handle::try_current() {
@@ -4588,6 +4633,8 @@ impl MoqGStreamerDecoder {
 impl Drop for MoqGStreamerDecoder {
     fn drop(&mut self) {
         use gstreamer::prelude::*;
+
+        tracing::debug!("MoQ: MoqGStreamerDecoder dropped (nal_rx closing)");
 
         // Signal EOS to appsrc
         let _ = self.appsrc.end_of_stream();

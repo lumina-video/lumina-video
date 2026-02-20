@@ -10,10 +10,14 @@ use std::sync::mpsc;
 use lumina_video::media::{DiscoveryEvent, MoqStream, NostrDiscovery};
 
 /// Sample videos for testing: (name, video_url, subtitle_url)
+///
+/// MP4/MOV → macOS AVPlayer native path (audio handled by AVPlayer, not cpal);
+///           on Linux and Android these route through FFmpeg+cpal instead
+/// MKV/WebM → FFmpeg decode path (audio through cpal ring buffer)
 const SAMPLE_VIDEOS: &[(&str, &str, Option<&str>)] = &[
     (
         "Big Buck Bunny (MP4)",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
+        "https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_320x180.mp4",
         Some("https://raw.githubusercontent.com/demuxed/big-buck-captions/main/big-buck-bunny.srt"),
     ),
     (
@@ -21,26 +25,31 @@ const SAMPLE_VIDEOS: &[(&str, &str, Option<&str>)] = &[
         "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/Sintel.mp4",
         Some("https://durian.blender.org/wp-content/content/subtitles/sintel_en.srt"),
     ),
+    (
+        "Elephant's Dream (MP4)",
+        "https://archive.org/download/ElephantsDream/ed_hd.mp4",
+        None,
+    ),
     // Tears of Steel has dialogue - good for A/V sync testing
     (
         "Tears of Steel (English)",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4",
+        "https://download.blender.org/demo/movies/ToS/tears_of_steel_720p.mov",
         Some("https://download.blender.org/demo/movies/ToS/subtitles/TOS-en.srt"),
     ),
     // Non-Latin script subtitle tests
     (
         "Tears of Steel (日本語)",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4",
+        "https://download.blender.org/demo/movies/ToS/tears_of_steel_720p.mov",
         Some("https://download.blender.org/demo/movies/ToS/subtitles/TOS-JP.srt"),
     ),
     (
         "Tears of Steel (中文)",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4",
+        "https://download.blender.org/demo/movies/ToS/tears_of_steel_720p.mov",
         Some("https://download.blender.org/demo/movies/ToS/subtitles/TOS-CH-traditional.srt"),
     ),
     (
         "Tears of Steel (Русский)",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4",
+        "https://download.blender.org/demo/movies/ToS/tears_of_steel_720p.mov",
         Some("https://download.blender.org/demo/movies/ToS/subtitles/TOS-ru.srt"),
     ),
     (
@@ -1020,6 +1029,13 @@ impl eframe::App for DemoApp {
                                     };
                                     ui.colored_label(audio_color, audio_label);
                                     ui.end_row();
+
+                                    // Audio codec
+                                    if let Some(ref codec) = moq.audio_codec {
+                                        ui.label("Audio codec:");
+                                        ui.label(codec.as_str());
+                                        ui.end_row();
+                                    }
                                 });
                         }
 
