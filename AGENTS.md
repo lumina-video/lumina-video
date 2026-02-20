@@ -226,6 +226,9 @@ fn potentially_slow_operation() {
 - No blocking calls, no synchronous I/O, no unbounded queues in frame-critical threads.
 - No mutex contention in frame-critical paths; use lock-free or bounded SPSC designs.
 
+### MoQ Protocol Rules
+- See [MOQ_BEST_PRACTICES.md](MOQ_BEST_PRACTICES.md) for MoQ-specific transport, sync, and media packaging rules.
+
 ### Clocking, Backpressure, and Recovery
 - Define one master clock (audio or wall clock) and enforce drift correction policy.
 - Use bounded queues with explicit drop policy (`drop_oldest` by default for live).
