@@ -238,8 +238,8 @@ cargo run --package lumina-video-demo --features windows-native-video
 - **Minimal dependencies** — Linux/Android/Web need no FFmpeg; macOS uses FFmpeg for MKV/WebM containers
 - **Subtitles** — SRT and WebVTT with customizable styling
 - **HLS streaming** with adaptive bitrate
-- **A/V sync** — callback-based audio clock (drift TBC)
-- **MoQ live streaming** — Media over QUIC transport with hardware decode (experimental)
+- **A/V sync** — callback-based audio clock with proportional drift correction
+- **MoQ live streaming** — Media over QUIC transport with hardware decode, AAC + Opus audio (experimental)
 
 ## Platform Support
 
@@ -261,7 +261,7 @@ cargo run --package lumina-video-demo --features windows-native-video
 |------|-------------|--------|
 | Windows | Zero-copy diagnostics + A/V sync bridge | Needs porting to lumina-video |
 | MoQ | Frame pixelation on late join (IDR resync) | Investigating HTTP group fetch |
-| MoQ | Audio playback verification | Pipeline built, needs live stream testing |
+| MoQ | Linux / Android / Windows / Web testing | Audio pipeline ready, needs platform validation |
 | MoQ | zap.stream connectivity | Upstream PR submitted |
 
 > **Testers wanted!** Windows zero-copy needs validation on real hardware.
@@ -372,9 +372,10 @@ lumina-video = { git = "https://github.com/lumina-video/lumina-video", features 
 | QUIC transport (quinn) | Working |
 | Catalog fetch + track subscription | Working |
 | H.264 hardware decode (VTDecoder) | Working (macOS) |
-| AAC audio decode (symphonia + rodio) | Built, not yet verified on live stream |
-| Linux / Android / Windows / Web | Not yet tested |
+| AAC + Opus audio (symphonia + libopus → cpal) | Working (macOS); Linux/Android ready |
+| A/V sync (drift correction + stall-on-underrun) | Working |
 | Late-join IDR resync | In progress |
+| Linux / Android / Windows / Web | Audio pipeline ready (macOS tested) |
 | Nostr NIP-53 stream discovery | In progress |
 
 **Tested relays:**
@@ -436,12 +437,16 @@ lumina-video                            GPU backend: wgpu (Vulkan, Metal, DX12, 
 ├── video_player.rs    # Main VideoPlayer widget (egui integration)
 ├── video_texture.rs   # wgpu::Texture management, YUV→RGB shaders
 ├── zero_copy.rs       # Platform zero-copy: IOSurface, DMA-BUF, D3D11→D3D12, AHB
-├── frame_queue.rs     # Thread-safe frame buffer
+├── frame_queue.rs     # Frame buffer + A/V sync (drift correction, stall-on-underrun)
+├── audio.rs           # Audio playback via cpal, lock-free ring buffer
+├── audio_ring_buffer.rs # Lock-free SPSC ring buffer (MoQ live + FFmpeg VOD)
+├── sync_metrics.rs    # A/V drift tracking and quality metrics
+├── moq_audio.rs       # MoQ audio pipeline (AAC/Opus decode → ring buffer)
+├── moq_decoder.rs     # MoQ video decode + shared state (VTDecoder, MediaCodec)
 ├── macos_video.rs     # VideoToolbox (macOS)
 ├── linux_video.rs     # GStreamer + VA-API (Linux)
 ├── windows_video.rs   # Media Foundation + DXVA (Windows)
-├── android_video.rs   # MediaCodec (Android)
-└── audio.rs           # Audio playback, A/V sync
+└── android_video.rs   # MediaCodec (Android)
 ```
 
 **[Zero-copy internals →](docs/ZERO-COPY.md)** | **[A/V sync details →](docs/AV-SYNC.md)**
