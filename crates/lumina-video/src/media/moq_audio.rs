@@ -1,4 +1,4 @@
-//! MoQ audio pipeline: crossbeam handoff → symphonia AAC decode → cpal playback.
+//! MoQ audio pipeline: crossbeam handoff → AAC/Opus decode → cpal playback.
 //!
 //! This module is gated on `cfg(all(feature = "moq", any(target_os = "macos", target_os = "linux", target_os = "android")))`.
 //! Android uses cpal/Oboe (same pipeline as desktop). Windows has no MoQ decoder yet.
@@ -63,7 +63,9 @@ impl<T> LiveEdgeSender<T> {
 /// Codec type for the MoQ audio decoder, determined from the catalog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MoqAudioCodec {
+    /// AAC-LC decoded via symphonia.
     Aac,
+    /// Opus decoded via audiovideo-opus (libopus).
     Opus,
 }
 
@@ -100,6 +102,12 @@ impl OpusDecoder {
     fn new(sample_rate: u32, channels: u32) -> Result<Self, String> {
         if channels == 0 {
             return Err("Opus decoder requires at least 1 channel".to_string());
+        }
+        if channels > 2 {
+            tracing::warn!(
+                "Opus decoder: {} channels requested, downmixing to stereo (Opus supports max 2)",
+                channels,
+            );
         }
         let ch = match channels.min(2) {
             1 => opus::Channels::Mono,
@@ -324,6 +332,7 @@ const GAP_THRESHOLD_US: u64 = 32_000; // 32ms
 /// Uses a lock-free ring buffer read by the cpal audio callback,
 /// eliminating per-source transitions and queue mutex contention
 /// that caused clicks/pops in the previous batch+append approach.
+#[allow(clippy::too_many_arguments)]
 fn moq_audio_thread_main(
     audio_rx: crossbeam_channel::Receiver<MoqAudioFrame>,
     sample_rate: u32,
@@ -439,7 +448,8 @@ fn moq_audio_thread_main(
                         audio_handle.set_audio_base_pts(samples.pts);
                     }
 
-                    // Gap detection: insert silence for PTS discontinuities > 32ms
+                    // Gap detection: insert silence for PTS discontinuities > 32ms.
+                    // Capped at 1s AND available buffer space to avoid overflow.
                     if let Some(prev_pts) = last_pts_us {
                         let expected_next = prev_pts
                             + (samples.data.len() as u64 * 1_000_000)
@@ -449,12 +459,23 @@ fn moq_audio_thread_main(
                             let gap_us = actual - expected_next;
                             let silence_samples =
                                 (gap_us as usize * sample_rate as usize * ch) / 1_000_000;
-                            let silence = vec![0.0f32; silence_samples.min(48000 * ch)]; // Cap at 1s
-                            producer.write(&silence);
+                            // Cap at 1s, and also at available buffer space to prevent
+                            // silence from overflowing and overwriting valid audio.
+                            let available =
+                                producer.capacity().saturating_sub(producer.fill_level());
+                            let capped = silence_samples
+                                .min(sample_rate as usize * ch)
+                                .min(available);
+                            if capped > 0 {
+                                let silence = vec![0.0f32; capped];
+                                producer.write(&silence);
+                            }
                             tracing::debug!(
-                                "MoQ audio: inserted {}ms silence ({} samples) for PTS gap",
+                                "MoQ audio: inserted {}ms silence ({}/{} samples, avail={}) for PTS gap",
                                 gap_us / 1000,
+                                capped,
                                 silence_samples,
+                                available,
                             );
                         }
                     }
@@ -553,9 +574,7 @@ pub(crate) fn select_preferred_audio_rendition(
         .audio
         .renditions
         .iter()
-        .filter(|(_, cfg)| {
-            matches!(cfg.codec, AudioCodec::AAC(_) | AudioCodec::Opus)
-        })
+        .filter(|(_, cfg)| matches!(cfg.codec, AudioCodec::AAC(_) | AudioCodec::Opus))
         .max_by_key(|(_, cfg)| {
             let codec_priority = match cfg.codec {
                 AudioCodec::Opus => 1u32, // prefer Opus (lower latency)
@@ -570,9 +589,16 @@ pub(crate) fn select_preferred_audio_rendition(
 /// Determines the `MoqAudioCodec` from a hang catalog `AudioConfig`.
 pub(crate) fn audio_codec_from_config(cfg: &hang::catalog::AudioConfig) -> MoqAudioCodec {
     use hang::catalog::AudioCodec;
-    match cfg.codec {
+    match &cfg.codec {
         AudioCodec::Opus => MoqAudioCodec::Opus,
-        _ => MoqAudioCodec::Aac,
+        AudioCodec::AAC(_) => MoqAudioCodec::Aac,
+        other => {
+            tracing::warn!(
+                "Unknown audio codec in catalog: {}, falling back to AAC decoder",
+                other,
+            );
+            MoqAudioCodec::Aac
+        }
     }
 }
 

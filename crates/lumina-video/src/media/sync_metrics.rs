@@ -667,6 +667,11 @@ impl SyncMetrics {
         }
     }
 
+    /// Returns the current drift in microseconds (positive = video ahead).
+    pub fn current_drift_us(&self) -> i64 {
+        self.inner.current_drift_us.load(Ordering::Relaxed)
+    }
+
     /// Returns true if sync is currently within acceptable threshold.
     pub fn is_in_sync(&self) -> bool {
         let drift_us = self.inner.current_drift_us.load(Ordering::Relaxed);

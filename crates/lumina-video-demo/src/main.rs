@@ -22,7 +22,7 @@ const SAMPLE_VIDEOS: &[(&str, &str, Option<&str>)] = &[
     ),
     (
         "Sintel (MP4)",
-        "https://archive.org/download/Sintel/sintel-1280-surround.mp4",
+        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/Sintel.mp4",
         Some("https://durian.blender.org/wp-content/content/subtitles/sintel_en.srt"),
     ),
     (
@@ -1029,6 +1029,13 @@ impl eframe::App for DemoApp {
                                     };
                                     ui.colored_label(audio_color, audio_label);
                                     ui.end_row();
+
+                                    // Audio codec
+                                    if let Some(ref codec) = moq.audio_codec {
+                                        ui.label("Audio codec:");
+                                        ui.label(codec.as_str());
+                                        ui.end_row();
+                                    }
                                 });
                         }
 

@@ -1129,7 +1129,6 @@ impl VideoPlayer {
 
                 // Clear FrameScheduler's audio handle so it falls back to wall-clock
                 self.scheduler.clear_audio_handle();
-                self.scheduler.clear_audio_stall();
 
                 self.moq_audio_bound = false;
             }
