@@ -47,7 +47,7 @@ pub mod media;
 
 // Vendored runtime support for Linux (bundles GStreamer libraries)
 #[cfg(all(target_os = "linux", feature = "vendored-runtime"))]
-pub mod vendored_runtime;
+pub use lumina_video_core::vendored_runtime;
 
 // Re-export main video types for convenience
 pub use media::{
