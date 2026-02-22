@@ -63,6 +63,16 @@ pub mod windows_video;
 #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
 pub mod windows_audio;
 
+// === Zero-copy GPU import ===
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "android",
+    all(target_os = "windows", feature = "windows-native-video")
+))]
+pub mod zero_copy;
+
 // === Vendored runtime (Linux only) ===
 
 #[cfg(all(target_os = "linux", feature = "vendored-runtime"))]

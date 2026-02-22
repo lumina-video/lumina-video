@@ -2402,7 +2402,7 @@ pub mod android {
         height: u32,
         hw_buffer_format: u32,
     ) -> Result<Vec<wgpu::Texture>, ZeroCopyError> {
-        use crate::media::android_video::AHARDWAREBUFFER_FORMAT_YV12;
+        use crate::android_video::AHARDWAREBUFFER_FORMAT_YV12;
         let is_yv12 = hw_buffer_format == AHARDWAREBUFFER_FORMAT_YV12;
         if ahardware_buffer.is_null() {
             return Err(ZeroCopyError::InvalidResource(
