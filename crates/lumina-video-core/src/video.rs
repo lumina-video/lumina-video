@@ -1136,7 +1136,7 @@ pub trait VideoDecoderBackend: Send {
     ///
     /// Used by MoQ decoders to expose their `AudioHandle` for A/V sync in
     /// `FrameScheduler`. Returns `None` by default.
-    fn audio_handle(&self) -> Option<super::audio::AudioHandle> {
+    fn audio_handle(&self) -> Option<crate::audio::AudioHandle> {
         None
     }
 
@@ -1261,7 +1261,7 @@ impl VideoDecoderBackend for Box<dyn VideoDecoderBackend + Send> {
         (**self).handles_audio_internally()
     }
 
-    fn audio_handle(&self) -> Option<super::audio::AudioHandle> {
+    fn audio_handle(&self) -> Option<crate::audio::AudioHandle> {
         (**self).audio_handle()
     }
 

@@ -2876,7 +2876,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lumina-video"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "android-activity",
  "ash",
@@ -2943,7 +2943,7 @@ dependencies = [
 
 [[package]]
 name = "lumina-video-android"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "android-activity",
  "android_logger",
@@ -2961,8 +2961,60 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumina-video-core"
+version = "0.2.2"
+dependencies = [
+ "android-activity",
+ "ash",
+ "block2 0.6.2",
+ "bytemuck",
+ "cpal",
+ "crossbeam",
+ "crossbeam-channel",
+ "drm-fourcc",
+ "ffmpeg-next",
+ "gstreamer",
+ "gstreamer-allocators",
+ "gstreamer-app",
+ "gstreamer-video",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "jni",
+ "libc",
+ "metal",
+ "ndk",
+ "ndk-context",
+ "ndk-sys 0.6.0+11769913",
+ "objc2 0.6.3",
+ "objc2-av-foundation",
+ "objc2-core-foundation",
+ "objc2-core-media",
+ "objc2-core-video",
+ "objc2-foundation 0.3.2",
+ "objc2-video-toolbox",
+ "opus",
+ "parking_lot",
+ "poll-promise",
+ "profiling",
+ "rodio",
+ "rustls",
+ "symphonia-codec-aac",
+ "symphonia-core",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "url",
+ "webpki-roots 1.0.4",
+ "wgpu",
+ "wgpu-hal",
+ "windows 0.58.0",
+]
+
+[[package]]
 name = "lumina-video-demo"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "eframe",
  "egui",
@@ -2976,7 +3028,7 @@ dependencies = [
 
 [[package]]
 name = "lumina-video-web-demo"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "eframe",
  "egui",
