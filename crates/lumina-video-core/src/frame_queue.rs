@@ -809,7 +809,7 @@ fn process_audio_command(
     cmd: DecodeCommand,
     player: &mut crate::audio::AudioPlayer,
     decoder: &mut AudioDecoder,
-    producer: &crate::media::audio_ring_buffer::RingBufferProducer,
+    producer: &crate::audio_ring_buffer::RingBufferProducer,
     first_samples: &mut bool,
 ) -> CommandResult {
     match cmd {
@@ -844,7 +844,7 @@ fn audio_thread_main(
     stop_flag: Arc<AtomicBool>,
 ) {
     use crate::audio::AudioPlayer;
-    use crate::media::audio_ring_buffer::RingBufferConfig;
+    use crate::audio_ring_buffer::RingBufferConfig;
 
     // Query device sample rate first so ring buffer capacity matches actual output rate
     let device_sample_rate = match AudioPlayer::query_device_sample_rate() {
@@ -2687,7 +2687,7 @@ impl Default for FrameScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::media::video::{CpuFrame, DecodedFrame, PixelFormat, Plane};
+    use crate::video::{CpuFrame, DecodedFrame, PixelFormat, Plane};
 
     fn make_test_frame(pts: Duration) -> VideoFrame {
         let plane = Plane {
@@ -2754,7 +2754,7 @@ mod tests {
 
     /// Bind an AudioHandle with a specific position for drift controller tests.
     fn bind_test_audio_metrics_only(s: &mut FrameScheduler, pos: Duration) {
-        let h = crate::media::audio::AudioHandle::new();
+        let h = crate::audio::AudioHandle::new();
         h.set_available(true);
         h.set_audio_format(48_000, 2);
         h.set_audio_base_pts(Duration::ZERO);

@@ -36,3 +36,34 @@ pub mod sync_metrics;
 pub mod triple_buffer;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod network;
+
+// === Platform decoders ===
+
+#[cfg(target_os = "macos")]
+pub mod macos_video;
+#[cfg(target_os = "macos")]
+pub mod audio_decoder;
+#[cfg(target_os = "macos")]
+pub mod video_decoder;
+
+#[cfg(target_os = "linux")]
+pub mod linux_video;
+#[cfg(target_os = "linux")]
+pub mod linux_video_gst;
+
+#[cfg(target_os = "android")]
+pub mod android_video;
+#[cfg(target_os = "android")]
+pub mod android_vulkan;
+#[cfg(target_os = "android")]
+pub mod ndk_image_reader;
+
+#[cfg(all(target_os = "windows", feature = "windows-native-video"))]
+pub mod windows_video;
+#[cfg(all(target_os = "windows", feature = "windows-native-video"))]
+pub mod windows_audio;
+
+// === Vendored runtime (Linux only) ===
+
+#[cfg(all(target_os = "linux", feature = "vendored-runtime"))]
+pub mod vendored_runtime;

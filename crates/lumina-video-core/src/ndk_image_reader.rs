@@ -30,7 +30,7 @@
 
 #![cfg(all(target_os = "android", feature = "android-zero-copy"))]
 
-use crate::media::android_video::AndroidVideoFrame;
+use crate::android_video::AndroidVideoFrame;
 use jni::objects::JObject;
 use jni::JNIEnv;
 use ndk::hardware_buffer::{HardwareBuffer, HardwareBufferUsage};
