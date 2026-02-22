@@ -3,6 +3,7 @@ resolver = "2"
 package.version = "0.2.2"
 members = [
     "crates/lumina-video",
+    "crates/lumina-video-core",
     "crates/lumina-video-demo",
     "crates/lumina-video-android",
     "crates/lumina-video-web-demo",

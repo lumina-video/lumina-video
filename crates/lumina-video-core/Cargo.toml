@@ -1,0 +1,103 @@
+[package]
+name = "lumina-video-core"
+version = { workspace = true }
+edition = "2021"
+description = "Core video decode and zero-copy pipeline for lumina-video (egui-free)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lumina-video/lumina-video"
+keywords = ["video", "multimedia", "hardware-acceleration", "zero-copy"]
+categories = ["multimedia", "rendering"]
+
+[dependencies]
+# Utilities
+tracing = { workspace = true }
+thiserror = { workspace = true }
+url = "2.5"
+bytemuck = { version = "1.14", features = ["derive"] }
+
+# Android native decoder + zero-copy
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { workspace = true }
+android-activity = { version = "0.6", features = ["game-activity"] }
+ndk-context = "0.1"
+ndk-sys = { version = "0.6" }
+ndk = { version = "0.9", features = ["api-level-26", "media"] }
+webpki-roots = { workspace = true }
+ash = { version = "0.38" }
+wgpu-hal = { version = "24", features = ["vulkan"] }
+wgpu = { version = "24" }
+libc = { version = "0.2" }
+cpal = { workspace = true }
+opus = { workspace = true }
+symphonia-codec-aac = { workspace = true }
+symphonia-core = { workspace = true }
+
+# Linux GStreamer-based video decoder + zero-copy
+[target.'cfg(target_os = "linux")'.dependencies]
+gstreamer = { version = "0.24" }
+gstreamer-app = { version = "0.24", features = ["v1_24"] }
+gstreamer-video = { version = "0.24" }
+gstreamer-allocators = { version = "0.24" }
+ash = { version = "0.38" }
+libc = { version = "0.2" }
+drm-fourcc = { version = "2.2" }
+wgpu = { version = "24", features = ["vulkan-portability"] }
+cpal = { workspace = true }
+opus = { workspace = true }
+symphonia-codec-aac = { workspace = true }
+symphonia-core = { workspace = true }
+
+# macOS native AVFoundation/VideoToolbox decoder + zero-copy
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-av-foundation = { workspace = true }
+objc2-core-media = { workspace = true }
+objc2-core-video = { workspace = true }
+objc2-video-toolbox = { workspace = true }
+block2 = { workspace = true }
+objc2-core-foundation = { version = "0.3", features = ["CFNumber", "CFDictionary", "CFString"] }
+metal = { workspace = true }
+wgpu = { version = "24" }
+profiling = { version = "1.0" }
+ffmpeg-next = { workspace = true }
+cpal = { workspace = true }
+opus = { workspace = true }
+symphonia-codec-aac = { workspace = true }
+symphonia-core = { workspace = true }
+
+# Windows native Media Foundation decoder
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Foundation",
+    "Win32_Security",
+], optional = true }
+rodio = { version = "0.21", default-features = false, features = ["playback", "symphonia-all"], optional = true }
+
+# Native-only dependencies (not available on wasm32)
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+parking_lot = { workspace = true }
+crossbeam-channel = "0.5"
+crossbeam = "0.8.4"
+poll-promise = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+hyper-rustls = { workspace = true }
+rustls = { workspace = true }
+tokio = { workspace = true }
+
+[features]
+default = []
+windows-native-video = ["windows", "rodio"]
+vendored-runtime = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(feature, values(\"cargo-clippy\"))"] }
