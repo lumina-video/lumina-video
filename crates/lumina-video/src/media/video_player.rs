@@ -50,16 +50,8 @@ use parking_lot::Mutex;
 use egui::{Response, Sense, Ui, Vec2};
 use egui_wgpu::wgpu;
 
-#[cfg(target_os = "android")]
-use super::android_video::AndroidVideoDecoder;
 use super::audio::AudioHandle;
-#[cfg(target_os = "macos")]
-use super::frame_queue::AudioThread;
-use super::frame_queue::{DecodeThread, FrameQueue, FrameScheduler};
-#[cfg(target_os = "linux")]
-use super::linux_video::ZeroCopyGStreamerDecoder;
-#[cfg(target_os = "macos")]
-use super::macos_video::MacOSVideoDecoder;
+use super::player::CorePlayer;
 use super::subtitles::{SubtitleError, SubtitleStyle, SubtitleTrack};
 use super::sync_metrics::{SyncMetrics, SyncMetricsSnapshot};
 use super::triple_buffer::{triple_buffer, TripleBufferReader, TripleBufferWriter};
@@ -71,42 +63,16 @@ use super::video::LinuxGpuSurface;
 use super::video::MacOSGpuSurface;
 #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
 use super::video::WindowsGpuSurface;
-use super::video::{
-    CpuFrame, PixelFormat, VideoDecoderBackend, VideoError, VideoMetadata, VideoState,
-};
-#[cfg(target_os = "macos")]
-use super::video_decoder::FfmpegDecoder;
+use super::video::{CpuFrame, PixelFormat, VideoError, VideoMetadata, VideoState};
+#[cfg(feature = "moq")]
+use super::video::VideoDecoderBackend;
 
 #[cfg(feature = "moq")]
 use super::moq_decoder::{MoqDecoder, MoqStatsHandle, MoqStatsSnapshot};
 
-/// Returns true if the URL points to a container format supported by AVFoundation on macOS.
-///
-/// AVFoundation supports: MP4, MOV, M4V, HLS (m3u8), and some AVI files.
-/// It does NOT support: MKV, WebM, FLV, OGG, or Matroska.
-///
-/// When a URL has an unsupported extension, we skip AVFoundation entirely and use FFmpeg.
-/// This prevents AVFoundation from accepting the file but failing to produce frames.
-#[cfg(target_os = "macos")]
-fn is_avfoundation_supported_container(url: &str) -> bool {
-    // Extract the path part (strip query params for remote URLs)
-    let path = url.split('?').next().unwrap_or(url);
-
-    // Get the extension (lowercase for comparison)
-    let ext = path
-        .rsplit('.')
-        .next()
-        .map(|e| e.to_lowercase())
-        .unwrap_or_default();
-
-    // AVFoundation-supported containers
-    matches!(
-        ext.as_str(),
-        "mp4" | "m4v" | "mov" | "m4a" | "m3u8" | "ts" | "avi" | "aac" | "mp3" | "wav" | "aiff"
-    )
-}
 use super::video_controls::{VideoControls, VideoControlsConfig, VideoControlsResponse};
 use super::video_texture::{VideoRenderCallback, VideoRenderResources, VideoTexture};
+#[cfg(feature = "moq")]
 use poll_promise::Promise;
 
 /// Shared state for pending frame to be rendered.
@@ -142,23 +108,13 @@ pub struct PendingFrame {
 /// - Uploading frames to GPU textures
 /// - Rendering frames via wgpu
 /// - Basic playback controls (play, pause, seek)
+///
+/// Delegates core playback logic to [`CorePlayer`].
 pub struct VideoPlayer {
-    /// Current playback state
-    state: VideoState,
-    /// Video metadata
-    metadata: Option<VideoMetadata>,
-    /// The frame queue for decoded frames
-    frame_queue: Arc<FrameQueue>,
-    /// The decode thread
-    decode_thread: Option<DecodeThread>,
-    /// Frame scheduler for timing
-    scheduler: FrameScheduler,
+    /// Core playback engine (decode pipeline, frame queue, A/V sync)
+    core: CorePlayer,
     /// Current video texture
     texture: Arc<Mutex<Option<VideoTexture>>>,
-    /// Whether the player has been initialized
-    initialized: bool,
-    /// The URL being played
-    url: String,
     /// Whether to autoplay
     autoplay: bool,
     /// Whether to loop playback
@@ -179,18 +135,6 @@ pub struct VideoPlayer {
     show_controls: bool,
     /// Controls configuration
     controls_config: VideoControlsConfig,
-    /// Audio handle for volume/mute control
-    audio_handle: AudioHandle,
-    /// Audio decode/playback thread
-    #[cfg(target_os = "macos")]
-    audio_thread: Option<AudioThread>,
-    /// Background thread for async initialization
-    init_thread: Option<std::thread::JoinHandle<()>>,
-    /// Promise for async initialization result (poll_promise eliminates Mutex contention)
-    init_promise: Option<Promise<Result<Box<dyn VideoDecoderBackend + Send>, VideoError>>>,
-    /// Android player ID for multi-player frame isolation (prevents frame mixing)
-    #[cfg(target_os = "android")]
-    android_player_id: u64,
     /// Rate-limit "no CPU fallback" warning (log once per player instance, persists across frames)
     #[cfg(any(
         target_os = "macos",
@@ -199,11 +143,6 @@ pub struct VideoPlayer {
         all(target_os = "windows", feature = "windows-native-video")
     ))]
     fallback_logged: Arc<std::sync::atomic::AtomicBool>,
-    /// Linux zero-copy metrics for monitoring DMABuf → Vulkan rendering
-    /// Wrapped in Mutex so async init thread can populate it
-    #[cfg(target_os = "linux")]
-    linux_zero_copy_metrics:
-        Arc<parking_lot::Mutex<Option<Arc<super::linux_video::ZeroCopyMetrics>>>>,
     /// MoQ decoder stats handle for monitoring MoQ-specific pipeline state
     /// Wrapped in Mutex so init thread can populate it after MoqDecoder is created
     #[cfg(feature = "moq")]
@@ -211,6 +150,12 @@ pub struct VideoPlayer {
     /// Whether we've already late-bound the MoQ audio handle to self.audio_handle
     #[cfg(feature = "moq")]
     moq_audio_bound: bool,
+    /// MoQ-specific init promise (MoQ init bypasses CorePlayer)
+    #[cfg(feature = "moq")]
+    moq_init_promise: Option<Promise<Result<Box<dyn VideoDecoderBackend + Send>, VideoError>>>,
+    /// MoQ-specific init thread handle
+    #[cfg(feature = "moq")]
+    moq_init_thread: Option<std::thread::JoinHandle<()>>,
     /// Loaded subtitle track for rendering
     subtitle_track: Option<SubtitleTrack>,
     /// Whether subtitles are visible
@@ -223,17 +168,10 @@ impl VideoPlayer {
     /// Creates a new video player for the given URL.
     pub fn new(url: impl Into<String>) -> Self {
         let (pending_frame_writer, pending_frame_reader) = triple_buffer();
-        let audio_handle = AudioHandle::new();
-        let scheduler = FrameScheduler::with_audio_handle(audio_handle.clone());
+        let core = CorePlayer::new(url);
         Self {
-            state: VideoState::Loading,
-            metadata: None,
-            frame_queue: Arc::new(FrameQueue::with_default_capacity()),
-            decode_thread: None,
-            scheduler,
+            core,
             texture: Arc::new(Mutex::new(None)),
-            initialized: false,
-            url: url.into(),
             autoplay: false,
             loop_playback: false,
             loop_seek_pending: false,
@@ -244,14 +182,6 @@ impl VideoPlayer {
             pending_frame_reader,
             show_controls: true,
             controls_config: VideoControlsConfig::default(),
-            audio_handle,
-            #[cfg(target_os = "macos")]
-            audio_thread: None,
-            init_thread: None,
-            init_promise: None,
-            // Updated from decoder.android_player_id() once init completes.
-            #[cfg(target_os = "android")]
-            android_player_id: 0,
             #[cfg(any(
                 target_os = "macos",
                 target_os = "linux",
@@ -259,12 +189,14 @@ impl VideoPlayer {
                 all(target_os = "windows", feature = "windows-native-video")
             ))]
             fallback_logged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            #[cfg(target_os = "linux")]
-            linux_zero_copy_metrics: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "moq")]
             moq_stats: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "moq")]
             moq_audio_bound: false,
+            #[cfg(feature = "moq")]
+            moq_init_promise: None,
+            #[cfg(feature = "moq")]
+            moq_init_thread: None,
             subtitle_track: None,
             show_subtitles: true,
             subtitle_style: SubtitleStyle::default(),
@@ -332,17 +264,10 @@ impl VideoPlayer {
         }
 
         let (pending_frame_writer, pending_frame_reader) = triple_buffer();
-        let audio_handle = AudioHandle::new();
-        let scheduler = FrameScheduler::with_audio_handle(audio_handle.clone());
+        let core = CorePlayer::new(url);
         Self {
-            state: VideoState::Loading,
-            metadata: None,
-            frame_queue: Arc::new(FrameQueue::with_default_capacity()),
-            decode_thread: None,
-            scheduler,
+            core,
             texture: Arc::new(Mutex::new(None)),
-            initialized: false,
-            url: url.into(),
             autoplay: false,
             loop_playback: false,
             loop_seek_pending: false,
@@ -353,14 +278,6 @@ impl VideoPlayer {
             pending_frame_reader,
             show_controls: true,
             controls_config: VideoControlsConfig::default(),
-            audio_handle,
-            #[cfg(target_os = "macos")]
-            audio_thread: None,
-            init_thread: None,
-            init_promise: None,
-            // Updated from decoder.android_player_id() once init completes.
-            #[cfg(target_os = "android")]
-            android_player_id: 0,
             #[cfg(any(
                 target_os = "macos",
                 target_os = "linux",
@@ -368,12 +285,14 @@ impl VideoPlayer {
                 all(target_os = "windows", feature = "windows-native-video")
             ))]
             fallback_logged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            #[cfg(target_os = "linux")]
-            linux_zero_copy_metrics: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "moq")]
             moq_stats: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "moq")]
             moq_audio_bound: false,
+            #[cfg(feature = "moq")]
+            moq_init_promise: None,
+            #[cfg(feature = "moq")]
+            moq_init_thread: None,
             subtitle_track: None,
             show_subtitles: true,
             subtitle_style: SubtitleStyle::default(),
@@ -395,7 +314,7 @@ impl VideoPlayer {
     /// Sets whether audio is muted.
     pub fn with_muted(mut self, muted: bool) -> Self {
         self.muted = muted;
-        self.audio_handle.set_muted(muted);
+        self.core.audio_handle().set_muted(muted);
         self
     }
 
@@ -428,501 +347,156 @@ impl VideoPlayer {
     /// This spawns a background thread to open the video and prepare for playback.
     /// The player will show a loading state until initialization completes.
     ///
-    /// Note: On macOS, AVPlayer requires main thread initialization, so the decoder
-    /// is created synchronously on the main thread before spawning the background thread.
+    /// MoQ URLs are handled here (MoQ is egui-layer concern); non-MoQ URLs
+    /// delegate to [`CorePlayer::init_decoder`].
     pub fn start_async_init(&mut self) {
-        if self.initialized || self.init_thread.is_some() {
+        if self.core.is_initialized() || self.core.is_init_pending() {
             return;
         }
 
-        let url = self.url.clone();
-        let (sender, promise) = Promise::new();
-        self.init_promise = Some(promise);
-
-        // macOS: Initialize decoder on main thread BEFORE spawning background thread
-        // AVPlayer/AVFoundation requires main thread for initialization
-        // Skip for unsupported containers (MKV, WebM) - use FFmpeg directly
-        #[cfg(target_os = "macos")]
-        let macos_decoder_result: Option<Result<MacOSVideoDecoder, VideoError>> = {
-            if is_avfoundation_supported_container(&url) {
-                tracing::info!("Initializing macOS VideoToolbox decoder on main thread");
-                Some(MacOSVideoDecoder::new(&url))
-            } else {
-                tracing::info!(
-                    "Skipping macOS decoder for unsupported container, using FFmpeg: {}",
-                    url
-                );
-                None // Signal to use FFmpeg directly
-            }
-        };
-
-        // Capture Linux metrics holder for async init (so thread can populate it)
-        #[cfg(target_os = "linux")]
-        let linux_metrics_holder = Arc::clone(&self.linux_zero_copy_metrics);
-
-        // Capture MoQ stats holder for async init
+        // MoQ init already in progress (bypasses CorePlayer)
         #[cfg(feature = "moq")]
-        let moq_stats_holder = Arc::clone(&self.moq_stats);
+        if self.moq_init_promise.is_some() {
+            return;
+        }
 
-        // Spawn background thread for initialization
-        let handle = std::thread::spawn(move || {
-            // Open the video with platform-specific decoder
+        // Check for MoQ URL — handle in the egui layer
+        #[cfg(feature = "moq")]
+        if MoqDecoder::is_moq_url(self.core.url()) {
+            let url = self.core.url().to_string();
+            let moq_stats_holder = Arc::clone(&self.moq_stats);
 
-            // MoQ URLs - use MoQ decoder for live streaming
-            #[cfg(feature = "moq")]
-            if MoqDecoder::is_moq_url(&url) {
+            // MoQ init uses its own promise/thread (not CorePlayer's)
+            let (sender, promise) = Promise::new();
+
+            let handle = std::thread::spawn(move || {
                 tracing::info!("Using MoQ decoder for live stream: {}", url);
                 let result: Result<Box<dyn VideoDecoderBackend + Send>, VideoError> =
                     match MoqDecoder::new(&url) {
                         Ok(decoder) => {
-                            // Store stats handle for UI access before boxing
                             *moq_stats_holder.lock() = Some(decoder.stats_handle());
                             Ok(Box::new(decoder) as Box<dyn VideoDecoderBackend + Send>)
                         }
                         Err(e) => Err(e),
                     };
                 sender.send(result);
-                return;
-            }
+            });
 
-            // macOS with FFmpeg fallback - use pre-initialized decoder or FFmpeg for unsupported containers
-            #[cfg(target_os = "macos")]
-            let result: Result<Box<dyn VideoDecoderBackend + Send>, VideoError> = {
-                match macos_decoder_result {
-                    Some(Ok(d)) => {
-                        tracing::info!("Using macOS VideoToolbox hardware decoder");
-                        Ok(Box::new(d) as Box<dyn VideoDecoderBackend + Send>)
-                    }
-                    Some(Err(e)) => {
-                        tracing::warn!(
-                            "macOS VideoToolbox decoder failed, falling back to FFmpeg: {:?}",
-                            e
-                        );
-                        FfmpegDecoder::new(&url)
-                            .map(|d| Box::new(d) as Box<dyn VideoDecoderBackend + Send>)
-                    }
-                    None => {
-                        // Unsupported container (MKV, WebM, etc.) - use FFmpeg directly
-                        tracing::info!("Using FFmpeg for unsupported container format");
-                        FfmpegDecoder::new(&url)
-                            .map(|d| Box::new(d) as Box<dyn VideoDecoderBackend + Send>)
-                    }
-                }
-            };
+            // Store these for check_init_complete to pick up
+            self.moq_init_promise = Some(promise);
+            self.moq_init_thread = Some(handle);
+            return;
+        }
 
-            #[cfg(target_os = "android")]
-            let result: Result<Box<dyn VideoDecoderBackend + Send>, VideoError> = {
-                tracing::info!("Using Android ExoPlayer decoder for {}", url);
-                AndroidVideoDecoder::new(&url)
-                    .map(|d| Box::new(d) as Box<dyn VideoDecoderBackend + Send>)
-            };
-
-            // Linux: GStreamer is the only supported backend (no FFmpeg fallback)
-            // GStreamer handles all containers (MKV, WebM, MP4, etc.) and has built-in
-            // fallback from zero-copy DMABuf to CPU copy when VA-API is unavailable
-            #[cfg(target_os = "linux")]
-            let result: Result<Box<dyn VideoDecoderBackend + Send>, VideoError> = {
-                match ZeroCopyGStreamerDecoder::new(&url) {
-                    Ok(decoder) => {
-                        // Store metrics for later access
-                        *linux_metrics_holder.lock() = Some(Arc::clone(decoder.metrics()));
-                        Ok(Box::new(decoder) as Box<dyn VideoDecoderBackend + Send>)
-                    }
-                    Err(e) => Err(e),
-                }
-            };
-
-            // Fallback when no decoder is available at compile time
-            // (platforms without native decoder: Windows without feature, WASM, etc.)
-            #[cfg(not(any(target_os = "android", target_os = "macos", target_os = "linux",)))]
-            let result: Result<Box<dyn VideoDecoderBackend + Send>, VideoError> = {
-                let _ = &url; // Silence unused variable warning
-                Err(VideoError::DecoderInit(
-                    "No video decoder available for this platform".to_string(),
-                ))
-            };
-
-            sender.send(result);
-        });
-
-        self.init_thread = Some(handle);
+        // Non-MoQ: delegate to CorePlayer
+        self.core.init_decoder();
     }
 
     /// Checks if async initialization is complete and finishes setup.
     /// Returns true if initialization is complete (success or error).
     fn check_init_complete(&mut self) -> bool {
-        if self.initialized {
+        if self.core.is_initialized() {
             return true;
         }
 
-        // Check if promise exists and is ready (non-blocking poll)
-        let is_ready = self
-            .init_promise
-            .as_ref()
-            .is_some_and(|p| p.ready().is_some());
-
-        if !is_ready {
-            return false;
-        }
-
-        // Take the promise and extract the result
-        let Some(promise) = self.init_promise.take() else {
-            return false;
-        };
-
-        // try_take returns Ok(value) if ready, Err(promise) if not ready
-        let Ok(result) = promise.try_take() else {
-            // This shouldn't happen since we checked ready()
-            self.state = VideoState::Error(VideoError::Generic("Init thread crashed".into()));
-            self.init_thread = None;
-            return true;
-        };
-
-        match result {
-            Ok(decoder) => {
-                // Store metadata
-                let metadata = decoder.metadata().clone();
-                self.metadata = Some(metadata.clone());
-
-                // Check at RUNTIME if decoder handles audio internally
-                // This allows FFmpeg fallback on macOS/Linux to still get FFmpeg audio
-                let uses_native_audio = decoder.handles_audio_internally();
-
-                // Extract Android player ID for per-player frame queue routing
-                #[cfg(target_os = "android")]
-                {
-                    self.android_player_id = decoder.android_player_id();
-                }
-
-                // Extract MoQ audio handle (if any) before boxing the decoder
-                let decoder_audio_handle = decoder.audio_handle();
-
-                // For native decoders, set up audio_handle BEFORE creating decode thread
-                // so the decode_loop can update native_position from the decoder's current_time()
-                if uses_native_audio {
-                    if let Some(ref ah) = decoder_audio_handle {
-                        self.audio_handle = ah.clone();
-                    }
-                    self.audio_handle.set_available(true);
-                    self.scheduler.set_audio_handle(self.audio_handle.clone());
-                    tracing::info!("Native audio enabled (decoder handles audio internally)");
-                }
-
-                // Create and start the decode thread
-                let frame_queue = Arc::clone(&self.frame_queue);
-
-                // For native video decoders, pass audio_handle so decode_loop can
-                // update native_position from the decoder's current_time()
-                #[cfg(target_os = "macos")]
-                let decode_thread = if uses_native_audio {
-                    DecodeThread::with_audio_handle(
-                        decoder,
-                        frame_queue,
-                        Some(self.audio_handle.clone()),
-                    )
-                } else {
-                    DecodeThread::new(decoder, frame_queue)
-                };
-
-                #[cfg(not(target_os = "macos"))]
-                let decode_thread = DecodeThread::new(decoder, frame_queue);
-
-                self.decode_thread = Some(decode_thread);
-
-                // Start FFmpeg audio thread only if decoder doesn't handle audio internally
-                // AND this is not a MoQ URL (MoQ handles audio via its own pipeline).
-                #[cfg(target_os = "macos")]
-                {
-                    #[cfg(feature = "moq")]
-                    let is_moq = super::moq_decoder::MoqDecoder::is_moq_url(&self.url);
-                    #[cfg(not(feature = "moq"))]
-                    let is_moq = false;
-                    if !uses_native_audio && !is_moq {
-                        if let Some(audio_thread) = AudioThread::new(&self.url, metadata.start_time)
-                        {
-                            self.audio_handle = audio_thread.handle();
-                            // Update FrameScheduler's audio handle so sync metrics work
-                            self.scheduler.set_audio_handle(self.audio_handle.clone());
-                            tracing::info!("FFmpeg audio playback initialized for {}", self.url);
-                            self.audio_thread = Some(audio_thread);
+        // Check MoQ init path first (bypasses CorePlayer)
+        #[cfg(feature = "moq")]
+        if let Some(ref promise) = self.moq_init_promise {
+            if promise.ready().is_some() {
+                let promise = self.moq_init_promise.take().unwrap();
+                self.moq_init_thread = None;
+                match promise.try_take() {
+                    Ok(Ok(decoder)) => {
+                        // MoQ decoder ready — wrap in CorePlayer
+                        let url = self.core.url().to_string();
+                        self.core = CorePlayer::with_decoder(url, decoder);
+                        if self.autoplay {
+                            self.core.play_with_muted(self.muted);
                         }
+                        return true;
                     }
-                }
-
-                self.state = VideoState::Ready;
-                self.initialized = true;
-                self.init_thread = None;
-
-                // Start playback if autoplay is enabled
-                if self.autoplay {
-                    self.play();
-                }
-
-                true
-            }
-            Err(e) => {
-                self.state = VideoState::Error(e);
-                self.init_thread = None;
-                // Mark as initialized even on error to prevent infinite retry loop
-                // (show() would otherwise restart init every frame since init_thread is None)
-                self.initialized = true;
-                true
-            }
-        }
-    }
-
-    /// Initializes the video player synchronously (legacy, causes UI freeze).
-    #[allow(dead_code)]
-    pub fn initialize(&mut self) -> Result<(), VideoError> {
-        if self.initialized {
-            return Ok(());
-        }
-
-        // Open the video with platform-specific decoder
-        // For unsupported containers (MKV, WebM), skip macOS decoder and use FFmpeg directly
-        #[cfg(target_os = "macos")]
-        let decoder: Box<dyn VideoDecoderBackend + Send> = {
-            if !is_avfoundation_supported_container(&self.url) {
-                tracing::info!(
-                    "Using FFmpeg for unsupported container format: {}",
-                    self.url
-                );
-                Box::new(FfmpegDecoder::new(&self.url)?)
-            } else {
-                match MacOSVideoDecoder::new(&self.url) {
-                    Ok(d) => {
-                        tracing::info!("Using macOS VideoToolbox hardware decoder");
-                        Box::new(d)
+                    Ok(Err(e)) => {
+                        self.core.set_state(VideoState::Error(e));
+                        return true;
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            "macOS VideoToolbox decoder failed, falling back to FFmpeg: {:?}",
-                            e
-                        );
-                        Box::new(FfmpegDecoder::new(&self.url)?)
+                    Err(_) => {
+                        self.core.set_state(VideoState::Error(VideoError::Generic(
+                            "MoQ init thread crashed".into(),
+                        )));
+                        return true;
                     }
                 }
             }
-        };
-
-        #[cfg(target_os = "android")]
-        let decoder: Box<dyn VideoDecoderBackend + Send> = {
-            tracing::info!("Using Android ExoPlayer decoder for {}", self.url);
-            let d = AndroidVideoDecoder::new(&self.url)?;
-            self.android_player_id = d.android_player_id();
-            Box::new(d)
-        };
-
-        // Linux: GStreamer is the only supported backend (no FFmpeg fallback)
-        // GStreamer handles all containers (MKV, WebM, MP4, etc.) and has built-in
-        // fallback from zero-copy DMABuf to CPU copy when VA-API is unavailable
-        #[cfg(target_os = "linux")]
-        let decoder: Box<dyn VideoDecoderBackend + Send> = {
-            let gst_decoder = ZeroCopyGStreamerDecoder::new(&self.url)?;
-            // Store metrics for later access
-            *self.linux_zero_copy_metrics.lock() = Some(Arc::clone(gst_decoder.metrics()));
-            Box::new(gst_decoder)
-        };
-
-        // Fallback when no decoder is available at compile time
-        #[cfg(not(any(target_os = "android", target_os = "macos", target_os = "linux",)))]
-        {
-            return Err(VideoError::DecoderInit(
-                "No video decoder available for this platform".to_string(),
-            ));
+            return false; // MoQ init still pending
         }
 
-        // Code that requires a decoder - only compiled when one is available
-        #[cfg(any(target_os = "android", target_os = "macos", target_os = "linux",))]
-        {
-            self.metadata = Some(decoder.metadata().clone());
-
-            let frame_queue = Arc::clone(&self.frame_queue);
-            let decode_thread = DecodeThread::new(decoder, frame_queue);
-
-            self.decode_thread = Some(decode_thread);
-            self.state = VideoState::Ready;
-            self.initialized = true;
-
-            if self.autoplay {
-                self.play();
-            }
-
-            Ok(())
+        // Non-MoQ: delegate to CorePlayer
+        let complete = self.core.check_init_complete();
+        if complete && self.autoplay && matches!(self.core.state(), VideoState::Ready) {
+            self.core.play_with_muted(self.muted);
         }
+        complete
     }
 
     /// Starts or resumes playback.
     pub fn play(&mut self) {
-        if let Some(ref thread) = self.decode_thread {
-            // For native decoders (macOS, Android, GStreamer), sync mute state before playing
-            // This ensures audio plays correctly when user hasn't explicitly muted
-            #[cfg(any(target_os = "android", target_os = "macos", target_os = "linux"))]
-            thread.set_muted(self.muted);
-
-            thread.play();
-            self.scheduler.start();
-            self.state = VideoState::Playing {
-                position: self.scheduler.position(),
-            };
-
-            // Start audio playback (FFmpeg audio thread)
-            #[cfg(target_os = "macos")]
-            if let Some(ref audio_thread) = self.audio_thread {
-                audio_thread.play();
-            }
-        }
+        self.core.play_with_muted(self.muted);
     }
 
     /// Pauses playback.
     pub fn pause(&mut self) {
-        if let Some(ref thread) = self.decode_thread {
-            thread.pause();
-            self.scheduler.pause();
-            self.state = VideoState::Paused {
-                position: self.scheduler.position(),
-            };
-
-            // Pause audio playback
-            #[cfg(target_os = "macos")]
-            if let Some(ref audio_thread) = self.audio_thread {
-                audio_thread.pause();
-            }
-        }
+        self.core.pause();
     }
 
     /// Toggles between play and pause.
     pub fn toggle_playback(&mut self) {
-        match self.state {
-            VideoState::Playing { .. } => self.pause(),
-            VideoState::Paused { .. } | VideoState::Ready | VideoState::Ended => self.play(),
-            _ => {}
-        }
+        self.core.toggle_playback();
     }
 
     /// Seeks to a specific position.
     pub fn seek(&mut self, position: Duration) {
-        // Log seek origin for debugging unexpected seeks
-        if position == Duration::ZERO {
-            tracing::debug!(
-                "Seek to ZERO requested from state={:?}, loop_playback={}",
-                self.state,
-                self.loop_playback
-            );
-        }
-
-        // Note: EOS is cleared by the decode thread after a successful seek
-        // (see frame_queue.rs process_decode_command). We don't clear it eagerly
-        // here because if seek fails (e.g. live MoQ streams), EOS should remain
-        // set to prevent an infinite seek-EOS loop.
-
-        if let Some(ref thread) = self.decode_thread {
-            thread.seek(position);
-            self.scheduler.seek(position);
-
-            // Seek audio
-            #[cfg(target_os = "macos")]
-            if let Some(ref audio_thread) = self.audio_thread {
-                audio_thread.seek(position);
-            }
-
-            // Update state with new position
-            match self.state {
-                VideoState::Playing { .. } => {
-                    self.state = VideoState::Playing { position };
-                }
-                VideoState::Paused { .. } => {
-                    self.state = VideoState::Paused { position };
-                }
-                VideoState::Ended => {
-                    self.state = VideoState::Paused { position };
-                }
-                _ => {}
-            }
-        }
+        self.core.seek(position);
     }
 
     /// Returns the current playback state.
     pub fn state(&self) -> &VideoState {
-        &self.state
+        self.core.state()
     }
 
     /// Returns the video metadata if available.
     pub fn metadata(&self) -> Option<&VideoMetadata> {
-        self.metadata.as_ref()
+        self.core.metadata()
     }
 
     /// Returns the current playback position.
     pub fn position(&self) -> Duration {
-        self.scheduler.position()
+        self.core.position()
     }
 
     /// Returns the video duration if known.
     pub fn duration(&self) -> Option<Duration> {
-        // First try to get duration from the decode thread (updated dynamically, e.g., from ExoPlayer callbacks)
-        if let Some(ref thread) = self.decode_thread {
-            if let Some(dur) = thread.duration() {
-                return Some(dur);
-            }
-        }
-        // Fall back to metadata duration
-        self.metadata.as_ref().and_then(|m| m.duration)
+        self.core.duration()
     }
 
     /// Returns the A/V sync metrics tracker.
-    ///
-    /// Use this to monitor audio-video synchronization quality during playback.
-    /// The metrics track drift between audio and video presentation timestamps.
     pub fn sync_metrics(&self) -> &SyncMetrics {
-        self.scheduler.sync_metrics()
+        self.core.sync_metrics()
     }
 
     /// Returns a snapshot of current A/V sync metrics.
-    ///
-    /// This provides a point-in-time view of sync quality including:
-    /// - Current drift (positive = video ahead of audio)
-    /// - Maximum drift observed
-    /// - Percentage of frames out of sync
     pub fn sync_metrics_snapshot(&self) -> SyncMetricsSnapshot {
-        self.scheduler.sync_metrics().snapshot()
+        self.core.sync_metrics_snapshot()
     }
 
     /// Returns a snapshot of Linux zero-copy metrics (Linux GStreamer only).
-    ///
-    /// This provides visibility into whether DMABuf → Vulkan zero-copy rendering
-    /// is working, or if the system has fallen back to CPU copy.
-    ///
-    /// Returns `None` if:
-    /// - Not on Linux
-    /// - GStreamer decoder not used
-    /// - Decoder not yet initialized
-    ///
-    /// # Example
-    /// ```ignore
-    /// # use lumina_video::VideoPlayer;
-    /// let player = VideoPlayer::new("video.mp4");
-    /// if let Some(metrics) = player.linux_zero_copy_metrics() {
-    ///     if metrics.is_zero_copy_active() {
-    ///         println!("✓ Zero-copy active: {} frames", metrics.zero_copy_frames);
-    ///     } else {
-    ///         println!("⚠ Fallback: {:.1}% CPU copy", metrics.fallback_percentage());
-    ///     }
-    /// }
-    /// ```
     #[cfg(target_os = "linux")]
     pub fn linux_zero_copy_metrics(
         &self,
     ) -> Option<super::linux_video::LinuxZeroCopyMetricsSnapshot> {
-        self.linux_zero_copy_metrics
-            .lock()
-            .as_ref()
-            .map(|metrics| metrics.snapshot())
+        self.core.linux_zero_copy_metrics()
     }
 
     /// Returns a snapshot of MoQ decoder stats (MoQ streams only).
-    ///
-    /// Returns `None` if the current stream is not a MoQ stream or if the
-    /// MoQ decoder hasn't been initialized yet.
     #[cfg(feature = "moq")]
     pub fn moq_stats(&self) -> Option<MoqStatsSnapshot> {
         self.moq_stats
@@ -932,130 +506,50 @@ impl VideoPlayer {
     }
 
     /// Returns the video dimensions (width, height).
-    ///
-    /// This checks the decode thread first for dynamically updated dimensions
-    /// (e.g., from ExoPlayer callbacks on Android), then falls back to metadata.
     pub fn dimensions(&self) -> Option<(u32, u32)> {
-        // First try to get dimensions from the decode thread
-        if let Some(ref thread) = self.decode_thread {
-            if let Some(dims) = thread.dimensions() {
-                return Some(dims);
-            }
-        }
-        // Fall back to metadata dimensions
-        self.metadata.as_ref().map(|m| (m.width, m.height))
+        self.core.dimensions()
     }
 
     /// Returns the video frame rate.
-    ///
-    /// This checks the decode thread first for dynamically updated frame rate
-    /// (e.g., from macOS AVPlayer when metadata becomes ready), then falls back to metadata.
     pub fn frame_rate(&self) -> Option<f32> {
-        // First try to get frame rate from the decode thread
-        if let Some(ref thread) = self.decode_thread {
-            if let Some(fps) = thread.frame_rate() {
-                return Some(fps);
-            }
-        }
-        // Fall back to metadata frame rate
-        self.metadata.as_ref().map(|m| m.frame_rate)
-    }
-
-    /// Syncs the stored metadata with values from the decode thread.
-    ///
-    /// This should be called periodically to update the metadata with
-    /// dynamically discovered values (e.g., macOS AVPlayer lazy metadata).
-    fn sync_metadata_from_decode_thread(&mut self) {
-        let Some(ref thread) = self.decode_thread else {
-            return;
-        };
-
-        let Some(ref mut metadata) = self.metadata else {
-            return;
-        };
-
-        // Update duration
-        if let Some(dur) = thread.duration() {
-            metadata.duration = Some(dur);
-        }
-
-        // Update dimensions
-        if let Some((w, h)) = thread.dimensions() {
-            if w > 1 && h > 1 {
-                metadata.width = w;
-                metadata.height = h;
-            }
-        }
-
-        // Update frame rate and manage pacing for live streams
-        if let Some(fps) = thread.frame_rate() {
-            if fps > 0.0 {
-                metadata.frame_rate = fps;
-                if metadata.duration.is_none() {
-                    // Live/MoQ: enable pacing to smooth group-boundary bursts
-                    self.scheduler.set_frame_rate_pacing(fps);
-                } else {
-                    // VOD or stream that acquired duration: disable pacing
-                    self.scheduler.clear_frame_rate_pacing();
-                }
-            }
-        }
+        self.core.frame_rate()
     }
 
     /// Returns true if the video is currently playing.
     pub fn is_playing(&self) -> bool {
-        self.scheduler.is_playing()
+        self.core.is_playing()
     }
 
     /// Returns the current buffering percentage (0-100).
-    ///
-    /// For network streams, this indicates how much data has been buffered.
-    /// Returns 100 for local files or when buffering state is unknown.
     pub fn buffering_percent(&self) -> i32 {
-        if let Some(ref thread) = self.decode_thread {
-            thread.buffering_percent()
-        } else {
-            100 // Assume buffered if no decode thread yet
-        }
+        self.core.buffering_percent()
     }
 
     /// Returns the audio handle for volume/mute control.
     pub fn audio_handle(&self) -> &AudioHandle {
-        &self.audio_handle
+        self.core.audio_handle()
     }
 
     /// Returns the current volume (0-100).
     pub fn volume(&self) -> u32 {
-        self.audio_handle.volume()
+        self.core.audio_handle().volume()
     }
 
     /// Sets the volume (0-100).
     pub fn set_volume(&mut self, volume: u32) {
-        self.audio_handle.set_volume(volume);
-
-        // On Android, audio is controlled by ExoPlayer through the decode thread
-        #[cfg(target_os = "android")]
-        if let Some(ref decode_thread) = self.decode_thread {
-            // Convert 0-100 to 0.0-1.0
-            decode_thread.set_volume(volume as f32 / 100.0);
-        }
+        self.core.set_volume(volume);
     }
 
     /// Returns whether audio is muted.
     pub fn is_muted(&self) -> bool {
-        self.audio_handle.is_muted()
+        self.core.audio_handle().is_muted()
     }
 
     /// Toggles the mute state.
     pub fn toggle_mute(&mut self) {
-        self.audio_handle.toggle_mute();
-        self.muted = self.audio_handle.is_muted();
-
-        // For native decoders, audio is controlled through the decode thread
-        #[cfg(any(target_os = "android", target_os = "macos", target_os = "linux"))]
-        if let Some(ref decode_thread) = self.decode_thread {
-            decode_thread.set_muted(self.muted);
-        }
+        self.core.audio_handle().toggle_mute();
+        self.muted = self.core.audio_handle().is_muted();
+        self.core.set_muted(self.muted);
     }
 
     /// Loads subtitles from SRT format content.
@@ -1092,19 +586,20 @@ impl VideoPlayer {
             // Try to acquire the audio handle
             if let Some(moq_ah) = stats.audio_handle() {
                 // Migrate current mute/volume state
-                moq_ah.set_muted(self.audio_handle.is_muted());
-                moq_ah.set_volume(self.audio_handle.volume());
-
-                // Replace the player-level handle (for UI mute/volume controls only)
-                self.audio_handle = moq_ah;
-                self.audio_handle.set_available(true);
+                moq_ah.set_muted(self.core.audio_handle().is_muted());
+                moq_ah.set_volume(self.core.audio_handle().volume());
+                moq_ah.set_available(true);
 
                 // Bind to FrameScheduler for sync metrics (drift tracking).
                 // Use metrics-only mode: wall-clock drives frame pacing, not audio.
                 // MoQ audio arrives late; switching to audio-as-master would cause
                 // a position discontinuity that freezes or jumps video.
-                self.scheduler
-                    .set_audio_handle_metrics_only(self.audio_handle.clone());
+                self.core
+                    .scheduler_mut()
+                    .set_audio_handle_metrics_only(moq_ah.clone());
+
+                // Replace the player-level handle (for UI mute/volume controls only)
+                self.core.set_audio_handle(moq_ah);
 
                 // Don't enable playback epoch here — let the FrameScheduler's
                 // clock rebase enable it, so cpal stays gated until video is ready.
@@ -1123,12 +618,12 @@ impl VideoPlayer {
 
                 // Create a fresh placeholder handle and migrate state
                 let placeholder = AudioHandle::new();
-                placeholder.set_muted(self.audio_handle.is_muted());
-                placeholder.set_volume(self.audio_handle.volume());
-                self.audio_handle = placeholder;
+                placeholder.set_muted(self.core.audio_handle().is_muted());
+                placeholder.set_volume(self.core.audio_handle().volume());
+                self.core.set_audio_handle(placeholder);
 
                 // Clear FrameScheduler's audio handle so it falls back to wall-clock
-                self.scheduler.clear_audio_handle();
+                self.core.scheduler_mut().clear_audio_handle();
 
                 self.moq_audio_bound = false;
             }
@@ -1200,35 +695,33 @@ impl VideoPlayer {
         // Allocate space for the video
         let (rect, response) = ui.allocate_exact_size(size, Sense::click());
 
-        // Start async initialization if needed
-        if !self.initialized && self.init_thread.is_none() {
-            self.start_async_init();
-        }
+        // Start async initialization if needed (idempotent — guards inside)
+        self.start_async_init();
 
         // Check if async init is complete
-        if !self.initialized {
+        if !self.core.is_initialized() {
             self.check_init_complete();
         }
 
         // Sync metadata from decode thread (for lazy metadata like macOS AVPlayer)
-        self.sync_metadata_from_decode_thread();
+        self.core.sync_metadata_from_decode_thread();
 
         // Late-bind MoQ audio handle (async — not available at init time)
         #[cfg(feature = "moq")]
-        if self.initialized {
+        if self.core.is_initialized() {
             self.poll_moq_audio_handle();
         }
 
         // Update frame if playback requested (even if buffering), or try to get preview frame when Ready/Paused
-        if self.scheduler.is_playback_requested() {
+        if self.core.is_playback_requested() {
             self.update_frame();
-        } else if matches!(self.state, VideoState::Ready | VideoState::Paused { .. }) {
+        } else if matches!(self.core.state(), VideoState::Ready | VideoState::Paused { .. }) {
             // Try to get preview frame from queue (non-blocking)
             self.try_get_preview_frame();
         }
 
         // Check for end of stream
-        if self.frame_queue.is_eos() && self.frame_queue.is_empty() {
+        if self.core.is_eos() && self.core.is_queue_empty() {
             if self.loop_playback && !self.loop_seek_pending {
                 tracing::debug!("Loop triggered: seeking to start");
                 self.loop_seek_pending = true;
@@ -1241,12 +734,12 @@ impl VideoPlayer {
                     tracing::debug!("Loop seek failed (EOS reappeared), ending playback");
                     self.loop_seek_pending = false;
                 }
-                self.state = VideoState::Ended;
+                self.core.set_state(VideoState::Ended);
             }
         }
 
         // Render the video frame, loading state, or error
-        match &self.state {
+        match self.core.state() {
             VideoState::Error(err) => {
                 self.render_error(ui, rect, err);
             }
@@ -1260,7 +753,7 @@ impl VideoPlayer {
                 // Show buffering overlay only when playing AND buffering < 100%
                 // Don't show when paused/ready - let user see the preview frame
                 let buffering = self.buffering_percent();
-                let is_audio_stall = self.scheduler.is_audio_stall();
+                let is_audio_stall = self.core.is_audio_stall();
                 if (buffering < 100 || is_audio_stall) && self.is_playing() {
                     let pct = if is_audio_stall { 90 } else { buffering };
                     self.render_buffering_overlay(ui, rect, pct);
@@ -1282,9 +775,9 @@ impl VideoPlayer {
         let mut controls_response = VideoControlsResponse::default();
 
         if self.show_controls {
-            let controls = VideoControls::new(&self.state, self.position(), self.duration())
+            let controls = VideoControls::new(self.core.state(), self.position(), self.duration())
                 .with_config(self.controls_config.clone())
-                .with_muted(self.audio_handle.is_muted())
+                .with_muted(self.core.audio_handle().is_muted())
                 .with_subtitles(self.show_subtitles, self.subtitle_track.is_some())
                 .with_buffering_percent(self.buffering_percent());
             controls_response = controls.show(ui, rect);
@@ -1330,15 +823,19 @@ impl VideoPlayer {
         }
 
         // Request repaint if playing/buffering, loading, initializing, or have pending frame
-        let is_initializing = self.init_thread.is_some();
+        #[cfg(feature = "moq")]
+        let is_initializing =
+            self.core.is_init_pending() || self.moq_init_promise.is_some();
+        #[cfg(not(feature = "moq"))]
+        let is_initializing = self.core.is_init_pending();
         let has_pending_frame = self.pending_frame_reader.has_new_frame();
         let is_buffering = self.buffering_percent() < 100;
-        if self.scheduler.is_playback_requested()
+        if self.core.is_playback_requested()
             || is_initializing
             || has_pending_frame
             || is_buffering
             || matches!(
-                self.state,
+                self.core.state(),
                 VideoState::Loading | VideoState::Buffering { .. }
             )
         {
@@ -1359,15 +856,10 @@ impl VideoPlayer {
     /// The actual texture creation and upload happens in the prepare callback
     /// which has access to VideoRenderResources.
     fn update_frame(&mut self) {
-        // Get the next frame to display
-        if let Some(frame) = self.scheduler.get_next_frame(&self.frame_queue) {
+        // Get the next frame to display (CorePlayer updates state internally)
+        if let Some(frame) = self.core.poll_frame() {
             // Frame received — loop seek succeeded if one was pending
             self.loop_seek_pending = false;
-
-            // Update state with current position
-            self.state = VideoState::Playing {
-                position: frame.pts,
-            };
 
             // Check if texture needs to be recreated
             let texture_guard = self.texture.lock();
@@ -1455,7 +947,7 @@ impl VideoPlayer {
         }
 
         // Peek at the queue - don't pop so we can play from the beginning
-        let Some(frame) = self.frame_queue.peek() else {
+        let Some(frame) = self.core.peek_frame() else {
             return;
         };
 
@@ -1762,7 +1254,7 @@ impl VideoPlayer {
             ))]
             fallback_logged: Arc::clone(&self.fallback_logged),
             #[cfg(target_os = "android")]
-            player_id: self.android_player_id,
+            player_id: self.core.android_player_id(),
         };
 
         // Add paint callback
@@ -1834,20 +1326,8 @@ impl VideoPlayer {
     }
 }
 
-impl Drop for VideoPlayer {
-    fn drop(&mut self) {
-        // Stop the decode thread
-        if let Some(ref thread) = self.decode_thread {
-            thread.stop();
-        }
-
-        // Stop the audio thread
-        #[cfg(target_os = "macos")]
-        if let Some(ref audio_thread) = self.audio_thread {
-            audio_thread.stop();
-        }
-    }
-}
+// Note: No Drop impl needed — CorePlayer has its own Drop that stops
+// the decode thread and audio thread.
 
 /// Response from showing a video player widget.
 pub struct VideoPlayerResponse {

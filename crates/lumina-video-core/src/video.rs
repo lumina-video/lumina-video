@@ -467,7 +467,7 @@ pub struct DmaBufPlane {
 /// ```
 /// # #[cfg(target_os = "linux")]
 /// # fn main() {
-/// use lumina_video::media::video::{LinuxGpuSurface, DmaBufPlane, PixelFormat};
+/// use lumina_video_core::video::{LinuxGpuSurface, DmaBufPlane, PixelFormat};
 ///
 /// // LinuxGpuSurface::new() is unsafe because it requires valid DMABuf file descriptors.
 /// // In practice, surfaces are created by the decoder (GStreamer/VA-API), not user code.
