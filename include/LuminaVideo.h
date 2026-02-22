@@ -10,6 +10,7 @@
 #ifndef LUMINA_VIDEO_H
 #define LUMINA_VIDEO_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __APPLE__
@@ -18,6 +19,11 @@
 
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+/* Nullability annotations for Swift interop */
+#ifdef __clang__
+#pragma clang assume_nonnull begin
 #endif
 
 /* ========================================================================= */
@@ -70,7 +76,7 @@ typedef struct LuminaFrame LuminaFrame;
  * @return LUMINA_OK on success, or an error code.
  */
 LuminaError lumina_player_create(const char *url,
-                                 LuminaPlayer **out_player);
+                                 LuminaPlayer *_Nullable *out_player);
 
 /**
  * Destroys a video player and frees all resources.
@@ -81,7 +87,7 @@ LuminaError lumina_player_create(const char *url,
  *                  After return, *player is NULL.
  * @return LUMINA_OK on success, LUMINA_ERROR_NULL_PTR if player is NULL.
  */
-LuminaError lumina_player_destroy(LuminaPlayer **player);
+LuminaError lumina_player_destroy(LuminaPlayer *_Nullable *player);
 
 /* ========================================================================= */
 /* Playback control                                                           */
@@ -122,7 +128,7 @@ LuminaError lumina_player_seek(LuminaPlayer *player, double position_secs);
  * @param player    Valid player handle. Returns LUMINA_STATE_ERROR if NULL.
  * @return Current state enum value.
  */
-LuminaState lumina_player_state(const LuminaPlayer *player);
+LuminaState lumina_player_state(const LuminaPlayer *_Nullable player);
 
 /**
  * Returns the current playback position in seconds.
@@ -130,7 +136,7 @@ LuminaState lumina_player_state(const LuminaPlayer *player);
  * @param player    Valid player handle. Returns 0.0 if NULL.
  * @return Position in seconds.
  */
-double lumina_player_position(const LuminaPlayer *player);
+double lumina_player_position(const LuminaPlayer *_Nullable player);
 
 /**
  * Returns the video duration in seconds, or -1.0 if unknown.
@@ -138,7 +144,47 @@ double lumina_player_position(const LuminaPlayer *player);
  * @param player    Valid player handle. Returns -1.0 if NULL.
  * @return Duration in seconds, or -1.0 for live/unknown.
  */
-double lumina_player_duration(const LuminaPlayer *player);
+double lumina_player_duration(const LuminaPlayer *_Nullable player);
+
+/* ========================================================================= */
+/* Audio control                                                              */
+/* ========================================================================= */
+
+/**
+ * Sets the muted state.
+ *
+ * @param player    Valid player handle. Must not be NULL.
+ * @param muted     true to mute, false to unmute.
+ * @return LUMINA_OK on success.
+ */
+LuminaError lumina_player_set_muted(LuminaPlayer *player, bool muted);
+
+/**
+ * Returns the current muted state.
+ *
+ * @param player    Valid player handle. Returns true (muted) if NULL.
+ * @return true if muted, false if unmuted.
+ */
+bool lumina_player_is_muted(const LuminaPlayer *_Nullable player);
+
+/**
+ * Sets the volume level (0-100).
+ *
+ * Values outside 0-100 are clamped.
+ *
+ * @param player    Valid player handle. Must not be NULL.
+ * @param volume    Volume level (0 = silent, 100 = full).
+ * @return LUMINA_OK on success.
+ */
+LuminaError lumina_player_set_volume(LuminaPlayer *player, int32_t volume);
+
+/**
+ * Returns the current volume level (0-100).
+ *
+ * @param player    Valid player handle. Returns 0 if NULL.
+ * @return Volume level (0-100).
+ */
+int32_t lumina_player_volume(const LuminaPlayer *_Nullable player);
 
 /* ========================================================================= */
 /* Frame retrieval                                                            */
@@ -156,7 +202,7 @@ double lumina_player_duration(const LuminaPlayer *player);
  * @param player    Valid player handle. Returns NULL if player is NULL.
  * @return Owned frame pointer, or NULL if no frame is ready.
  */
-LuminaFrame *lumina_player_poll_frame(LuminaPlayer *player);
+LuminaFrame *_Nullable lumina_player_poll_frame(LuminaPlayer *_Nullable player);
 
 /* ========================================================================= */
 /* Frame accessors                                                            */
@@ -167,14 +213,14 @@ LuminaFrame *lumina_player_poll_frame(LuminaPlayer *player);
  *
  * @param frame    Valid frame handle. Returns 0 if NULL.
  */
-uint32_t lumina_frame_width(const LuminaFrame *frame);
+uint32_t lumina_frame_width(const LuminaFrame *_Nullable frame);
 
 /**
  * Returns the frame height in pixels.
  *
  * @param frame    Valid frame handle. Returns 0 if NULL.
  */
-uint32_t lumina_frame_height(const LuminaFrame *frame);
+uint32_t lumina_frame_height(const LuminaFrame *_Nullable frame);
 
 #ifdef __APPLE__
 /**
@@ -186,7 +232,7 @@ uint32_t lumina_frame_height(const LuminaFrame *frame);
  *
  * @param frame    Valid frame handle. Returns NULL if frame is NULL.
  */
-IOSurfaceRef lumina_frame_iosurface(const LuminaFrame *frame);
+IOSurfaceRef _Nullable lumina_frame_iosurface(const LuminaFrame *_Nullable frame);
 #endif
 
 /**
@@ -196,7 +242,41 @@ IOSurfaceRef lumina_frame_iosurface(const LuminaFrame *frame);
  *
  * @param frame    Frame to release (may be NULL).
  */
-void lumina_frame_release(LuminaFrame *frame);
+void lumina_frame_release(LuminaFrame *_Nullable frame);
+
+/* ========================================================================= */
+/* Diagnostics                                                                */
+/* ========================================================================= */
+
+/**
+ * FFI diagnostics snapshot.
+ *
+ * All fields are zero in release builds (debug_assertions disabled).
+ * In debug builds, tracks player/frame lifecycle and FFI call counts.
+ */
+typedef struct LuminaDiagnostics {
+    uint64_t players_created;
+    uint64_t players_destroyed;
+    uint64_t players_peak;
+    uint64_t players_live;
+    uint64_t frames_created;
+    uint64_t frames_destroyed;
+    uint64_t frames_peak;
+    uint64_t frames_live;
+    uint64_t ffi_calls;
+} LuminaDiagnostics;
+
+/**
+ * Fills a diagnostics snapshot.
+ *
+ * @param out    Pointer to LuminaDiagnostics struct. Must not be NULL.
+ * @return LUMINA_OK on success, LUMINA_ERROR_NULL_PTR if out is NULL.
+ */
+LuminaError lumina_diagnostics_snapshot(LuminaDiagnostics *out);
+
+#ifdef __clang__
+#pragma clang assume_nonnull end
+#endif
 
 #ifdef __cplusplus
 }

@@ -10,11 +10,13 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::macro_metavars_in_unsafe)]
 
+pub mod diagnostics;
 pub mod error;
 pub mod handle;
 pub mod safety;
 
 use std::ffi::CStr;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -77,8 +79,13 @@ pub extern "C" fn lumina_player_create(
             core: Arc::new(Mutex::new(core)),
         });
 
+        let raw = Box::into_raw(player);
+        diagnostics::register_player(raw as *const u8);
+        #[cfg(debug_assertions)]
+        diagnostics::record_player_created();
+
         unsafe {
-            *out_player = Box::into_raw(player);
+            *out_player = raw;
         }
         Ok(())
     })
@@ -96,19 +103,31 @@ pub extern "C" fn lumina_player_destroy(player: *mut *mut LuminaPlayer) -> i32 {
             return Err(LuminaError::NullPtr);
         }
 
-        let player_ptr = unsafe { *player };
+        // Atomic swap: read the pointer and null it in one operation.
+        // This prevents TOCTOU races where two threads could both read
+        // a non-null pointer and attempt Box::from_raw on it.
+        let atomic = unsafe { AtomicPtr::from_ptr(player) };
+        let player_ptr = atomic.swap(std::ptr::null_mut(), Ordering::AcqRel);
+
         if player_ptr.is_null() {
             return Ok(()); // Already destroyed — no-op
         }
 
-        // Null out the caller's pointer first
-        unsafe {
-            *player = std::ptr::null_mut();
+        // Check registry: unknown pointer → double-free attempt
+        if !diagnostics::unregister_player(player_ptr as *const u8) {
+            tracing::error!(
+                "FFI: lumina_player_destroy called with unknown pointer {:?} (possible double-free)",
+                player_ptr
+            );
+            return Err(LuminaError::Internal);
         }
 
         // Reconstruct and drop
         let _player = unsafe { Box::from_raw(player_ptr) };
         // Drop: Arc<Mutex<CorePlayer>> runs CorePlayer::drop() which stops threads
+
+        #[cfg(debug_assertions)]
+        diagnostics::record_player_destroyed();
 
         Ok(())
     })
@@ -120,6 +139,9 @@ pub extern "C" fn lumina_player_destroy(player: *mut *mut LuminaPlayer) -> i32 {
 
 /// Starts or resumes playback.
 ///
+/// Preserves the current mute state — `CorePlayer::play()` would force unmute,
+/// so we use `play_with_muted()` to keep whatever the caller set.
+///
 /// # Safety
 /// `player` must be a valid non-null `LuminaPlayer` pointer.
 #[no_mangle]
@@ -129,7 +151,9 @@ pub extern "C" fn lumina_player_play(player: *mut LuminaPlayer) -> i32 {
         player.with_core(|core| {
             // Complete init if still pending
             core.check_init_complete();
-            core.play();
+            // Preserve mute state: play() forces unmute, play_with_muted() respects it
+            let muted = core.audio_handle().is_muted();
+            core.play_with_muted(muted);
         });
         Ok(())
     })
@@ -156,12 +180,84 @@ pub extern "C" fn lumina_player_pause(player: *mut LuminaPlayer) -> i32 {
 pub extern "C" fn lumina_player_seek(player: *mut LuminaPlayer, position_secs: f64) -> i32 {
     ffi_boundary(|| {
         let player = check_not_null!(player);
-        if !position_secs.is_finite() {
+        if !position_secs.is_finite() || position_secs > u64::MAX as f64 {
             return Err(LuminaError::InvalidArgument);
         }
         let position = Duration::from_secs_f64(position_secs.max(0.0));
         player.with_core(|core| core.seek(position));
         Ok(())
+    })
+}
+
+// =========================================================================
+// Audio control
+// =========================================================================
+
+/// Sets the muted state.
+///
+/// # Safety
+/// `player` must be a valid non-null `LuminaPlayer` pointer.
+#[no_mangle]
+pub extern "C" fn lumina_player_set_muted(player: *mut LuminaPlayer, muted: bool) -> i32 {
+    ffi_boundary(|| {
+        let player = check_not_null!(player);
+        player.with_core(|core| {
+            core.set_muted(muted);
+        });
+        Ok(())
+    })
+}
+
+/// Returns the current muted state.
+///
+/// Returns `true` (safe default: muted) if player is NULL.
+///
+/// # Safety
+/// `player` must be a valid `LuminaPlayer` pointer (or NULL).
+#[no_mangle]
+pub extern "C" fn lumina_player_is_muted(player: *const LuminaPlayer) -> bool {
+    ffi_boundary_or(true, || {
+        if player.is_null() {
+            return true;
+        }
+        let player = unsafe { &*player };
+        player.core.lock().audio_handle().is_muted()
+    })
+}
+
+/// Sets the volume level (0-100).
+///
+/// Values outside 0-100 are clamped.
+///
+/// # Safety
+/// `player` must be a valid non-null `LuminaPlayer` pointer.
+#[no_mangle]
+pub extern "C" fn lumina_player_set_volume(player: *mut LuminaPlayer, volume: i32) -> i32 {
+    ffi_boundary(|| {
+        let player = check_not_null!(player);
+        // Clamp in i32 domain first to avoid negative → large unsigned wrap
+        let clamped = volume.clamp(0, 100) as u32;
+        player.with_core(|core| {
+            core.set_volume(clamped);
+        });
+        Ok(())
+    })
+}
+
+/// Returns the current volume level (0-100).
+///
+/// Returns 0 (silent) if player is NULL.
+///
+/// # Safety
+/// `player` must be a valid `LuminaPlayer` pointer (or NULL).
+#[no_mangle]
+pub extern "C" fn lumina_player_volume(player: *const LuminaPlayer) -> i32 {
+    ffi_boundary_or(0, || {
+        if player.is_null() {
+            return 0;
+        }
+        let player = unsafe { &*player };
+        player.core.lock().audio_handle().volume() as i32
     })
 }
 
@@ -246,13 +342,23 @@ pub extern "C" fn lumina_player_poll_frame(player: *mut LuminaPlayer) -> *mut Lu
             return std::ptr::null_mut();
         }
         let player = unsafe { &*player };
-        let mut core = player.core.lock();
-
-        // Drive init forward if needed
-        core.check_init_complete();
-
-        match core.poll_frame() {
-            Some(frame) => Box::into_raw(Box::new(LuminaFrame { frame })),
+        let frame = {
+            let mut core = player.core.lock();
+            // Drive init forward if needed
+            core.check_init_complete();
+            core.poll_frame()
+        };
+        // Lock dropped — boxing and diagnostics outside critical section
+        match frame {
+            Some(frame) => {
+                let raw = Box::into_raw(Box::new(LuminaFrame { frame }));
+                #[cfg(debug_assertions)]
+                {
+                    diagnostics::register_frame(raw as *const u8);
+                    diagnostics::record_frame_created();
+                }
+                raw
+            }
             None => std::ptr::null_mut(),
         }
     })
@@ -335,7 +441,88 @@ pub extern "C" fn lumina_frame_release(frame: *mut LuminaFrame) {
         if frame.is_null() {
             return;
         }
+
+        #[cfg(debug_assertions)]
+        {
+            if !diagnostics::unregister_frame(frame as *const u8) {
+                tracing::error!(
+                    "FFI: lumina_frame_release called with unknown pointer {:?} (possible double-free)",
+                    frame
+                );
+                return; // Skip Box::from_raw on unknown pointer
+            }
+            diagnostics::record_frame_destroyed();
+        }
+
         let _frame = unsafe { Box::from_raw(frame) };
         // Drop frees the frame and its GPU surfaces
     });
+}
+
+// =========================================================================
+// Diagnostics
+// =========================================================================
+
+/// FFI diagnostics snapshot (matches `LuminaDiagnostics` in the C header).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LuminaDiagnostics {
+    /// Total players created over the process lifetime.
+    pub players_created: u64,
+    /// Total players destroyed over the process lifetime.
+    pub players_destroyed: u64,
+    /// Peak concurrent players.
+    pub players_peak: u64,
+    /// Current number of live players.
+    pub players_live: u64,
+    /// Total frames created over the process lifetime.
+    pub frames_created: u64,
+    /// Total frames released over the process lifetime.
+    pub frames_destroyed: u64,
+    /// Peak concurrent frames.
+    pub frames_peak: u64,
+    /// Current number of live frames.
+    pub frames_live: u64,
+    /// Total FFI calls made.
+    pub ffi_calls: u64,
+}
+
+/// Fills a diagnostics snapshot.
+///
+/// All fields are zero in release builds (debug_assertions disabled).
+///
+/// # Safety
+/// `out` must be a valid non-null pointer to `LuminaDiagnostics`.
+#[no_mangle]
+pub extern "C" fn lumina_diagnostics_snapshot(out: *mut LuminaDiagnostics) -> i32 {
+    ffi_boundary(|| {
+        if out.is_null() {
+            return Err(LuminaError::NullPtr);
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            let snap = diagnostics::snapshot();
+            unsafe {
+                *out = LuminaDiagnostics {
+                    players_created: snap.players_created,
+                    players_destroyed: snap.players_destroyed,
+                    players_peak: snap.players_peak,
+                    players_live: snap.players_live,
+                    frames_created: snap.frames_created,
+                    frames_destroyed: snap.frames_destroyed,
+                    frames_peak: snap.frames_peak,
+                    frames_live: snap.frames_live,
+                    ffi_calls: snap.ffi_calls,
+                };
+            }
+        }
+
+        #[cfg(not(debug_assertions))]
+        unsafe {
+            *out = LuminaDiagnostics::default();
+        }
+
+        Ok(())
+    })
 }
