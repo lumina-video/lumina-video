@@ -12,6 +12,7 @@ pub enum LuminaError {
     InitFailed = 3,
     Decode = 4,
     Internal = 5,
+    InvalidArgument = 6,
 }
 
 impl From<VideoError> for LuminaError {

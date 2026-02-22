@@ -1,8 +1,9 @@
 //! FFI conformance tests for lumina-video-ios.
 //!
 //! Tests are gated to macOS/iOS since the underlying decoders require
-//! those platforms. On Linux, the crate compiles but tests are skipped.
+//! those platforms. On other platforms, the crate compiles but tests are skipped.
 
+#![cfg(any(target_os = "ios", target_os = "macos"))]
 #![allow(unused_unsafe)]
 
 use lumina_video_ios::error::LuminaError;

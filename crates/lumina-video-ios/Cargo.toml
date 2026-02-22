@@ -10,5 +10,5 @@ crate-type = ["staticlib", "lib"]
 
 [dependencies]
 lumina-video-core = { path = "../lumina-video-core" }
-parking_lot = "0.12"
-tracing = "0.1"
+parking_lot = { workspace = true }
+tracing = { workspace = true }

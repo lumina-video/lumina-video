@@ -25,7 +25,18 @@ use lumina_video_core::video::VideoState;
 
 use crate::error::LuminaError;
 use crate::handle::{LuminaFrame, LuminaPlayer};
-use crate::safety::ffi_boundary;
+use crate::safety::{ffi_boundary, ffi_boundary_or};
+
+// =========================================================================
+// State constants (matching include/LuminaVideo.h)
+// =========================================================================
+
+const LUMINA_STATE_LOADING: i32 = 0;
+const LUMINA_STATE_READY: i32 = 1;
+const LUMINA_STATE_PLAYING: i32 = 2;
+const LUMINA_STATE_PAUSED: i32 = 3;
+const LUMINA_STATE_ENDED: i32 = 4;
+const LUMINA_STATE_ERROR: i32 = 5;
 
 // =========================================================================
 // Player lifecycle
@@ -44,6 +55,11 @@ pub extern "C" fn lumina_player_create(
     ffi_boundary(|| {
         if url.is_null() || out_player.is_null() {
             return Err(LuminaError::NullPtr);
+        }
+
+        // Null out first so callers always see NULL on failure
+        unsafe {
+            *out_player = std::ptr::null_mut();
         }
 
         let url_str = unsafe { CStr::from_ptr(url) }
@@ -140,6 +156,9 @@ pub extern "C" fn lumina_player_pause(player: *mut LuminaPlayer) -> i32 {
 pub extern "C" fn lumina_player_seek(player: *mut LuminaPlayer, position_secs: f64) -> i32 {
     ffi_boundary(|| {
         let player = check_not_null!(player);
+        if !position_secs.is_finite() {
+            return Err(LuminaError::InvalidArgument);
+        }
         let position = Duration::from_secs_f64(position_secs.max(0.0));
         player.with_core(|core| core.seek(position));
         Ok(())
@@ -156,20 +175,22 @@ pub extern "C" fn lumina_player_seek(player: *mut LuminaPlayer, position_secs: f
 /// `player` must be a valid `LuminaPlayer` pointer (or NULL).
 #[no_mangle]
 pub extern "C" fn lumina_player_state(player: *const LuminaPlayer) -> i32 {
-    if player.is_null() {
-        return 5; // LUMINA_STATE_ERROR
-    }
-    let player = unsafe { &*player };
-    let state = player.core.lock().state().clone();
-    match state {
-        VideoState::Loading => 0,
-        VideoState::Ready => 1,
-        VideoState::Playing { .. } => 2,
-        VideoState::Paused { .. } => 3,
-        VideoState::Ended => 4,
-        VideoState::Error(_) => 5,
-        VideoState::Buffering { .. } => 2, // Treat buffering as playing
-    }
+    ffi_boundary_or(LUMINA_STATE_ERROR, || {
+        if player.is_null() {
+            return LUMINA_STATE_ERROR;
+        }
+        let player = unsafe { &*player };
+        let state = player.core.lock().state().clone();
+        match state {
+            VideoState::Loading => LUMINA_STATE_LOADING,
+            VideoState::Ready => LUMINA_STATE_READY,
+            VideoState::Playing { .. } => LUMINA_STATE_PLAYING,
+            VideoState::Paused { .. } => LUMINA_STATE_PAUSED,
+            VideoState::Ended => LUMINA_STATE_ENDED,
+            VideoState::Error(_) => LUMINA_STATE_ERROR,
+            VideoState::Buffering { .. } => LUMINA_STATE_PLAYING,
+        }
+    })
 }
 
 /// Returns the current playback position in seconds.
@@ -178,11 +199,13 @@ pub extern "C" fn lumina_player_state(player: *const LuminaPlayer) -> i32 {
 /// `player` must be a valid `LuminaPlayer` pointer (or NULL).
 #[no_mangle]
 pub extern "C" fn lumina_player_position(player: *const LuminaPlayer) -> f64 {
-    if player.is_null() {
-        return 0.0;
-    }
-    let player = unsafe { &*player };
-    player.core.lock().position().as_secs_f64()
+    ffi_boundary_or(0.0, || {
+        if player.is_null() {
+            return 0.0;
+        }
+        let player = unsafe { &*player };
+        player.core.lock().position().as_secs_f64()
+    })
 }
 
 /// Returns the video duration in seconds, or -1.0 if unknown.
@@ -191,16 +214,18 @@ pub extern "C" fn lumina_player_position(player: *const LuminaPlayer) -> f64 {
 /// `player` must be a valid `LuminaPlayer` pointer (or NULL).
 #[no_mangle]
 pub extern "C" fn lumina_player_duration(player: *const LuminaPlayer) -> f64 {
-    if player.is_null() {
-        return -1.0;
-    }
-    let player = unsafe { &*player };
-    player
-        .core
-        .lock()
-        .duration()
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(-1.0)
+    ffi_boundary_or(-1.0, || {
+        if player.is_null() {
+            return -1.0;
+        }
+        let player = unsafe { &*player };
+        player
+            .core
+            .lock()
+            .duration()
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(-1.0)
+    })
 }
 
 // =========================================================================
@@ -216,19 +241,21 @@ pub extern "C" fn lumina_player_duration(player: *const LuminaPlayer) -> f64 {
 /// `player` must be a valid `LuminaPlayer` pointer (or NULL).
 #[no_mangle]
 pub extern "C" fn lumina_player_poll_frame(player: *mut LuminaPlayer) -> *mut LuminaFrame {
-    if player.is_null() {
-        return std::ptr::null_mut();
-    }
-    let player = unsafe { &*player };
-    let mut core = player.core.lock();
+    ffi_boundary_or(std::ptr::null_mut(), || {
+        if player.is_null() {
+            return std::ptr::null_mut();
+        }
+        let player = unsafe { &*player };
+        let mut core = player.core.lock();
 
-    // Drive init forward if needed
-    core.check_init_complete();
+        // Drive init forward if needed
+        core.check_init_complete();
 
-    match core.poll_frame() {
-        Some(frame) => Box::into_raw(Box::new(LuminaFrame { frame })),
-        None => std::ptr::null_mut(),
-    }
+        match core.poll_frame() {
+            Some(frame) => Box::into_raw(Box::new(LuminaFrame { frame })),
+            None => std::ptr::null_mut(),
+        }
+    })
 }
 
 // =========================================================================
@@ -241,12 +268,14 @@ pub extern "C" fn lumina_player_poll_frame(player: *mut LuminaPlayer) -> *mut Lu
 /// `frame` must be a valid `LuminaFrame` pointer (or NULL).
 #[no_mangle]
 pub extern "C" fn lumina_frame_width(frame: *const LuminaFrame) -> u32 {
-    if frame.is_null() {
-        return 0;
-    }
-    let frame = unsafe { &*frame };
-    let (w, _) = frame.frame.dimensions();
-    w
+    ffi_boundary_or(0, || {
+        if frame.is_null() {
+            return 0;
+        }
+        let frame = unsafe { &*frame };
+        let (w, _) = frame.frame.dimensions();
+        w
+    })
 }
 
 /// Returns the frame height in pixels.
@@ -255,12 +284,14 @@ pub extern "C" fn lumina_frame_width(frame: *const LuminaFrame) -> u32 {
 /// `frame` must be a valid `LuminaFrame` pointer (or NULL).
 #[no_mangle]
 pub extern "C" fn lumina_frame_height(frame: *const LuminaFrame) -> u32 {
-    if frame.is_null() {
-        return 0;
-    }
-    let frame = unsafe { &*frame };
-    let (_, h) = frame.frame.dimensions();
-    h
+    ffi_boundary_or(0, || {
+        if frame.is_null() {
+            return 0;
+        }
+        let frame = unsafe { &*frame };
+        let (_, h) = frame.frame.dimensions();
+        h
+    })
 }
 
 /// Returns the IOSurface for zero-copy Metal rendering.
@@ -272,21 +303,23 @@ pub extern "C" fn lumina_frame_height(frame: *const LuminaFrame) -> u32 {
 /// The returned IOSurface is valid only while the LuminaFrame is alive.
 #[no_mangle]
 pub extern "C" fn lumina_frame_iosurface(frame: *const LuminaFrame) -> *mut std::ffi::c_void {
-    if frame.is_null() {
-        return std::ptr::null_mut();
-    }
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        let frame = unsafe { &*frame };
-        if let Some(surface) = frame.frame.frame.as_macos_surface() {
-            return surface.io_surface;
+    ffi_boundary_or(std::ptr::null_mut(), || {
+        if frame.is_null() {
+            return std::ptr::null_mut();
         }
-    }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            let frame = unsafe { &*frame };
+            if let Some(surface) = frame.frame.frame.as_macos_surface() {
+                return surface.io_surface;
+            }
+        }
 
-    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-    let _ = frame;
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let _ = frame;
 
-    std::ptr::null_mut()
+        std::ptr::null_mut()
+    })
 }
 
 /// Releases a decoded video frame and frees its resources.
@@ -298,9 +331,11 @@ pub extern "C" fn lumina_frame_iosurface(frame: *const LuminaFrame) -> *mut std:
 /// After this call, the pointer is invalid.
 #[no_mangle]
 pub extern "C" fn lumina_frame_release(frame: *mut LuminaFrame) {
-    if frame.is_null() {
-        return;
-    }
-    let _frame = unsafe { Box::from_raw(frame) };
-    // Drop frees the frame and its GPU surfaces
+    ffi_boundary_or((), || {
+        if frame.is_null() {
+            return;
+        }
+        let _frame = unsafe { Box::from_raw(frame) };
+        // Drop frees the frame and its GPU surfaces
+    });
 }

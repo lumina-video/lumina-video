@@ -12,6 +12,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
 use parking_lot::Mutex;
 use poll_promise::Promise;
 
@@ -21,13 +22,13 @@ use crate::frame_queue::AudioThread;
 use crate::frame_queue::{DecodeThread, FrameQueue, FrameScheduler};
 #[cfg(target_os = "linux")]
 use crate::linux_video::ZeroCopyGStreamerDecoder;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 use crate::macos_video::MacOSVideoDecoder;
 use crate::sync_metrics::{SyncMetrics, SyncMetricsSnapshot};
 use crate::video::{VideoDecoderBackend, VideoError, VideoFrame, VideoMetadata, VideoState};
 
-/// Returns true if the URL points to a container format supported by AVFoundation on macOS.
-#[cfg(target_os = "macos")]
+/// Returns true if the URL points to a container format supported by AVFoundation.
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 fn is_avfoundation_supported_container(url: &str) -> bool {
     let path = url.split('?').next().unwrap_or(url);
     let ext = path
@@ -213,6 +214,20 @@ impl CorePlayer {
                 }
             };
 
+            #[cfg(target_os = "ios")]
+            let result: Result<Box<dyn VideoDecoderBackend + Send>, VideoError> = {
+                if is_avfoundation_supported_container(&url) {
+                    tracing::info!("Initializing iOS VideoToolbox decoder");
+                    MacOSVideoDecoder::new(&url)
+                        .map(|d| Box::new(d) as Box<dyn VideoDecoderBackend + Send>)
+                } else {
+                    Err(VideoError::DecoderInit(format!(
+                        "Unsupported container format on iOS: {}",
+                        url
+                    )))
+                }
+            };
+
             #[cfg(target_os = "android")]
             let result: Result<Box<dyn VideoDecoderBackend + Send>, VideoError> = {
                 use crate::android_video::AndroidVideoDecoder;
@@ -232,7 +247,12 @@ impl CorePlayer {
                 }
             };
 
-            #[cfg(not(any(target_os = "android", target_os = "macos", target_os = "linux")))]
+            #[cfg(not(any(
+                target_os = "android",
+                target_os = "ios",
+                target_os = "linux",
+                target_os = "macos",
+            )))]
             let result: Result<Box<dyn VideoDecoderBackend + Send>, VideoError> = {
                 let _ = &url;
                 Err(VideoError::DecoderInit(
@@ -356,7 +376,7 @@ impl CorePlayer {
     /// Starts or resumes playback.
     pub fn play(&mut self) {
         if let Some(ref thread) = self.decode_thread {
-            #[cfg(any(target_os = "android", target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "android", target_os = "ios", target_os = "linux", target_os = "macos"))]
             thread.set_muted(false); // sync mute state
             thread.play();
             self.scheduler.start();
@@ -373,7 +393,7 @@ impl CorePlayer {
     /// Starts playback with a specific mute state.
     pub fn play_with_muted(&mut self, muted: bool) {
         if let Some(ref thread) = self.decode_thread {
-            #[cfg(any(target_os = "android", target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "android", target_os = "ios", target_os = "linux", target_os = "macos"))]
             thread.set_muted(muted);
             thread.play();
             self.scheduler.start();
@@ -543,9 +563,17 @@ impl CorePlayer {
     pub fn poll_frame(&mut self) -> Option<VideoFrame> {
         let frame = self.scheduler.get_next_frame(&self.frame_queue);
         if let Some(ref f) = frame {
-            self.state = VideoState::Playing {
-                position: f.pts,
-            };
+            match self.state {
+                VideoState::Playing { .. } => {
+                    self.state = VideoState::Playing { position: f.pts };
+                }
+                VideoState::Paused { .. } => {
+                    self.state = VideoState::Paused { position: f.pts };
+                }
+                _ => {
+                    self.state = VideoState::Playing { position: f.pts };
+                }
+            }
         }
         frame
     }
@@ -661,7 +689,7 @@ impl CorePlayer {
     /// Sets the muted state and syncs to the decode thread.
     pub fn set_muted(&mut self, muted: bool) {
         self.audio_handle.set_muted(muted);
-        #[cfg(any(target_os = "android", target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "android", target_os = "ios", target_os = "linux", target_os = "macos"))]
         if let Some(ref thread) = self.decode_thread {
             thread.set_muted(muted);
         }

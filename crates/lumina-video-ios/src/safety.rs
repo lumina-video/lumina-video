@@ -25,6 +25,22 @@ where
     }
 }
 
+/// Wraps a non-Result FFI entry point with panic catching.
+///
+/// Returns `default` if the closure panics.
+pub fn ffi_boundary_or<T, F>(default: T, f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(val) => val,
+        Err(_panic) => {
+            tracing::error!("FFI: caught Rust panic at FFI boundary");
+            default
+        }
+    }
+}
+
 /// Validates a pointer is non-null, returning a reference.
 ///
 /// # Safety

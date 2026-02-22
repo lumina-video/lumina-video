@@ -32,6 +32,7 @@ typedef int32_t LuminaError;
 #define LUMINA_ERROR_INIT_FAILED   3
 #define LUMINA_ERROR_DECODE        4
 #define LUMINA_ERROR_INTERNAL      5
+#define LUMINA_ERROR_INVALID_ARG   6
 
 /* ========================================================================= */
 /* Playback state                                                             */
