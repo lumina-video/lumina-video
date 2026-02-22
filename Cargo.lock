@@ -3029,6 +3029,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumina-video-ios"
+version = "0.2.2"
+dependencies = [
+ "lumina-video-core",
+ "parking_lot",
+ "tracing",
+]
+
+[[package]]
 name = "lumina-video-web-demo"
 version = "0.2.2"
 dependencies = [
