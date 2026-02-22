@@ -6,7 +6,7 @@ description = "C FFI layer for lumina-video-core (iOS/Swift integration)"
 publish = false
 
 [lib]
-crate-type = ["staticlib"]
+crate-type = ["staticlib", "lib"]
 
 [dependencies]
 lumina-video-core = { path = "../lumina-video-core" }

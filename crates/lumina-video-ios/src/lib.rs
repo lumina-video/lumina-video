@@ -5,6 +5,11 @@
 //!
 //! See `docs/ios-ffi-contract.md` for the full contract.
 
+// FFI functions intentionally take raw pointers without `unsafe` on the fn signature.
+// Safety is enforced inside each function body via null checks + ffi_boundary().
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(clippy::macro_metavars_in_unsafe)]
+
 pub mod error;
 pub mod handle;
 pub mod safety;
