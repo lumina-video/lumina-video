@@ -7,6 +7,7 @@
 
 use lumina_video_ios::error::LuminaError;
 use lumina_video_ios::handle::{LuminaFrame, LuminaPlayer};
+use lumina_video_ios::LuminaDiagnostics;
 use std::ptr;
 
 // Import FFI functions
@@ -24,6 +25,11 @@ extern "C" {
     fn lumina_frame_height(frame: *const LuminaFrame) -> u32;
     fn lumina_frame_iosurface(frame: *const LuminaFrame) -> *mut std::ffi::c_void;
     fn lumina_frame_release(frame: *mut LuminaFrame);
+    fn lumina_player_set_muted(player: *mut LuminaPlayer, muted: bool) -> i32;
+    fn lumina_player_is_muted(player: *const LuminaPlayer) -> bool;
+    fn lumina_player_set_volume(player: *mut LuminaPlayer, volume: i32) -> i32;
+    fn lumina_player_volume(player: *const LuminaPlayer) -> i32;
+    fn lumina_diagnostics_snapshot(out: *mut LuminaDiagnostics) -> i32;
 }
 
 const LUMINA_OK: i32 = LuminaError::Ok as i32;
@@ -146,6 +152,34 @@ fn seek_null_player() {
     unsafe {
         let err = lumina_player_seek(ptr::null_mut(), 1.0);
         assert_eq!(err, LUMINA_ERROR_NULL_PTR);
+    }
+}
+
+#[test]
+fn seek_nan_and_infinity_return_invalid_arg() {
+    let err_invalid_arg: i32 = LuminaError::InvalidArgument as i32;
+    unsafe {
+        let url = b"https://example.com/test.mp4\0".as_ptr() as *const i8;
+        let mut player: *mut LuminaPlayer = ptr::null_mut();
+        let err = lumina_player_create(url, &mut player);
+        assert_eq!(err, LUMINA_OK);
+
+        let err = lumina_player_seek(player, f64::NAN);
+        assert_eq!(err, err_invalid_arg, "NAN seek should return INVALID_ARG");
+
+        let err = lumina_player_seek(player, f64::INFINITY);
+        assert_eq!(
+            err, err_invalid_arg,
+            "INFINITY seek should return INVALID_ARG"
+        );
+
+        let err = lumina_player_seek(player, f64::NEG_INFINITY);
+        assert_eq!(
+            err, err_invalid_arg,
+            "NEG_INFINITY seek should return INVALID_ARG"
+        );
+
+        lumina_player_destroy(&mut player);
     }
 }
 
@@ -307,5 +341,172 @@ fn thread_safety_create_destroy_different_thread() {
             assert_eq!(err, LUMINA_OK);
         });
         handle.join().unwrap();
+    }
+}
+
+// =========================================================================
+// Audio control — NULL safety
+// =========================================================================
+
+#[test]
+fn set_muted_null_player() {
+    unsafe {
+        let err = lumina_player_set_muted(ptr::null_mut(), true);
+        assert_eq!(err, LUMINA_ERROR_NULL_PTR);
+    }
+}
+
+#[test]
+fn is_muted_null_returns_true() {
+    unsafe {
+        // Safe default: muted
+        assert!(lumina_player_is_muted(ptr::null()));
+    }
+}
+
+#[test]
+fn set_volume_null_player() {
+    unsafe {
+        let err = lumina_player_set_volume(ptr::null_mut(), 50);
+        assert_eq!(err, LUMINA_ERROR_NULL_PTR);
+    }
+}
+
+#[test]
+fn volume_null_returns_zero() {
+    unsafe {
+        assert_eq!(lumina_player_volume(ptr::null()), 0);
+    }
+}
+
+// =========================================================================
+// Audio control — functional round-trips
+// =========================================================================
+
+#[test]
+fn mute_toggle_round_trip() {
+    unsafe {
+        let url = b"https://example.com/test.mp4\0".as_ptr() as *const i8;
+        let mut player: *mut LuminaPlayer = ptr::null_mut();
+        let err = lumina_player_create(url, &mut player);
+        assert_eq!(err, LUMINA_OK);
+
+        // Initially not muted (AudioHandle default)
+        assert!(!lumina_player_is_muted(player));
+
+        // Mute
+        let err = lumina_player_set_muted(player, true);
+        assert_eq!(err, LUMINA_OK);
+        assert!(lumina_player_is_muted(player));
+
+        // Unmute
+        let err = lumina_player_set_muted(player, false);
+        assert_eq!(err, LUMINA_OK);
+        assert!(!lumina_player_is_muted(player));
+
+        lumina_player_destroy(&mut player);
+    }
+}
+
+#[test]
+fn volume_set_get_round_trip() {
+    unsafe {
+        let url = b"https://example.com/test.mp4\0".as_ptr() as *const i8;
+        let mut player: *mut LuminaPlayer = ptr::null_mut();
+        let err = lumina_player_create(url, &mut player);
+        assert_eq!(err, LUMINA_OK);
+
+        let err = lumina_player_set_volume(player, 75);
+        assert_eq!(err, LUMINA_OK);
+        assert_eq!(lumina_player_volume(player), 75);
+
+        let err = lumina_player_set_volume(player, 0);
+        assert_eq!(err, LUMINA_OK);
+        assert_eq!(lumina_player_volume(player), 0);
+
+        lumina_player_destroy(&mut player);
+    }
+}
+
+#[test]
+fn volume_clamping() {
+    unsafe {
+        let url = b"https://example.com/test.mp4\0".as_ptr() as *const i8;
+        let mut player: *mut LuminaPlayer = ptr::null_mut();
+        let err = lumina_player_create(url, &mut player);
+        assert_eq!(err, LUMINA_OK);
+
+        // Above 100 → clamp to 100
+        let err = lumina_player_set_volume(player, 200);
+        assert_eq!(err, LUMINA_OK);
+        assert_eq!(lumina_player_volume(player), 100);
+
+        // Negative → clamp to 0 (critical: must clamp in i32 domain before cast to u32)
+        let err = lumina_player_set_volume(player, -50);
+        assert_eq!(err, LUMINA_OK);
+        assert_eq!(lumina_player_volume(player), 0);
+
+        lumina_player_destroy(&mut player);
+    }
+}
+
+// =========================================================================
+// Diagnostics
+// =========================================================================
+
+#[test]
+fn diagnostics_snapshot_null() {
+    unsafe {
+        let err = lumina_diagnostics_snapshot(ptr::null_mut());
+        assert_eq!(err, LUMINA_ERROR_NULL_PTR);
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn diagnostics_tracks_player_lifecycle() {
+    unsafe {
+        let mut before = std::mem::zeroed::<LuminaDiagnostics>();
+        lumina_diagnostics_snapshot(&mut before);
+
+        let url = b"https://example.com/test.mp4\0".as_ptr() as *const i8;
+        let mut player: *mut LuminaPlayer = ptr::null_mut();
+        let err = lumina_player_create(url, &mut player);
+        assert_eq!(err, LUMINA_OK);
+
+        let mut during = std::mem::zeroed::<LuminaDiagnostics>();
+        lumina_diagnostics_snapshot(&mut during);
+        assert!(during.players_created > before.players_created);
+        assert!(during.players_live > before.players_live);
+
+        lumina_player_destroy(&mut player);
+
+        let mut after = std::mem::zeroed::<LuminaDiagnostics>();
+        lumina_diagnostics_snapshot(&mut after);
+        assert!(after.players_destroyed > before.players_destroyed);
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn diagnostics_no_leak_after_100_cycles() {
+    unsafe {
+        let mut before = std::mem::zeroed::<LuminaDiagnostics>();
+        lumina_diagnostics_snapshot(&mut before);
+        let initial_live = before.players_live;
+
+        let url = b"https://example.com/test.mp4\0".as_ptr() as *const i8;
+        for _ in 0..100 {
+            let mut player: *mut LuminaPlayer = ptr::null_mut();
+            let err = lumina_player_create(url, &mut player);
+            assert_eq!(err, LUMINA_OK);
+            let err = lumina_player_destroy(&mut player);
+            assert_eq!(err, LUMINA_OK);
+        }
+
+        let mut after = std::mem::zeroed::<LuminaDiagnostics>();
+        lumina_diagnostics_snapshot(&mut after);
+        // No leaked players
+        assert_eq!(after.players_live, initial_live);
     }
 }
