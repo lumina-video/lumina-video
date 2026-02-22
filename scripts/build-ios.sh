@@ -6,7 +6,7 @@
 #   - aarch64-apple-ios-sim   (simulator)
 #
 # Usage:
-#   ./scripts/build-ios.sh [--release]
+#   ./scripts/build-ios.sh [--debug]    (default is release)
 
 set -euo pipefail
 
@@ -78,11 +78,16 @@ EXPECTED_SYMBOLS=(
     "_lumina_player_state"
     "_lumina_player_position"
     "_lumina_player_duration"
+    "_lumina_player_set_muted"
+    "_lumina_player_is_muted"
+    "_lumina_player_set_volume"
+    "_lumina_player_volume"
     "_lumina_player_poll_frame"
     "_lumina_frame_width"
     "_lumina_frame_height"
     "_lumina_frame_iosurface"
     "_lumina_frame_release"
+    "_lumina_diagnostics_snapshot"
 )
 
 # =========================================================================
