@@ -5,8 +5,10 @@ dist = "dist"
 [watch]
 ignore = ["dist"]
 
-# Copy video-bridge.js to dist
+# Bundle @moq/lite into IIFE (window.MoqLite) before build
+# Run `npm install` first if node_modules doesn't exist
+# Output goes to local moq-lite-bundle.js (copied to dist by data-trunk copy-file in HTML)
 [[hooks]]
-stage = "post_build"
+stage = "pre_build"
 command = "sh"
-command_args = ["-c", "cp -f ../lumina-video/src/media/video-bridge.js dist/ 2>/dev/null || true"]
+command_args = ["-c", "[ -d node_modules ] || npm install; node esbuild-moq.mjs"]

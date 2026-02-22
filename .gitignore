@@ -40,3 +40,17 @@ vendor/linux-x86_64/COPYING
 /strfry/
 /zap-stream-core/
 /zap.stream/
+
+# Build artifacts
+*.apk
+
+# Scratch docs / notes
+MOQ_AV_SYNC_PROBLEM.md
+MOQ_VT_CORRUPTION.md
+code-simplifier-swift-ios.md
+
+# Local dev/test files
+.envrc
+test-ws-moq.mjs
+zapstore.yaml
+crates/lumina-video-web-demo/test-moq.html

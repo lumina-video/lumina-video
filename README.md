@@ -181,8 +181,11 @@ cargo install trunk
 
 # Run the web demo
 cd crates/lumina-video-web-demo
+npm install   # Required for MoQ esbuild bundling
 trunk serve --open
 ```
+
+MoQ live streaming works in the browser via WebSocket polyfill — enter a `moq://` URL in the demo to connect.
 
 </details>
 
@@ -261,7 +264,7 @@ cargo run --package lumina-video-demo --features windows-native-video
 |------|-------------|--------|
 | Windows | Zero-copy diagnostics + A/V sync bridge | Needs porting to lumina-video |
 | MoQ | Frame pixelation on late join (IDR resync) | Investigating HTTP group fetch |
-| MoQ | Linux / Android / Windows / Web testing | Audio pipeline ready, needs platform validation |
+| MoQ | Linux / Android / Windows testing | Audio pipeline ready, needs platform validation |
 | MoQ | zap.stream connectivity | Upstream PR submitted |
 
 > **Testers wanted!** Windows zero-copy needs validation on real hardware.
@@ -375,13 +378,13 @@ lumina-video = { git = "https://github.com/lumina-video/lumina-video", features 
 | AAC + Opus audio (symphonia + libopus → cpal) | Working (macOS); Linux/Android ready |
 | A/V sync (drift correction + stall-on-underrun) | Working |
 | Late-join IDR resync | In progress |
-| Linux / Android / Windows / Web | Audio pipeline ready (macOS tested) |
+| Web (WebCodecs + AudioWorklet) | Working |
+| Linux / Android / Windows | Audio pipeline ready (macOS tested) |
 | Nostr NIP-53 stream discovery | In progress |
 
 **Tested relays:**
 
 - `moq://cdn.moq.dev` (kixelated — BBB demo)
-- `moq://interop-relay.cloudflare.mediaoverquic.com:443` (Cloudflare)
 
 ```rust
 // Connect to a MoQ live stream
@@ -443,6 +446,10 @@ lumina-video                            GPU backend: wgpu (Vulkan, Metal, DX12, 
 ├── sync_metrics.rs    # A/V drift tracking and quality metrics
 ├── moq_audio.rs       # MoQ audio pipeline (AAC/Opus decode → ring buffer)
 ├── moq_decoder.rs     # MoQ video decode + shared state (VTDecoder, MediaCodec)
+├── web_moq_decoder.rs # MoQ WASM bridge (WebCodecs via JS interop)
+├── web/
+│   ├── moq-transport-bridge.js  # MoQ transport + WebCodecs decode
+│   └── moq-audio-worklet.js     # AudioWorklet ring buffer
 ├── macos_video.rs     # VideoToolbox (macOS)
 ├── linux_video.rs     # GStreamer + VA-API (Linux)
 ├── windows_video.rs   # Media Foundation + DXVA (Windows)
