@@ -41,6 +41,8 @@ pub use lumina_video_core::subtitles;
 
 // audio_ring_buffer: pub in core for cross-crate access. NOT public API — do not stabilize.
 // Required by moq_audio.rs (super::audio_ring_buffer::RingBufferConfig).
+// Unused without the "moq" feature, but the cfg must match core's module gate.
+#[allow(unused_imports)]
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 pub(crate) use lumina_video_core::audio_ring_buffer;
 
