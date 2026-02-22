@@ -1,6 +1,39 @@
 import Foundation
+import AVFoundation
 import QuartzCore
 import CLuminaVideo
+
+/// AVAudioSession configuration for video playback.
+public struct AudioSessionConfig {
+    public let category: AVAudioSession.Category
+    public let options: AVAudioSession.CategoryOptions
+
+    /// Default: `.playback` category with `.mixWithOthers` option.
+    public static let `default` = AudioSessionConfig(
+        category: .playback,
+        options: .mixWithOthers
+    )
+}
+
+/// Weak-target proxy that breaks the CADisplayLink → LuminaVideoPlayer retain cycle.
+///
+/// CADisplayLink strongly retains its target. Without this proxy, the cycle
+/// `LuminaVideoPlayer → displayLink → LuminaVideoPlayer` prevents deallocation.
+private class DisplayLinkProxy {
+    weak var target: LuminaVideoPlayer?
+
+    init(target: LuminaVideoPlayer) {
+        self.target = target
+    }
+
+    @objc func displayLinkFired(_ link: CADisplayLink) {
+        guard let target = target else {
+            link.invalidate()
+            return
+        }
+        target.displayLinkFired(link)
+    }
+}
 
 /// Swift wrapper around the lumina-video Rust FFI.
 ///
@@ -8,7 +41,6 @@ import CLuminaVideo
 /// and decoded video frames. Matches the DamusVideoPlayer API shape.
 ///
 /// - Note: Must be used from the main thread (@MainActor).
-/// - Note: Audio is not yet implemented (placeholder `is_muted`).
 @MainActor
 public final class LuminaVideoPlayer: ObservableObject {
     // MARK: - Published properties
@@ -31,8 +63,26 @@ public final class LuminaVideoPlayer: ObservableObject {
     /// Video dimensions from the first decoded frame.
     @Published public private(set) var video_size: CGSize? = nil
 
-    /// Mute state placeholder (audio not yet implemented).
-    @Published public var is_muted: Bool = true
+    /// Mute state. Defaults to `true` (muted) — appropriate for autoplay/feed scenarios.
+    /// Setting this property immediately syncs to the Rust player.
+    @Published public var is_muted: Bool = true {
+        didSet {
+            guard oldValue != is_muted, let ptr = playerPtr else { return }
+            lumina_player_set_muted(ptr, is_muted)
+        }
+    }
+
+    /// Volume level (0-100). Defaults to 100 (full volume).
+    /// Setting this property immediately syncs to the Rust player.
+    @Published public var volume: Int32 = 100 {
+        didSet {
+            guard oldValue != volume, let ptr = playerPtr else { return }
+            lumina_player_set_volume(ptr, volume)
+        }
+    }
+
+    /// Whether the video URL has audio tracks. Detected asynchronously after init.
+    @Published public private(set) var has_audio: Bool = false
 
     // MARK: - Delegate
 
@@ -57,9 +107,13 @@ public final class LuminaVideoPlayer: ObservableObject {
     /// The player starts in `.loading` state. Decoder initialization happens
     /// asynchronously in Rust. Poll via CADisplayLink detects when ready.
     ///
-    /// - Parameter url: Video URL string (http/https/file).
+    /// Audio session is configured with the provided config (default: `.playback` + `.mixWithOthers`).
+    ///
+    /// - Parameters:
+    ///   - url: Video URL string (http/https/file path).
+    ///   - audioSessionConfig: Audio session configuration. Defaults to `.default`.
     /// - Throws: `LuminaVideoError` if the URL is invalid or creation fails.
-    public init(url: String) throws {
+    public init(url: String, audioSessionConfig: AudioSessionConfig = .default) throws {
         var ptr: OpaquePointer?
         let err = url.withCString { cStr in
             lumina_player_create(cStr, &ptr)
@@ -68,12 +122,25 @@ public final class LuminaVideoPlayer: ObservableObject {
             throw LuminaVideoError(rawValue: err) ?? .internal
         }
         self.playerPtr = validPtr
+
+        // Configure audio session
+        configureAudioSession(audioSessionConfig)
+
+        // Sync initial mute state to Rust player
+        lumina_player_set_muted(validPtr, is_muted)
+
         startDisplayLink()
+        detectAudioTracks(url: url)
     }
 
     deinit {
-        displayLink?.invalidate()
-        displayLink = nil
+        // CADisplayLink must be invalidated on the run loop it was added to.
+        // @MainActor does NOT isolate deinit, so dispatch to main as a safety net.
+        // (The DisplayLinkProxy already handles cleanup via its weak reference,
+        // but this ensures immediate invalidation rather than waiting for next tick.)
+        if let link = displayLink {
+            RunLoop.main.perform { link.invalidate() }
+        }
         if playerPtr != nil {
             lumina_player_destroy(&playerPtr)
         }
@@ -100,10 +167,43 @@ public final class LuminaVideoPlayer: ObservableObject {
         lumina_player_seek(ptr, position)
     }
 
+    // MARK: - Audio session
+
+    private func configureAudioSession(_ config: AudioSessionConfig) {
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(config.category, options: config.options)
+            try session.setActive(true)
+        } catch {
+            // Non-fatal: audio may not work but video playback continues
+        }
+    }
+
+    // MARK: - Audio track detection
+
+    /// Detects whether the video URL has audio tracks.
+    private func detectAudioTracks(url: String) {
+        // Normalize URL: plain paths (no scheme) → file URL, otherwise parse as URL string
+        let videoURL: URL
+        if url.contains("://") {
+            guard let parsed = URL(string: url) else { return }
+            videoURL = parsed
+        } else {
+            videoURL = URL(fileURLWithPath: url)
+        }
+        let asset = AVURLAsset(url: videoURL)
+        Task { @MainActor [weak self] in
+            let tracks = try? await asset.load(.tracks)
+            let hasAudioTrack = tracks?.contains(where: { $0.mediaType == .audio }) ?? false
+            self?.has_audio = hasAudioTrack
+        }
+    }
+
     // MARK: - Display link
 
     private func startDisplayLink() {
-        let link = CADisplayLink(target: self, selector: #selector(displayLinkFired))
+        let proxy = DisplayLinkProxy(target: self)
+        let link = CADisplayLink(target: proxy, selector: #selector(DisplayLinkProxy.displayLinkFired))
         link.add(to: .main, forMode: .common)
         displayLink = link
     }
@@ -119,7 +219,7 @@ public final class LuminaVideoPlayer: ObservableObject {
 
     // MARK: - Poll loop
 
-    @objc private func displayLinkFired(_ link: CADisplayLink) {
+    @objc fileprivate func displayLinkFired(_ link: CADisplayLink) {
         guard let ptr = playerPtr else { return }
 
         // 1. Poll state
@@ -139,10 +239,12 @@ public final class LuminaVideoPlayer: ObservableObject {
             }
         }
 
-        // 2. Poll position / duration
-        current_time = lumina_player_position(ptr)
+        // 2. Poll position / duration (only update @Published when changed to avoid unnecessary SwiftUI re-renders)
+        let newTime = lumina_player_position(ptr)
+        if newTime != current_time { current_time = newTime }
         let dur = lumina_player_duration(ptr)
-        duration = dur < 0 ? nil : dur
+        let newDuration: TimeInterval? = dur < 0 ? nil : dur
+        if newDuration != duration { duration = newDuration }
 
         // 3. Poll frame
         if let framePtr = lumina_player_poll_frame(ptr) {
