@@ -76,15 +76,6 @@ use std::fmt;
 // only available on certain platforms. This section provides compile-time
 // verification with clear error messages for unsupported configurations.
 
-/// Compile-time check for iOS - not yet implemented
-#[cfg(target_os = "ios")]
-compile_error!(
-    "The `zero-copy` feature is not yet supported on iOS. \
-     While IOSurface import is technically possible via Metal, the implementation \
-     has not been completed. Please disable the `zero-copy` feature on iOS, \
-     or contribute an implementation! See the macOS module for reference."
-);
-
 /// Compile-time check for WebAssembly - not supported
 #[cfg(target_family = "wasm")]
 compile_error!(
@@ -125,6 +116,7 @@ compile_error!(
 pub const fn is_platform_supported() -> bool {
     cfg!(any(
         target_os = "macos",
+        target_os = "ios",
         target_os = "linux",
         target_os = "android",
         target_os = "windows"
@@ -276,7 +268,7 @@ impl ZeroCopyStats {
 ///     };
 /// }
 /// ```
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod macos {
     use super::ZeroCopyError;
     use metal::foreign_types::ForeignType;
@@ -381,8 +373,11 @@ pub mod macos {
                     descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
                     // Note: For IOSurface-backed textures created via newTextureWithDescriptor:iosurface:plane:,
                     // Metal ignores the storage mode in the descriptor - the IOSurface dictates memory layout.
-                    // We set Managed here as the nominal value for macOS texture compatibility.
+                    // macOS uses Managed (CPU+GPU); iOS uses Shared (unified memory).
+                    #[cfg(target_os = "macos")]
                     descriptor.set_storage_mode(metal::MTLStorageMode::Managed);
+                    #[cfg(target_os = "ios")]
+                    descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
 
                     // Get raw pointers for objc msg_send
                     let device_ptr = metal_device_guard.as_ptr();

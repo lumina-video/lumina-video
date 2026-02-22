@@ -69,7 +69,7 @@ use std::sync::Mutex;
 /// The [`MacOSGpuSurface::new()`] constructor is unsafe because:
 /// - The `io_surface` pointer must be a valid `IOSurfaceRef` from `CVPixelBufferGetIOSurface()`
 /// - The `owner` must keep the underlying `CVPixelBuffer` alive for the surface's lifetime
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub struct MacOSGpuSurface {
     /// The IOSurface pointer (from CVPixelBufferGetIOSurface)
     pub io_surface: *mut std::ffi::c_void,
@@ -87,7 +87,7 @@ pub struct MacOSGpuSurface {
     _owner: Arc<dyn std::any::Any + Send + Sync>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 impl MacOSGpuSurface {
     /// Creates a new macOS GPU surface from an IOSurface.
     ///
@@ -121,7 +121,7 @@ impl MacOSGpuSurface {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 impl Clone for MacOSGpuSurface {
     fn clone(&self) -> Self {
         Self {
@@ -135,7 +135,7 @@ impl Clone for MacOSGpuSurface {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 impl std::fmt::Debug for MacOSGpuSurface {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MacOSGpuSurface")
@@ -150,9 +150,9 @@ impl std::fmt::Debug for MacOSGpuSurface {
 // SAFETY: The IOSurface pointer is safe to send/sync because:
 // - The underlying CVPixelBuffer is kept alive by Arc<dyn Any + Send + Sync>
 // - IOSurface is thread-safe (Apple's documentation)
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 unsafe impl Send for MacOSGpuSurface {}
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 unsafe impl Sync for MacOSGpuSurface {}
 
 /// Windows GPU surface holding a D3D11 shared handle for zero-copy import.
@@ -833,8 +833,8 @@ pub enum DecodedFrame {
     /// CPU-accessible frame data (works on all platforms)
     Cpu(CpuFrame),
 
-    /// macOS GPU surface for zero-copy rendering via IOSurface → Metal
-    #[cfg(target_os = "macos")]
+    /// macOS/iOS GPU surface for zero-copy rendering via IOSurface → Metal
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     MacOS(MacOSGpuSurface),
 
     /// Windows GPU surface for zero-copy rendering via D3D11 shared handle → D3D12
@@ -855,7 +855,7 @@ impl DecodedFrame {
     pub fn dimensions(&self) -> (u32, u32) {
         match self {
             DecodedFrame::Cpu(frame) => (frame.width, frame.height),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             DecodedFrame::MacOS(surface) => (surface.width, surface.height),
             #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
             DecodedFrame::Windows(surface) => (surface.width, surface.height),
@@ -870,7 +870,7 @@ impl DecodedFrame {
     pub fn format(&self) -> PixelFormat {
         match self {
             DecodedFrame::Cpu(frame) => frame.format,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             DecodedFrame::MacOS(surface) => surface.format,
             #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
             DecodedFrame::Windows(surface) => surface.format,
@@ -885,7 +885,7 @@ impl DecodedFrame {
     pub fn as_cpu(&self) -> Option<&CpuFrame> {
         match self {
             DecodedFrame::Cpu(frame) => Some(frame),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             DecodedFrame::MacOS(_) => None,
             #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
             DecodedFrame::Windows(_) => None,
@@ -896,8 +896,8 @@ impl DecodedFrame {
         }
     }
 
-    /// Attempts to get a reference to the macOS GPU surface.
-    #[cfg(target_os = "macos")]
+    /// Attempts to get a reference to the macOS/iOS GPU surface.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn as_macos_surface(&self) -> Option<&MacOSGpuSurface> {
         match self {
             DecodedFrame::MacOS(surface) => Some(surface),
@@ -936,7 +936,7 @@ impl DecodedFrame {
     pub fn is_gpu_surface(&self) -> bool {
         match self {
             DecodedFrame::Cpu(_) => false,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             DecodedFrame::MacOS(_) => true,
             #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
             DecodedFrame::Windows(_) => true,
@@ -1027,7 +1027,7 @@ pub enum HwAccelType {
 
 impl HwAccelType {
     /// Returns the best hardware acceleration for the current platform.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn platform_default() -> Self {
         HwAccelType::VideoToolbox
     }
@@ -1050,6 +1050,7 @@ impl HwAccelType {
 
     #[cfg(not(any(
         target_os = "macos",
+        target_os = "ios",
         target_os = "windows",
         target_os = "linux",
         target_os = "android"

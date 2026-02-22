@@ -1251,6 +1251,7 @@ checksum = "89a09f22a6c6069a18470eb92d2298acf25463f14256d24778e1230d789a2aec"
 dependencies = [
  "bitflags 2.10.0",
  "block2 0.6.2",
+ "libc",
  "objc2 0.6.3",
 ]
 
@@ -2970,8 +2971,8 @@ dependencies = [
  "block2 0.6.2",
  "bytemuck",
  "cpal",
- "crossbeam",
  "crossbeam-channel",
+ "dispatch2",
  "drm-fourcc",
  "ffmpeg-next",
  "gstreamer",
