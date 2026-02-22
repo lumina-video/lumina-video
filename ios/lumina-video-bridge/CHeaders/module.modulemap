@@ -1,0 +1,4 @@
+module CLuminaVideo {
+    header "include/LuminaVideo.h"
+    export *
+}

@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use ash::vk;
 
-use super::video::VideoError;
+use crate::video::VideoError;
 
 /// RAII wrapper for Android hardware buffer to ensure proper cleanup.
 ///

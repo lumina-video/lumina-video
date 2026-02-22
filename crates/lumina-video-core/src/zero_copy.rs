@@ -27,7 +27,7 @@
 //! | Linux | Vulkan | DMABuf (VA-API, V4L2) | Partial (single-plane only) |
 //! | Android | Vulkan | AHardwareBuffer (MediaCodec) | Rust ready, Java pending |
 //! | Windows | D3D12 | D3D11 Shared Handle | Partial (missing fence sync) |
-//! | iOS | Metal | IOSurface | Not yet implemented |
+//! | iOS | Metal | IOSurface | Shared with macOS (Metal/IOSurface) |
 //! | Web/WASM | WebGPU | N/A | Not supported (no external memory) |
 //!
 //! # Feature Flag
@@ -40,7 +40,7 @@
 //! lumina-video = { version = "..." }
 //! ```
 //!
-//! To disable zero-copy (e.g., for unsupported platforms like iOS or WASM),
+//! To disable zero-copy (e.g., for unsupported platforms like WASM),
 //! use `default-features = false`:
 //!
 //! ```toml
@@ -48,7 +48,7 @@
 //! lumina-video = { version = "...", default-features = false, features = ["macos-native-video"] }
 //! ```
 //!
-//! **Note:** On unsupported platforms (iOS, WASM, etc.), compilation will fail
+//! **Note:** On unsupported platforms (WASM, etc.), compilation will fail
 //! with a clear error message about platform support if zero-copy is enabled.
 //!
 //! # How It Works
@@ -75,15 +75,6 @@ use std::fmt;
 // The zero-copy feature requires platform-specific GPU interop APIs that are
 // only available on certain platforms. This section provides compile-time
 // verification with clear error messages for unsupported configurations.
-
-/// Compile-time check for iOS - not yet implemented
-#[cfg(target_os = "ios")]
-compile_error!(
-    "The `zero-copy` feature is not yet supported on iOS. \
-     While IOSurface import is technically possible via Metal, the implementation \
-     has not been completed. Please disable the `zero-copy` feature on iOS, \
-     or contribute an implementation! See the macOS module for reference."
-);
 
 /// Compile-time check for WebAssembly - not supported
 #[cfg(target_family = "wasm")]
@@ -118,13 +109,14 @@ compile_error!(
 ///
 /// # Supported Platforms
 ///
-/// - macOS: Metal backend with IOSurface
+/// - macOS/iOS: Metal backend with IOSurface
 /// - Linux: Vulkan backend with DMABuf
 /// - Android: Vulkan backend with AHardwareBuffer
 /// - Windows: D3D12 backend with D3D11 shared handles
 pub const fn is_platform_supported() -> bool {
     cfg!(any(
         target_os = "macos",
+        target_os = "ios",
         target_os = "linux",
         target_os = "android",
         target_os = "windows"
@@ -276,7 +268,7 @@ impl ZeroCopyStats {
 ///     };
 /// }
 /// ```
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod macos {
     use super::ZeroCopyError;
     use metal::foreign_types::ForeignType;
@@ -381,8 +373,11 @@ pub mod macos {
                     descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
                     // Note: For IOSurface-backed textures created via newTextureWithDescriptor:iosurface:plane:,
                     // Metal ignores the storage mode in the descriptor - the IOSurface dictates memory layout.
-                    // We set Managed here as the nominal value for macOS texture compatibility.
+                    // macOS uses Managed (CPU+GPU); iOS uses Shared (unified memory).
+                    #[cfg(target_os = "macos")]
                     descriptor.set_storage_mode(metal::MTLStorageMode::Managed);
+                    #[cfg(target_os = "ios")]
+                    descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
 
                     // Get raw pointers for objc msg_send
                     let device_ptr = metal_device_guard.as_ptr();
@@ -2402,7 +2397,7 @@ pub mod android {
         height: u32,
         hw_buffer_format: u32,
     ) -> Result<Vec<wgpu::Texture>, ZeroCopyError> {
-        use crate::media::android_video::AHARDWAREBUFFER_FORMAT_YV12;
+        use crate::android_video::AHARDWAREBUFFER_FORMAT_YV12;
         let is_yv12 = hw_buffer_format == AHARDWAREBUFFER_FORMAT_YV12;
         if ahardware_buffer.is_null() {
             return Err(ZeroCopyError::InvalidResource(

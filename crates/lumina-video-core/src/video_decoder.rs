@@ -28,7 +28,7 @@
 
 use std::time::Duration;
 
-use super::video::{
+use crate::video::{
     CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend, VideoError,
     VideoFrame, VideoMetadata,
 };

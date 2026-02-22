@@ -42,12 +42,12 @@ use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use std::str::FromStr;
 
-use crate::media::{
+use crate::video::{
     CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend, VideoError,
     VideoFrame, VideoMetadata,
 };
 
-use crate::media::video::{DmaBufPlane, LinuxGpuSurface};
+use crate::video::{DmaBufPlane, LinuxGpuSurface};
 
 // =============================================================================
 // DMABuf Information Types

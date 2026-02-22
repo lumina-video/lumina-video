@@ -524,7 +524,7 @@ impl std::fmt::Debug for AudioSamples {
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 mod cpal_impl {
     use super::*;
-    use crate::media::audio_ring_buffer::{
+    use crate::audio_ring_buffer::{
         audio_ring_buffer, ReadSample, RingBufferConfig, RingBufferConsumer, RingBufferProducer,
     };
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};

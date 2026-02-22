@@ -38,10 +38,10 @@
 //! uses DXVA2/D3D11VA for hardware decoding when available. The decoder falls
 //! back to software decode if hardware acceleration fails.
 
-use super::windows_audio::{AudioFormatInfo, AudioFrame};
+use crate::windows_audio::{AudioFormatInfo, AudioFrame};
 #[cfg(feature = "zero-copy")]
-use crate::media::video::WindowsGpuSurface;
-use crate::media::{
+use crate::video::WindowsGpuSurface;
+use crate::video::{
     CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend, VideoError,
     VideoFrame, VideoMetadata,
 };
