@@ -12,7 +12,10 @@ use std::sync::Arc;
 
 use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
-use lumina_video::media::{WebVideoPlayer, WebVideoRenderResources, WebVideoTexture};
+use lumina_video::media::{
+    WebMoqSession, WebMoqSessionState, WebMoqStats, WebVideoPlayer, WebVideoRenderResources,
+    WebVideoTexture,
+};
 use parking_lot::Mutex;
 use wasm_bindgen::JsCast;
 
@@ -98,6 +101,10 @@ const SAMPLE_VIDEOS: &[(&str, &str)] = &[
     (
         "Tears of Steel (MP4)",
         "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4",
+    ),
+    (
+        "MoQ Live (localhost)",
+        "moq://localhost:4443/anon/bbb",
     ),
 ];
 
@@ -387,6 +394,10 @@ mod icons {
     }
 }
 
+/// Slot for passing [`WebMoqSession`] back from async tasks.
+/// WASM is single-threaded, so `Rc<RefCell>` is safe.
+type MoqSessionSlot = std::rc::Rc<std::cell::RefCell<Option<WebMoqSession>>>;
+
 fn main() {
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
 
@@ -424,10 +435,30 @@ fn main() {
     });
 }
 
+/// MoQ session state for async connection lifecycle.
+enum MoqConnectState {
+    /// Not connecting
+    Idle,
+    /// Async connect in progress
+    Connecting,
+    /// Connected and catalog received, waiting to start playback
+    CatalogReady,
+    /// Starting playback (async audio init)
+    StartingPlayback,
+    /// Fully playing
+    Playing,
+}
+
 /// UI state for the lumina-video web demo application.
 struct DemoApp {
-    /// Active video player instance
+    /// Active video player instance (HLS/MP4)
     player: Option<WebVideoPlayer>,
+    /// Active MoQ session (live streaming)
+    moq_session: Option<WebMoqSession>,
+    /// MoQ connection state machine
+    moq_connect_state: MoqConnectState,
+    /// Status text for MoQ connection
+    moq_status: String,
     /// Shared state for zero-copy rendering (stored in CallbackResources)
     video_state: Option<Arc<Mutex<WebVideoState>>>,
     /// User-entered URL for custom video loading
@@ -448,6 +479,16 @@ struct DemoApp {
     is_seeking: bool,
     /// Current seek position while dragging (0.0-1.0)
     seek_position: f32,
+    /// Slot for passing MoQ session back from async tasks
+    moq_session_slot: MoqSessionSlot,
+    /// Whether the stats overlay is visible (toggled with 'S')
+    show_stats: bool,
+    /// FPS tracking: (timestamp, frame_count) at start of window
+    fps_window_start: (f64, u64),
+    /// Measured FPS
+    measured_fps: f32,
+    /// Cached extended stats (updated each frame when stats panel is visible)
+    cached_stats: Option<WebMoqStats>,
 }
 
 impl DemoApp {
@@ -471,6 +512,9 @@ impl DemoApp {
 
         Self {
             player: None,
+            moq_session: None,
+            moq_connect_state: MoqConnectState::Idle,
+            moq_status: String::new(),
             video_state,
             url_input: SAMPLE_VIDEOS
                 .first()
@@ -484,6 +528,11 @@ impl DemoApp {
             mouse_over_video: false,
             is_seeking: false,
             seek_position: 0.0,
+            moq_session_slot: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            show_stats: false,
+            fps_window_start: (0.0, 0),
+            measured_fps: 0.0,
+            cached_stats: None,
         }
     }
 
@@ -493,11 +542,34 @@ impl DemoApp {
         self.controls_visible = true;
         self.last_interaction = current_time();
 
-        // Clear existing texture
+        // Clear existing state
+        self.player = None;
+        self.moq_session = None;
+        self.moq_connect_state = MoqConnectState::Idle;
+        self.moq_status.clear();
         if let Some(state) = &self.video_state {
             let mut state = state.lock();
             state.texture = None;
             state.dims = (0, 0);
+        }
+
+        // Check if this is a MoQ URL
+        if WebMoqSession::is_moq_url(url) {
+            match WebMoqSession::new(url) {
+                Ok(session) => {
+                    self.moq_status = "Connecting...".to_string();
+                    self.moq_connect_state = MoqConnectState::Connecting;
+                    self.moq_session = Some(session);
+                    // Spawn the async connect
+                    // We use a shared pointer to communicate back
+                    // The actual connect is driven from poll in update()
+                }
+                Err(e) => {
+                    self.error = Some(format!("Failed to create MoQ session: {:?}", e));
+                    self.show_picker = true;
+                }
+            }
+            return;
         }
 
         match WebVideoPlayer::new(url) {
@@ -512,6 +584,124 @@ impl DemoApp {
                 self.error = Some(format!("Failed to load: {:?}", e));
                 self.show_picker = true;
             }
+        }
+    }
+
+    /// Drive the MoQ session state machine. Called each frame.
+    fn poll_moq_session(&mut self, ctx: &egui::Context) {
+        // Recover session from async task slot when moq_session was temporarily taken.
+        // This MUST happen before the moq_session guard below, because spawn_local
+        // tasks (connect, start_playback) take ownership of the session and return
+        // it via the slot when done. Without this, the guard returns early and the
+        // slot is never checked.
+        if self.moq_session.is_none() {
+            match self.moq_connect_state {
+                MoqConnectState::Connecting | MoqConnectState::StartingPlayback => {
+                    if let Some(session) = self.moq_session_slot.borrow_mut().take() {
+                        self.moq_session = Some(session);
+                    } else {
+                        // Async task still in progress — schedule repaint and wait
+                        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
+
+        let Some(session) = &mut self.moq_session else {
+            return;
+        };
+
+        match self.moq_connect_state {
+            MoqConnectState::Connecting => {
+                // We need to spawn the async connect on the first poll
+                // Check if the session is still in Init state (connect not started yet)
+                if matches!(session.state(), WebMoqSessionState::Init) {
+                    // Take ownership temporarily to spawn the async task
+                    let Some(mut session) = self.moq_session.take() else {
+                        return;
+                    };
+                    let ctx_clone = ctx.clone();
+                    let slot = self.moq_session_slot.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        if let Err(e) = session.connect().await {
+                            web_sys::console::error_1(
+                                &format!("MoQ connect failed: {:?}", e).into(),
+                            );
+                        }
+                        *slot.borrow_mut() = Some(session);
+                        ctx_clone.request_repaint();
+                    });
+                    self.moq_status = "Connecting...".to_string();
+                    return;
+                }
+
+                // Session recovered from slot — check state
+                match session.state() {
+                    WebMoqSessionState::Connected | WebMoqSessionState::CatalogReady => {
+                        self.moq_status = "Connected, waiting for catalog...".to_string();
+                    }
+                    WebMoqSessionState::Error(e) => {
+                        self.error = Some(format!("MoQ connection failed: {}", e));
+                        self.moq_connect_state = MoqConnectState::Idle;
+                        self.show_picker = true;
+                        return;
+                    }
+                    _ => {}
+                }
+
+                // Poll for catalog
+                session.poll_state();
+                if matches!(session.state(), WebMoqSessionState::CatalogReady) {
+                    self.moq_status = "Catalog received, starting playback...".to_string();
+                    self.moq_connect_state = MoqConnectState::CatalogReady;
+                }
+
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            MoqConnectState::CatalogReady => {
+                // Start playback async (audio init needs await)
+                let Some(mut session) = self.moq_session.take() else {
+                    return;
+                };
+                let ctx_clone = ctx.clone();
+                let slot = self.moq_session_slot.clone();
+                self.moq_connect_state = MoqConnectState::StartingPlayback;
+                self.moq_status = "Starting playback...".to_string();
+
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Err(e) = session.start_playback().await {
+                        web_sys::console::error_1(
+                            &format!("MoQ start playback failed: {:?}", e).into(),
+                        );
+                    }
+                    *slot.borrow_mut() = Some(session);
+                    ctx_clone.request_repaint();
+                });
+            }
+            MoqConnectState::StartingPlayback => {
+                // Session recovered from slot — check playback state
+                if let WebMoqSessionState::Error(e) = session.state() {
+                    self.error = Some(format!("MoQ playback failed: {}", e));
+                    self.moq_connect_state = MoqConnectState::Idle;
+                    self.show_picker = true;
+                    return;
+                }
+                self.moq_connect_state = MoqConnectState::Playing;
+                self.moq_status.clear();
+            }
+            MoqConnectState::Playing => {
+                session.poll_state();
+
+                if let WebMoqSessionState::Error(e) = session.state() {
+                    self.error = Some(format!("MoQ error: {}", e));
+                    self.moq_connect_state = MoqConnectState::Idle;
+                    self.moq_session = None;
+                    self.show_picker = true;
+                }
+            }
+            MoqConnectState::Idle => {}
         }
     }
 
@@ -578,6 +768,11 @@ impl DemoApp {
         if self.mouse_over_video || self.is_seeking {
             self.last_interaction = now;
             self.controls_visible = true;
+        } else if self.moq_session.is_some() {
+            // MoQ is always "playing" (live)
+            if now - self.last_interaction > CONTROLS_HIDE_DELAY {
+                self.controls_visible = false;
+            }
         } else if let Some(player) = &self.player {
             if player.is_playing() && now - self.last_interaction > CONTROLS_HIDE_DELAY {
                 self.controls_visible = false;
@@ -586,17 +781,12 @@ impl DemoApp {
     }
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
-        if self.player.is_none() {
-            return;
-        }
-
-        // Don't handle shortcuts when a text field is focused
-        if ctx.wants_keyboard_input() {
+        if self.player.is_none() && self.moq_session.is_none() {
             return;
         }
 
         ctx.input(|i| {
-            // Space: play/pause
+            // Space: play/pause (HLS/MP4 only — MoQ is always live)
             if i.key_pressed(egui::Key::Space) {
                 if let Some(player) = &mut self.player {
                     player.toggle_playback();
@@ -605,7 +795,7 @@ impl DemoApp {
                 }
             }
 
-            // Left arrow: skip back 10s
+            // Left arrow: skip back 10s (HLS/MP4 only)
             if i.key_pressed(egui::Key::ArrowLeft) {
                 if let Some(player) = &mut self.player {
                     let pos = player.position().as_secs_f64();
@@ -616,7 +806,7 @@ impl DemoApp {
                 }
             }
 
-            // Right arrow: skip forward 10s
+            // Right arrow: skip forward 10s (HLS/MP4 only)
             if i.key_pressed(egui::Key::ArrowRight) {
                 if let Some(player) = &mut self.player {
                     let pos = player.position().as_secs_f64();
@@ -637,13 +827,23 @@ impl DemoApp {
                     player.toggle_mute();
                     self.last_interaction = current_time();
                     self.controls_visible = true;
+                } else if let Some(session) = &mut self.moq_session {
+                    session.toggle_mute();
+                    self.last_interaction = current_time();
+                    self.controls_visible = true;
                 }
+            }
+
+            // S: toggle stats overlay
+            if i.key_pressed(egui::Key::S) {
+                self.show_stats = !self.show_stats;
             }
 
             // Escape: back to picker
             if i.key_pressed(egui::Key::Escape) {
                 self.player = None;
-                // Clear texture but keep state (Arc is shared with CallbackResources)
+                self.moq_session = None;
+                self.moq_connect_state = MoqConnectState::Idle;
                 if let Some(state) = &self.video_state {
                     let mut state = state.lock();
                     state.texture = None;
@@ -738,20 +938,39 @@ impl DemoApp {
 
                     ui.add_space(24.0);
                     ui.label(
-                        egui::RichText::new("Keyboard: Space=play/pause, Arrows=seek, M=mute")
-                            .size(12.0)
-                            .color(egui::Color32::DARK_GRAY),
+                        egui::RichText::new(
+                            "Keyboard: Space=play/pause, Arrows=seek, M=mute, S=stats",
+                        )
+                        .size(12.0)
+                        .color(egui::Color32::DARK_GRAY),
                     );
                 });
             });
     }
 
     fn show_video_player(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        // Drive MoQ state machine
+        self.poll_moq_session(ctx);
+
+        let is_moq = !matches!(self.moq_connect_state, MoqConnectState::Idle);
+
         self.update_controls_visibility();
         self.handle_keyboard(ctx);
 
-        // Request repaint for video updates (playing or loading initial frame)
-        if self.player.is_some() {
+        // Request repaint
+        if is_moq {
+            match self.moq_connect_state {
+                MoqConnectState::Playing => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                }
+                MoqConnectState::Connecting
+                | MoqConnectState::CatalogReady
+                | MoqConnectState::StartingPlayback => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                MoqConnectState::Idle => {}
+            }
+        } else if self.player.is_some() {
             let needs_texture = self
                 .video_state
                 .as_ref()
@@ -764,10 +983,6 @@ impl DemoApp {
                 .map(|p| p.is_playing())
                 .unwrap_or(false);
 
-            // Repaint cadence based on state:
-            // - Playing: 60fps for smooth video
-            // - Waiting for texture (loading): 4fps to check for first frame without spinning CPU
-            // - Paused with texture: no automatic repaint needed
             if is_playing {
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
             } else if needs_texture {
@@ -775,9 +990,11 @@ impl DemoApp {
             }
         }
 
-        // Update zero-copy texture before rendering
+        // Update textures before rendering
         if let Some(render_state) = frame.wgpu_render_state() {
-            if let Some(player) = &self.player {
+            if is_moq {
+                self.update_moq_texture(render_state);
+            } else if let Some(player) = &self.player {
                 let (video_width, video_height) = player.dimensions();
                 if video_width > 0 && video_height > 0 {
                     self.update_video_texture(render_state, video_width, video_height);
@@ -785,7 +1002,7 @@ impl DemoApp {
             }
         }
 
-        // Check if we have a valid texture to render
+        // Check if we have a valid texture
         let has_texture = self
             .video_state
             .as_ref()
@@ -797,7 +1014,9 @@ impl DemoApp {
             .show(ctx, |ui| {
                 let available_size = ui.available_size();
 
-                if let Some(player) = &self.player {
+                if is_moq {
+                    self.show_moq_player(ui, available_size, has_texture);
+                } else if let Some(player) = &self.player {
                     let (video_width, video_height) = player.dimensions();
 
                     if video_width > 0 && video_height > 0 {
@@ -844,6 +1063,465 @@ impl DemoApp {
                     }
                 }
             });
+    }
+
+    /// Update MoQ video texture from polled VideoFrame.
+    fn update_moq_texture(&mut self, render_state: &egui_wgpu::RenderState) {
+        let Some(session) = &mut self.moq_session else {
+            return;
+        };
+        let Some(video_state) = &self.video_state else {
+            return;
+        };
+
+        // Update extended stats cache when stats panel is visible
+        if self.show_stats {
+            self.cached_stats = session.get_extended_stats();
+        }
+
+        // Poll for new frames
+        if session.poll_frame().is_some() {
+            // Update FPS tracker
+            let now = current_time();
+            let frame_count = session.video_frame_count();
+            let (start_time, start_count) = self.fps_window_start;
+            let elapsed = now - start_time;
+            if elapsed >= 1.0 {
+                let delta_frames = frame_count.saturating_sub(start_count);
+                self.measured_fps = delta_frames as f32 / elapsed as f32;
+                self.fps_window_start = (now, frame_count);
+            } else if start_time == 0.0 {
+                self.fps_window_start = (now, frame_count);
+            }
+            let (w, h) = session.video_dimensions();
+            if w == 0 || h == 0 {
+                return;
+            }
+
+            let mut state = video_state.lock();
+            let dims_changed = state.dims != (w, h);
+            let texture_missing = state.texture.is_none();
+
+            if dims_changed || texture_missing {
+                state.texture = Some(WebVideoTexture::new(
+                    &render_state.device,
+                    state.resources.bind_group_layout(),
+                    state.resources.sampler(),
+                    w,
+                    h,
+                ));
+                state.dims = (w, h);
+            }
+
+            // Copy VideoFrame to wgpu texture
+            if let Some(texture) = &state.texture {
+                if let Err(e) = session.copy_to_wgpu_texture(&render_state.queue, texture.texture())
+                {
+                    web_sys::console::warn_1(&format!("MoQ texture copy failed: {:?}", e).into());
+                }
+            }
+        }
+    }
+
+    /// Render MoQ live stream player UI.
+    fn show_moq_player(
+        &mut self,
+        ui: &mut egui::Ui,
+        available_size: egui::Vec2,
+        has_texture: bool,
+    ) {
+        // Show status if not yet playing
+        if !matches!(self.moq_connect_state, MoqConnectState::Playing) || !has_texture {
+            ui.centered_and_justified(|ui| {
+                ui.vertical_centered(|ui| {
+                    ui.spinner();
+                    if !self.moq_status.is_empty() {
+                        ui.add_space(12.0);
+                        ui.label(
+                            egui::RichText::new(&self.moq_status)
+                                .color(egui::Color32::LIGHT_GRAY)
+                                .size(14.0),
+                        );
+                    }
+                });
+            });
+            return;
+        }
+
+        let (video_width, video_height) = self
+            .moq_session
+            .as_ref()
+            .map(|s| s.video_dimensions())
+            .unwrap_or((0, 0));
+
+        if video_width == 0 || video_height == 0 {
+            ui.centered_and_justified(|ui| {
+                ui.spinner();
+            });
+            return;
+        }
+
+        let aspect = video_width as f32 / video_height as f32;
+        let fit_width = available_size.x.min(available_size.y * aspect);
+        let fit_height = fit_width / aspect;
+        let video_size = egui::vec2(fit_width, fit_height);
+        let video_offset = (available_size - video_size) / 2.0;
+        let video_rect = egui::Rect::from_min_size(ui.min_rect().min + video_offset, video_size);
+
+        // Render video
+        if has_texture {
+            let paint_callback =
+                egui_wgpu::Callback::new_paint_callback(video_rect, WebVideoCallback);
+            ui.painter().add(paint_callback);
+        }
+
+        let response = ui.interact(video_rect, ui.id().with("moq_video"), egui::Sense::click());
+        self.mouse_over_video = response.hovered();
+        if response.hovered() {
+            self.last_interaction = current_time();
+            self.controls_visible = true;
+        }
+
+        // Draw stats overlay (toggled with 'S')
+        if self.show_stats {
+            self.draw_stats_overlay(ui, video_rect);
+        }
+
+        // Draw MoQ controls overlay (live — no seek bar)
+        self.draw_moq_controls_overlay(ui, video_rect);
+    }
+
+    /// Draw controls overlay for MoQ live streams (volume/mute only, no seek).
+    fn draw_moq_controls_overlay(&mut self, ui: &mut egui::Ui, video_rect: egui::Rect) {
+        let session = match &mut self.moq_session {
+            Some(s) => s,
+            None => return,
+        };
+
+        let alpha = if self.controls_visible { 255u8 } else { 0u8 };
+        if alpha == 0 {
+            return;
+        }
+
+        // "LIVE" badge (top-right)
+        if self.controls_visible {
+            let badge_rect = egui::Rect::from_min_size(
+                egui::pos2(video_rect.max.x - 70.0, video_rect.min.y + 12.0),
+                egui::vec2(58.0, 26.0),
+            );
+            ui.painter()
+                .rect_filled(badge_rect, 6.0, egui::Color32::from_rgb(255, 59, 48));
+            ui.painter().text(
+                badge_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "LIVE",
+                egui::FontId::proportional(13.0),
+                egui::Color32::WHITE,
+            );
+        }
+
+        // Bottom control bar (volume + mute only)
+        let bar_height = 56.0;
+        let bar_rect = egui::Rect::from_min_max(
+            egui::pos2(video_rect.min.x, video_rect.max.y - bar_height),
+            video_rect.max,
+        );
+
+        ui.painter().rect_filled(
+            bar_rect,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, (0.7 * alpha as f32) as u8),
+        );
+
+        let padding = 16.0;
+        let center_y = bar_rect.center().y;
+        let right_x = bar_rect.max.x - padding;
+
+        // Volume controls (right side)
+        let vol_slider_width = 70.0;
+        let vol_btn_width = MIN_TOUCH_TARGET;
+
+        let volume = session.volume();
+        let is_muted = session.is_muted() || volume < 0.01;
+
+        // Volume/mute button
+        let vol_btn_rect = egui::Rect::from_center_size(
+            egui::pos2(right_x - vol_slider_width - vol_btn_width / 2.0, center_y),
+            egui::vec2(vol_btn_width, MIN_TOUCH_TARGET),
+        );
+
+        if is_muted {
+            icons::draw_muted(
+                ui.painter(),
+                vol_btn_rect.center(),
+                32.0,
+                egui::Color32::WHITE,
+            );
+        } else {
+            icons::draw_volume(
+                ui.painter(),
+                vol_btn_rect.center(),
+                32.0,
+                egui::Color32::WHITE,
+                volume,
+            );
+        }
+
+        let vol_btn_response = ui
+            .interact(
+                vol_btn_rect,
+                ui.id().with("moq_vol_btn"),
+                egui::Sense::click(),
+            )
+            .on_hover_text("Mute (M)");
+        if vol_btn_response.clicked() {
+            session.toggle_mute();
+            self.last_interaction = current_time();
+        }
+
+        // Volume slider
+        let vol_slider_rect = egui::Rect::from_min_max(
+            egui::pos2(right_x - vol_slider_width, center_y - 3.0),
+            egui::pos2(right_x, center_y + 3.0),
+        );
+
+        ui.painter()
+            .rect_filled(vol_slider_rect, 3.0, egui::Color32::from_gray(80));
+        let vol_fill = egui::Rect::from_min_max(
+            vol_slider_rect.min,
+            egui::pos2(
+                vol_slider_rect.min.x + vol_slider_rect.width() * volume,
+                vol_slider_rect.max.y,
+            ),
+        );
+        ui.painter()
+            .rect_filled(vol_fill, 3.0, egui::Color32::WHITE);
+
+        let vol_response = ui.interact(
+            vol_slider_rect.expand(8.0),
+            ui.id().with("moq_vol_slider"),
+            egui::Sense::click_and_drag(),
+        );
+        if vol_response.dragged() || vol_response.clicked() {
+            self.last_interaction = current_time();
+            if let Some(pos) = vol_response.interact_pointer_pos() {
+                let v = ((pos.x - vol_slider_rect.min.x) / vol_slider_rect.width()).clamp(0.0, 1.0);
+                session.set_volume(v);
+            }
+        }
+
+        // Frame count display (left side)
+        let frame_count = session.video_frame_count();
+        ui.painter().text(
+            egui::pos2(bar_rect.min.x + padding, center_y),
+            egui::Align2::LEFT_CENTER,
+            format!("{} frames", frame_count),
+            egui::FontId::proportional(12.0),
+            egui::Color32::LIGHT_GRAY,
+        );
+
+        // Close button (top left)
+        if self.controls_visible {
+            let close_btn_rect = egui::Rect::from_min_size(
+                egui::pos2(video_rect.min.x + 12.0, video_rect.min.y + 12.0),
+                egui::vec2(MIN_TOUCH_TARGET, MIN_TOUCH_TARGET),
+            );
+
+            ui.painter().circle_filled(
+                close_btn_rect.center(),
+                MIN_TOUCH_TARGET / 2.0,
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120),
+            );
+            ui.painter().text(
+                close_btn_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "X",
+                egui::FontId::proportional(18.0),
+                egui::Color32::WHITE,
+            );
+
+            let close_response = ui
+                .interact(
+                    close_btn_rect,
+                    ui.id().with("moq_close_btn"),
+                    egui::Sense::click(),
+                )
+                .on_hover_text("Close (Escape)");
+            if close_response.clicked() {
+                self.moq_session = None;
+                self.moq_connect_state = MoqConnectState::Idle;
+                if let Some(state) = &self.video_state {
+                    let mut state = state.lock();
+                    state.texture = None;
+                    state.dims = (0, 0);
+                }
+                self.show_picker = true;
+            }
+        }
+    }
+
+    /// Draw MoQ stats overlay panel (top-left of video, toggled with 'S').
+    fn draw_stats_overlay(&self, ui: &mut egui::Ui, video_rect: egui::Rect) {
+        let session = match &self.moq_session {
+            Some(s) => s,
+            None => return,
+        };
+
+        let catalog = match session.catalog() {
+            Some(c) => c,
+            None => return,
+        };
+
+        let mono = egui::FontId::monospace(12.0);
+        let line_height = 16.0;
+        let padding = 10.0;
+
+        // Gather stats
+        let (video_width, video_height) = session.video_dimensions();
+        let video_frames = session.video_frame_count();
+
+        let video_codec = catalog
+            .video
+            .first()
+            .map(|v| v.codec.as_str())
+            .unwrap_or("?");
+        let max_fps = catalog
+            .video
+            .first()
+            .and_then(|v| v.framerate)
+            .unwrap_or(0.0);
+
+        let audio_codec = catalog
+            .audio
+            .first()
+            .map(|a| a.codec.as_str())
+            .unwrap_or("?");
+        let sample_rate = catalog.audio.first().map(|a| a.sample_rate).unwrap_or(0);
+        let channels = catalog.audio.first().map(|a| a.channels).unwrap_or(0);
+
+        let stats = self.cached_stats.clone().unwrap_or_default();
+
+        // Build text lines
+        let mut lines: Vec<(String, egui::Color32)> = Vec::new();
+        let white = egui::Color32::WHITE;
+        let gray = egui::Color32::from_gray(180);
+        let separator = ("─────────────────────────".to_string(), gray);
+
+        lines.push(("MoQ Stream Stats".to_string(), white));
+        lines.push(separator.clone());
+
+        lines.push((format!("Video Codec     {}", video_codec), white));
+        lines.push((
+            format!("Resolution      {}x{}", video_width, video_height),
+            white,
+        ));
+        if max_fps > 0.0 {
+            lines.push((format!("Max FPS         {}", max_fps as u32), white));
+        }
+
+        // Color-code measured FPS
+        let fps_color = if max_fps > 0.0 {
+            let ratio = self.measured_fps / max_fps;
+            if ratio > 0.9 {
+                egui::Color32::from_rgb(48, 209, 88) // green
+            } else if ratio > 0.5 {
+                egui::Color32::from_rgb(255, 159, 10) // orange
+            } else {
+                egui::Color32::from_rgb(255, 69, 58) // red
+            }
+        } else {
+            white
+        };
+        lines.push((
+            format!("Measured FPS    {:.1}", self.measured_fps),
+            fps_color,
+        ));
+
+        lines.push((
+            "GPU Transfer    Zero-Copy".to_string(),
+            egui::Color32::from_rgb(48, 209, 88),
+        ));
+        lines.push((format!("Video Frames    {}", video_frames), white));
+        lines.push((
+            format!("V Decode Queue  {}", stats.video_decode_queue_size),
+            white,
+        ));
+
+        lines.push(separator.clone());
+
+        lines.push((format!("Audio Codec     {}", audio_codec), white));
+        lines.push((format!("Sample Rate     {} Hz", sample_rate), white));
+        lines.push((format!("Channels        {}", channels), white));
+        lines.push((
+            format!("Audio Frames    {}", stats.audio_frame_count),
+            white,
+        ));
+
+        // Audio buffer %
+        let buf_pct = if stats.audio_buffer_capacity > 0 {
+            (stats.audio_buffer_length as f32 / stats.audio_buffer_capacity as f32 * 100.0)
+                .clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        let buf_color = if buf_pct > 50.0 {
+            egui::Color32::from_rgb(48, 209, 88) // green
+        } else if buf_pct > 20.0 {
+            egui::Color32::from_rgb(255, 159, 10) // orange
+        } else {
+            egui::Color32::from_rgb(255, 69, 58) // red
+        };
+        lines.push((format!("Audio Buffer    {:.0}%", buf_pct), buf_color));
+
+        lines.push((
+            format!("A Decode Queue  {}", stats.audio_decode_queue_size),
+            white,
+        ));
+        lines.push((
+            format!("Underflows      {}", stats.audio_underflow_samples),
+            if stats.audio_underflow_samples > 0 {
+                egui::Color32::from_rgb(255, 159, 10)
+            } else {
+                white
+            },
+        ));
+
+        lines.push(separator);
+
+        lines.push((
+            format!("Protocol        0x{:08x}", stats.connection_version),
+            white,
+        ));
+
+        // Calculate panel size
+        let num_lines = lines.len() as f32;
+        let panel_width = 260.0;
+        let panel_height = num_lines * line_height + padding * 2.0;
+
+        let panel_rect = egui::Rect::from_min_size(
+            egui::pos2(video_rect.min.x + 12.0, video_rect.min.y + 60.0),
+            egui::vec2(panel_width, panel_height),
+        );
+
+        // Background
+        ui.painter().rect_filled(
+            panel_rect,
+            6.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
+        );
+
+        // Draw text lines
+        let mut y = panel_rect.min.y + padding;
+        for (text, color) in &lines {
+            ui.painter().text(
+                egui::pos2(panel_rect.min.x + padding, y),
+                egui::Align2::LEFT_TOP,
+                text,
+                mono.clone(),
+                *color,
+            );
+            y += line_height;
+        }
     }
 
     fn is_control_area(&self, pointer_pos: Option<egui::Pos2>, video_rect: egui::Rect) -> bool {
@@ -944,7 +1622,6 @@ impl DemoApp {
                 self.last_interaction = current_time();
             }
 
-            // Skip forward button (right of center)
             // Skip forward button (right of center)
             let skip_fwd_center = egui::pos2(
                 center.x + btn_size / 2.0 + spacing + skip_btn_size / 2.0,

@@ -43,6 +43,11 @@
     <!-- HLS.js for HLS streaming support -->
     <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js"></script>
 
+    <!-- MoQ transport (bundled from local @moq/lite source via esbuild) -->
+    <script src="moq-lite-bundle.js"></script>
+    <link data-trunk rel="copy-file" href="moq-lite-bundle.js" />
+    <link data-trunk rel="copy-file" href="moq-audio-worklet.js" />
+
     <script>
         // Hide loading indicator when WASM is ready
         window.addEventListener('load', function() {
