@@ -35,9 +35,9 @@
 // =============================================================================
 // These re-exports preserve super:: paths for MoQ and other local consumers.
 
-pub use lumina_video_core::video;
 pub use lumina_video_core::audio;
 pub use lumina_video_core::subtitles;
+pub use lumina_video_core::video;
 
 // audio_ring_buffer: pub in core for cross-crate access. NOT public API — do not stabilize.
 // Required by moq_audio.rs (super::audio_ring_buffer::RingBufferConfig).
@@ -49,19 +49,19 @@ pub(crate) use lumina_video_core::audio_ring_buffer;
 #[cfg(not(target_arch = "wasm32"))]
 pub use lumina_video_core::frame_queue;
 #[cfg(not(target_arch = "wasm32"))]
-pub use lumina_video_core::sync_metrics;
-#[cfg(not(target_arch = "wasm32"))]
-pub use lumina_video_core::triple_buffer;
-#[cfg(not(target_arch = "wasm32"))]
 pub use lumina_video_core::network;
 #[cfg(not(target_arch = "wasm32"))]
 pub use lumina_video_core::player;
+#[cfg(not(target_arch = "wasm32"))]
+pub use lumina_video_core::sync_metrics;
+#[cfg(not(target_arch = "wasm32"))]
+pub use lumina_video_core::triple_buffer;
 
 // Platform-specific re-exports
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-pub use lumina_video_core::macos_video;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use lumina_video_core::audio_decoder;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub use lumina_video_core::macos_video;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use lumina_video_core::video_decoder;
 
@@ -78,9 +78,9 @@ pub use lumina_video_core::android_vulkan;
 pub use lumina_video_core::ndk_image_reader;
 
 #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
-pub use lumina_video_core::windows_video;
-#[cfg(all(target_os = "windows", feature = "windows-native-video"))]
 pub use lumina_video_core::windows_audio;
+#[cfg(all(target_os = "windows", feature = "windows-native-video"))]
+pub use lumina_video_core::windows_video;
 
 // Zero-copy module
 #[cfg(any(

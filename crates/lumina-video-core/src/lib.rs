@@ -15,9 +15,9 @@
 
 // === Universal modules (compile on all targets including wasm32) ===
 
-pub mod video;
 pub mod audio;
 pub mod subtitles;
+pub mod video;
 
 /// Internal bridge API — public only for cross-crate re-export by lumina-video.
 /// NOT semver-stable. Do not depend on this module directly from external crates.
@@ -31,20 +31,20 @@ pub mod audio_ring_buffer;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod frame_queue;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod sync_metrics;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod triple_buffer;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod network;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod player;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod sync_metrics;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod triple_buffer;
 
 // === Platform decoders ===
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-pub mod macos_video;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod audio_decoder;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub mod macos_video;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod video_decoder;
 
@@ -61,9 +61,9 @@ pub mod android_vulkan;
 pub mod ndk_image_reader;
 
 #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
-pub mod windows_video;
-#[cfg(all(target_os = "windows", feature = "windows-native-video"))]
 pub mod windows_audio;
+#[cfg(all(target_os = "windows", feature = "windows-native-video"))]
+pub mod windows_video;
 
 // === Zero-copy GPU import ===
 

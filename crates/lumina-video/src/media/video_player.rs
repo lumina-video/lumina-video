@@ -61,11 +61,11 @@ use super::video::AndroidGpuSurface;
 use super::video::LinuxGpuSurface;
 #[cfg(target_os = "macos")]
 use super::video::MacOSGpuSurface;
+#[cfg(feature = "moq")]
+use super::video::VideoDecoderBackend;
 #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
 use super::video::WindowsGpuSurface;
 use super::video::{CpuFrame, PixelFormat, VideoError, VideoMetadata, VideoState};
-#[cfg(feature = "moq")]
-use super::video::VideoDecoderBackend;
 
 #[cfg(feature = "moq")]
 use super::moq_decoder::{MoqDecoder, MoqStatsHandle, MoqStatsSnapshot};
@@ -451,8 +451,15 @@ impl VideoPlayer {
     }
 
     /// Toggles between play and pause.
+    ///
+    /// Uses `VideoPlayer::play()`/`pause()` rather than `CorePlayer::toggle_playback()`
+    /// to ensure the mute state is preserved via `play_with_muted`.
     pub fn toggle_playback(&mut self) {
-        self.core.toggle_playback();
+        match self.core.state() {
+            VideoState::Playing { .. } => self.pause(),
+            VideoState::Paused { .. } | VideoState::Ready | VideoState::Ended => self.play(),
+            _ => {}
+        }
     }
 
     /// Seeks to a specific position.
@@ -717,7 +724,10 @@ impl VideoPlayer {
         // Update frame if playback requested (even if buffering), or try to get preview frame when Ready/Paused
         if self.core.is_playback_requested() {
             self.update_frame();
-        } else if matches!(self.core.state(), VideoState::Ready | VideoState::Paused { .. }) {
+        } else if matches!(
+            self.core.state(),
+            VideoState::Ready | VideoState::Paused { .. }
+        ) {
             // Try to get preview frame from queue (non-blocking)
             self.try_get_preview_frame();
         }
@@ -826,8 +836,7 @@ impl VideoPlayer {
 
         // Request repaint if playing/buffering, loading, initializing, or have pending frame
         #[cfg(feature = "moq")]
-        let is_initializing =
-            self.core.is_init_pending() || self.moq_init_promise.is_some();
+        let is_initializing = self.core.is_init_pending() || self.moq_init_promise.is_some();
         #[cfg(not(feature = "moq"))]
         let is_initializing = self.core.is_init_pending();
         let has_pending_frame = self.pending_frame_reader.has_new_frame();

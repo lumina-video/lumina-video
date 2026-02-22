@@ -31,9 +31,9 @@ pub enum DecodeCommand {
     Seek(Duration),
     /// Stop the decode thread
     Stop,
-    /// Set muted state (Android only - audio controlled by ExoPlayer)
+    /// Set muted state (sent to platform decoder: AVPlayer on iOS/macOS, ExoPlayer on Android).
     SetMuted(bool),
-    /// Set volume level (Android only - audio controlled by ExoPlayer)
+    /// Set volume level (sent to platform decoder: AVPlayer on iOS/macOS, ExoPlayer on Android).
     SetVolume(f32),
 }
 
@@ -373,12 +373,12 @@ impl DecodeThread {
         let _ = self.command_tx.send(DecodeCommand::Stop);
     }
 
-    /// Sets the muted state (Android only - audio is controlled by ExoPlayer).
+    /// Sets the muted state (sent to platform decoder: AVPlayer on iOS/macOS, ExoPlayer on Android).
     pub fn set_muted(&self, muted: bool) {
         let _ = self.command_tx.send(DecodeCommand::SetMuted(muted));
     }
 
-    /// Sets the volume level (Android only - audio is controlled by ExoPlayer).
+    /// Sets the volume level (sent to platform decoder: AVPlayer on iOS/macOS, ExoPlayer on Android).
     pub fn set_volume(&self, volume: f32) {
         let _ = self.command_tx.send(DecodeCommand::SetVolume(volume));
     }

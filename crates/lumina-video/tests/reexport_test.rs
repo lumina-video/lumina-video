@@ -40,7 +40,9 @@ fn video_player_constructors() {
     assert!(matches!(player.state(), VideoState::Loading));
     assert!(!player.is_playing());
 
-    let player2 = VideoPlayer::new("test.mp4").with_autoplay(true).with_loop(true);
+    let player2 = VideoPlayer::new("test.mp4")
+        .with_autoplay(true)
+        .with_loop(true);
     assert!(matches!(player2.state(), VideoState::Loading));
 }
 

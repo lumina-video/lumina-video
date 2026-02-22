@@ -38,13 +38,13 @@
 //! uses DXVA2/D3D11VA for hardware decoding when available. The decoder falls
 //! back to software decode if hardware acceleration fails.
 
-use crate::windows_audio::{AudioFormatInfo, AudioFrame};
 #[cfg(feature = "zero-copy")]
 use crate::video::WindowsGpuSurface;
 use crate::video::{
     CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend, VideoError,
     VideoFrame, VideoMetadata,
 };
+use crate::windows_audio::{AudioFormatInfo, AudioFrame};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};

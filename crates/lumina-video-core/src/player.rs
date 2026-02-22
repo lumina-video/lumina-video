@@ -92,8 +92,7 @@ pub struct CorePlayer {
     android_player_id: u64,
     /// Linux zero-copy metrics
     #[cfg(target_os = "linux")]
-    linux_zero_copy_metrics:
-        Arc<Mutex<Option<Arc<crate::linux_video::ZeroCopyMetrics>>>>,
+    linux_zero_copy_metrics: Arc<Mutex<Option<Arc<crate::linux_video::ZeroCopyMetrics>>>>,
 }
 
 impl CorePlayer {
@@ -128,7 +127,10 @@ impl CorePlayer {
     ///
     /// Use this when the caller manages decoder creation (e.g., MoQ).
     /// The player transitions directly to [`VideoState::Ready`].
-    pub fn with_decoder(url: impl Into<String>, decoder: Box<dyn VideoDecoderBackend + Send>) -> Self {
+    pub fn with_decoder(
+        url: impl Into<String>,
+        decoder: Box<dyn VideoDecoderBackend + Send>,
+    ) -> Self {
         let audio_handle = AudioHandle::new();
         let scheduler = FrameScheduler::with_audio_handle(audio_handle.clone());
         let metadata = decoder.metadata().clone();
@@ -194,9 +196,7 @@ impl CorePlayer {
         #[cfg(target_os = "ios")]
         let ios_decoder_result: Option<Result<MacOSVideoDecoder, VideoError>> = {
             if is_avfoundation_supported_container(&url) {
-                tracing::info!(
-                    "Initializing iOS VideoToolbox decoder (dispatching to main queue)"
-                );
+                tracing::info!("Initializing iOS VideoToolbox decoder (dispatching to main queue)");
                 let url_clone = url.clone();
                 Some(dispatch2::run_on_main(move |_mtm| {
                     MacOSVideoDecoder::new(&url_clone)
@@ -339,7 +339,7 @@ impl CorePlayer {
 
                 let frame_queue = Arc::clone(&self.frame_queue);
 
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 let decode_thread = if uses_native_audio {
                     DecodeThread::with_audio_handle(
                         decoder,
@@ -350,7 +350,7 @@ impl CorePlayer {
                     DecodeThread::new(decoder, frame_queue)
                 };
 
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                 let decode_thread = DecodeThread::new(decoder, frame_queue);
 
                 self.decode_thread = Some(decode_thread);
@@ -395,10 +395,18 @@ impl CorePlayer {
     // =========================================================================
 
     /// Starts or resumes playback.
+    ///
+    /// Preserves the current mute state. Use [`play_with_muted`] to set an
+    /// explicit mute state at the same time.
     pub fn play(&mut self) {
         if let Some(ref thread) = self.decode_thread {
-            #[cfg(any(target_os = "android", target_os = "ios", target_os = "linux", target_os = "macos"))]
-            thread.set_muted(false); // sync mute state
+            #[cfg(any(
+                target_os = "android",
+                target_os = "ios",
+                target_os = "linux",
+                target_os = "macos"
+            ))]
+            thread.set_muted(self.audio_handle.is_muted());
             thread.play();
             self.scheduler.start();
             self.state = VideoState::Playing {
@@ -414,7 +422,12 @@ impl CorePlayer {
     /// Starts playback with a specific mute state.
     pub fn play_with_muted(&mut self, muted: bool) {
         if let Some(ref thread) = self.decode_thread {
-            #[cfg(any(target_os = "android", target_os = "ios", target_os = "linux", target_os = "macos"))]
+            #[cfg(any(
+                target_os = "android",
+                target_os = "ios",
+                target_os = "linux",
+                target_os = "macos"
+            ))]
             thread.set_muted(muted);
             thread.play();
             self.scheduler.start();
@@ -446,10 +459,7 @@ impl CorePlayer {
     /// Seeks to a specific position.
     pub fn seek(&mut self, position: Duration) {
         if position == Duration::ZERO {
-            tracing::debug!(
-                "Seek to ZERO requested from state={:?}",
-                self.state,
-            );
+            tracing::debug!("Seek to ZERO requested from state={:?}", self.state,);
         }
 
         if let Some(ref thread) = self.decode_thread {
@@ -591,9 +601,11 @@ impl CorePlayer {
                 VideoState::Paused { .. } => {
                     self.state = VideoState::Paused { position: f.pts };
                 }
-                _ => {
+                VideoState::Ready | VideoState::Buffering { .. } | VideoState::Loading => {
                     self.state = VideoState::Playing { position: f.pts };
                 }
+                // Don't override Ended/Error — frame may be stale or spurious
+                VideoState::Ended | VideoState::Error(_) => {}
             }
         }
         frame
@@ -710,7 +722,12 @@ impl CorePlayer {
     /// Sets the muted state and syncs to the decode thread.
     pub fn set_muted(&mut self, muted: bool) {
         self.audio_handle.set_muted(muted);
-        #[cfg(any(target_os = "android", target_os = "ios", target_os = "linux", target_os = "macos"))]
+        #[cfg(any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos"
+        ))]
         if let Some(ref thread) = self.decode_thread {
             thread.set_muted(muted);
         }
@@ -719,13 +736,18 @@ impl CorePlayer {
     /// Sets volume and syncs to the decode thread.
     pub fn set_volume(&mut self, volume: u32) {
         self.audio_handle.set_volume(volume);
-        #[cfg(target_os = "android")]
+        #[cfg(any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos"
+        ))]
         if let Some(ref decode_thread) = self.decode_thread {
             decode_thread.set_volume(volume as f32 / 100.0);
         }
     }
 
-    /// Stops the decode thread (called during cleanup).
+    /// Stops the decode thread and joins the init thread (called during cleanup).
     fn stop(&mut self) {
         if let Some(ref thread) = self.decode_thread {
             thread.stop();
@@ -733,6 +755,10 @@ impl CorePlayer {
         #[cfg(target_os = "macos")]
         if let Some(ref audio_thread) = self.audio_thread {
             audio_thread.stop();
+        }
+        // Join init thread if still running to avoid leaking the handle
+        if let Some(handle) = self.init_thread.take() {
+            let _ = handle.join();
         }
     }
 }

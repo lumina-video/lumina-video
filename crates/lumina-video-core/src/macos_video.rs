@@ -1360,6 +1360,14 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
         Ok(())
     }
 
+    /// Set volume for AVPlayer audio (0.0 = silent, 1.0 = full).
+    fn set_volume(&mut self, volume: f32) -> Result<(), VideoError> {
+        let clamped = volume.clamp(0.0, 1.0);
+        unsafe { self.player.setVolume(clamped) };
+        tracing::debug!("MacOSVideoDecoder: volume={}", clamped);
+        Ok(())
+    }
+
     /// AVPlayer handles audio internally with perfect A/V sync.
     fn handles_audio_internally(&self) -> bool {
         true
