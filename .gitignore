@@ -16,6 +16,8 @@ target
 /dist
 /packages
 .direnv/
+# SPM build artifacts
+.build/
 /tags
 .zed
 .lsp
