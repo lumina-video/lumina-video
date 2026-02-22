@@ -126,6 +126,15 @@ extern "C" {
 // ============================================================================
 
 /// Parsed MoQ URL for web.
+///
+/// URL format: `moq[s]://host[:port][/auth_path]/namespace`
+/// - `moq://` = no TLS, `moqs://` = TLS
+/// - `auth_path` = optional relay auth path (e.g., "anon" for anonymous)
+/// - `namespace` = broadcast name (last path segment)
+///
+/// Examples:
+/// - `moq://localhost:4443/anon/bbb` → relay `http://localhost:4443/anon`, broadcast `bbb`
+/// - `moqs://relay.example.com/live` → relay `https://relay.example.com`, broadcast `live`
 #[derive(Debug, Clone)]
 pub struct WebMoqUrl {
     /// Remote host
@@ -134,11 +143,10 @@ pub struct WebMoqUrl {
     port: u16,
     /// Whether to use TLS
     use_tls: bool,
-    /// Namespace (first path component)
+    /// Auth path (e.g., "anon" for anonymous access on dev relays)
+    auth_path: Option<String>,
+    /// Namespace / broadcast name (last path segment)
     namespace: String,
-    /// Track name (reserved for track-specific subscriptions)
-    #[allow(dead_code)]
-    track: Option<String>,
     /// Query string (e.g., "jwt=xxx" for authentication)
     query: Option<String>,
     /// Original URL (reserved for debugging/logging)
@@ -189,45 +197,42 @@ impl WebMoqUrl {
             (authority.to_string(), 443)
         };
 
-        // Parse path
+        // Parse path: last segment = namespace, preceding segments = auth_path
         let path = path.trim_matches('/');
         if path.is_empty() {
             return Err(VideoError::OpenFailed("Missing namespace".to_string()));
         }
 
-        let (namespace, track) = match path.find('/') {
-            Some(idx) => {
-                let ns = &path[..idx];
-                let track = &path[idx + 1..];
-                (
-                    ns.to_string(),
-                    if track.is_empty() {
-                        None
-                    } else {
-                        Some(track.to_string())
-                    },
-                )
-            }
-            None => (path.to_string(), None),
+        let (auth_path, namespace) = match path.rfind('/') {
+            Some(idx) => (Some(path[..idx].to_string()), path[idx + 1..].to_string()),
+            None => (None, path.to_string()),
         };
+
+        if namespace.is_empty() {
+            return Err(VideoError::OpenFailed("Missing namespace".to_string()));
+        }
 
         Ok(WebMoqUrl {
             host,
             port,
             use_tls,
+            auth_path,
             namespace,
-            track,
             query,
             original,
         })
     }
 
-    /// Returns the WebTransport URL for connection.
+    /// Returns the WebTransport URL for connection (includes auth path if present).
     pub fn webtransport_url(&self) -> String {
         let scheme = if self.use_tls { "https" } else { "http" };
+        let path = match &self.auth_path {
+            Some(p) => format!("/{}", p),
+            None => String::new(),
+        };
         match &self.query {
-            Some(q) => format!("{}://{}:{}?{}", scheme, self.host, self.port, q),
-            None => format!("{}://{}:{}", scheme, self.host, self.port),
+            Some(q) => format!("{}://{}:{}{}?{}", scheme, self.host, self.port, path, q),
+            None => format!("{}://{}:{}{}", scheme, self.host, self.port, path),
         }
     }
 
@@ -538,23 +543,17 @@ impl WebMoqDecoder {
             VideoError::DecodeFailed("No frame available for texture copy".to_string())
         })?;
 
-        // Get frame dimensions (web-sys uses snake_case for JavaScript camelCase)
         let width = frame.display_width();
         let height = frame.display_height();
 
-        // Clone the frame for the copy operation (VideoFrame.clone() returns Result)
-        let frame_clone = frame.clone().map_err(|e| {
-            VideoError::DecodeFailed(format!("Failed to clone VideoFrame: {:?}", e))
-        })?;
+        let source_info = wgpu::CopyExternalImageSourceInfo {
+            source: wgpu::ExternalImageSource::VideoFrame(frame),
+            origin: wgpu::Origin2d::ZERO,
+            flip_y: false,
+        };
 
-        // Use wgpu's copy_external_image_to_texture
-        // Note: wgpu on web uses ExternalImageSource::VideoFrame which takes web_sys::VideoFrame
         queue.copy_external_image_to_texture(
-            &wgpu::CopyExternalImageSourceInfo {
-                source: wgpu::ExternalImageSource::VideoFrame(frame_clone),
-                origin: wgpu::Origin2d::ZERO,
-                flip_y: false,
-            },
+            &source_info,
             wgpu::CopyExternalImageDestInfo {
                 texture,
                 mip_level: 0,
@@ -570,8 +569,9 @@ impl WebMoqDecoder {
             },
         );
 
-        // Close the original frame to release resources
-        frame.close();
+        if let wgpu::ExternalImageSource::VideoFrame(vf) = source_info.source {
+            vf.close();
+        }
 
         Ok(())
     }
@@ -742,27 +742,716 @@ pub mod codec_strings {
     pub const VP9_PROFILE_2: &str = "vp09.02.10.10";
 }
 
+// ============================================================================
+// wasm-bindgen extern declarations for moq-transport-bridge.js
+// ============================================================================
+
+#[wasm_bindgen(module = "/web/moq-transport-bridge.js")]
+extern "C" {
+    /// Connects to a MoQ relay and subscribes to a broadcast.
+    #[wasm_bindgen(catch, js_name = "moqConnect")]
+    async fn js_moq_connect(url: &str, namespace: &str) -> Result<JsValue, JsValue>;
+
+    /// Disconnects a MoQ session.
+    #[wasm_bindgen(js_name = "moqDisconnect")]
+    fn js_moq_disconnect(session_id: u32);
+
+    /// Gets the session state string.
+    #[wasm_bindgen(js_name = "moqGetSessionState")]
+    fn js_moq_get_session_state(session_id: u32) -> String;
+
+    /// Gets the error message for a session.
+    #[wasm_bindgen(js_name = "moqGetError")]
+    fn js_moq_get_error(session_id: u32) -> Option<String>;
+
+    /// Gets the parsed catalog as JSON string.
+    #[wasm_bindgen(js_name = "moqGetCatalog")]
+    fn js_moq_get_catalog(session_id: u32) -> Option<String>;
+
+    /// Starts video decoding for a track.
+    #[wasm_bindgen(catch, js_name = "moqStartVideo")]
+    fn js_moq_start_video(
+        session_id: u32,
+        track_name: &str,
+        codec: &str,
+        width: u32,
+        height: u32,
+        container_kind: &str,
+        timescale: u32,
+        description: Option<String>,
+        on_frame: &js_sys::Function,
+        on_error: &js_sys::Function,
+    ) -> Result<u32, JsValue>;
+
+    /// Gets the latest decoded VideoFrame.
+    #[wasm_bindgen(js_name = "moqGetVideoFrame")]
+    fn js_moq_get_video_frame(decoder_id: u32) -> Option<VideoFrame>;
+
+    /// Closes a video decoder.
+    #[wasm_bindgen(js_name = "moqCloseVideo")]
+    fn js_moq_close_video(decoder_id: u32);
+
+    /// Starts audio decoding and playback.
+    #[wasm_bindgen(catch, js_name = "moqStartAudio")]
+    async fn js_moq_start_audio(
+        session_id: u32,
+        track_name: &str,
+        codec: &str,
+        sample_rate: u32,
+        channels: u32,
+        container_kind: &str,
+        timescale: u32,
+        description: Option<String>,
+    ) -> Result<JsValue, JsValue>;
+
+    /// Sets audio muted state.
+    #[wasm_bindgen(js_name = "moqSetAudioMuted")]
+    fn js_moq_set_audio_muted(audio_id: i32, muted: bool);
+
+    /// Sets audio volume.
+    #[wasm_bindgen(js_name = "moqSetAudioVolume")]
+    fn js_moq_set_audio_volume(audio_id: i32, volume: f32);
+
+    /// Gets audio state.
+    #[wasm_bindgen(js_name = "moqGetAudioState")]
+    fn js_moq_get_audio_state(audio_id: i32) -> JsValue;
+
+    /// Closes an audio handle.
+    #[wasm_bindgen(js_name = "moqCloseAudio")]
+    fn js_moq_close_audio(audio_id: i32);
+
+    /// Gets session stats.
+    #[wasm_bindgen(js_name = "moqGetStats")]
+    fn js_moq_get_stats(session_id: u32) -> JsValue;
+
+    /// Gets extended stats for diagnostics overlay.
+    #[wasm_bindgen(js_name = "moqGetExtendedStats")]
+    fn js_moq_get_extended_stats(session_id: u32) -> JsValue;
+}
+
+// ============================================================================
+// WebMoqSession — full MoQ lifecycle management
+// ============================================================================
+
+/// State of a MoQ session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebMoqSessionState {
+    /// Waiting for connect() to be called
+    Init,
+    /// Connection in progress
+    Connecting,
+    /// Connected, waiting for catalog
+    Connected,
+    /// Catalog received, ready to start playback
+    CatalogReady,
+    /// Video (and optionally audio) are playing
+    Playing,
+    /// Error occurred
+    Error(String),
+    /// Session closed
+    Closed,
+}
+
+/// Parsed catalog from a MoQ broadcast.
+#[derive(Debug, Clone)]
+pub struct WebMoqCatalog {
+    /// Video renditions
+    pub video: Vec<WebMoqVideoRendition>,
+    /// Audio renditions
+    pub audio: Vec<WebMoqAudioRendition>,
+}
+
+/// A video rendition from the catalog.
+#[derive(Debug, Clone)]
+pub struct WebMoqVideoRendition {
+    /// Track name in the MoQ broadcast.
+    pub name: String,
+    /// WebCodecs codec string (e.g., `"avc1.42E01E"`).
+    pub codec: String,
+    /// Video width in pixels.
+    pub width: u32,
+    /// Video height in pixels.
+    pub height: u32,
+    /// Frame rate (fps), if specified in catalog.
+    pub framerate: Option<f32>,
+    /// Container format kind (`"legacy"` or `"cmaf"`).
+    pub container_kind: String,
+    /// Timescale for CMAF timestamps (e.g., 90000 for 90kHz).
+    pub timescale: u32,
+    /// Hex-encoded codec description (SPS/PPS for H.264).
+    pub description: Option<String>,
+}
+
+/// An audio rendition from the catalog.
+#[derive(Debug, Clone)]
+pub struct WebMoqAudioRendition {
+    /// Track name in the MoQ broadcast.
+    pub name: String,
+    /// WebCodecs codec string (e.g., `"opus"`).
+    pub codec: String,
+    /// Audio sample rate in Hz (e.g., 48000).
+    pub sample_rate: u32,
+    /// Number of audio channels.
+    pub channels: u32,
+    /// Container format kind (`"legacy"` or `"cmaf"`).
+    pub container_kind: String,
+    /// Timescale for CMAF timestamps.
+    pub timescale: u32,
+    /// Hex-encoded codec description.
+    pub description: Option<String>,
+}
+
+/// Full MoQ session managing connection, catalog, video, and audio.
+pub struct WebMoqSession {
+    /// Parsed MoQ URL
+    url: WebMoqUrl,
+    /// JavaScript session ID
+    session_id: Option<u32>,
+    /// Current session state
+    state: WebMoqSessionState,
+    /// Parsed catalog
+    catalog: Option<WebMoqCatalog>,
+    /// Video decoder ID (from JS)
+    video_decoder_id: Option<u32>,
+    /// Audio handle ID (from JS, -1 means unsupported)
+    audio_id: Option<i32>,
+    /// Shared state for video frame callbacks
+    video_shared: Rc<RefCell<DecoderSharedState>>,
+    /// Frame callback closure (must keep alive)
+    _video_frame_cb: Option<Closure<dyn FnMut(f64, u32, u32, f64)>>,
+    /// Error callback closure (must keep alive)
+    _video_error_cb: Option<Closure<dyn FnMut(String)>>,
+    /// Video dimensions (updated from frame callback)
+    video_width: u32,
+    video_height: u32,
+    /// Volume and mute state
+    volume: f32,
+    muted: bool,
+}
+
+impl WebMoqSession {
+    /// Creates a new MoQ session for the given URL.
+    pub fn new(url: &str) -> Result<Self, VideoError> {
+        let moq_url = WebMoqUrl::parse(url)?;
+        Ok(Self {
+            url: moq_url,
+            session_id: None,
+            state: WebMoqSessionState::Init,
+            catalog: None,
+            video_decoder_id: None,
+            audio_id: None,
+            video_shared: Rc::new(RefCell::new(DecoderSharedState::default())),
+            _video_frame_cb: None,
+            _video_error_cb: None,
+            video_width: 0,
+            video_height: 0,
+            volume: 1.0,
+            muted: true, // Start muted per browser autoplay policy
+        })
+    }
+
+    /// Initiates the async connection. Returns a future that resolves when connected.
+    pub async fn connect(&mut self) -> Result<(), VideoError> {
+        self.state = WebMoqSessionState::Connecting;
+        let wt_url = self.url.webtransport_url();
+        let namespace = self.url.namespace().to_string();
+
+        match js_moq_connect(&wt_url, &namespace).await {
+            Ok(id_val) => {
+                let id = id_val
+                    .as_f64()
+                    .filter(|f| *f >= 0.0 && *f <= u32::MAX as f64)
+                    .map(|f| f as u32)
+                    .ok_or_else(|| {
+                        VideoError::DecoderInit(format!("Invalid session ID from JS: {:?}", id_val))
+                    })?;
+                self.session_id = Some(id);
+                self.state = WebMoqSessionState::Connected;
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!("{:?}", e);
+                self.state = WebMoqSessionState::Error(msg.clone());
+                Err(VideoError::OpenFailed(msg))
+            }
+        }
+    }
+
+    /// Polls the session state, checking for catalog availability.
+    /// Call this each frame from the render loop.
+    pub fn poll_state(&mut self) {
+        let Some(session_id) = self.session_id else {
+            return;
+        };
+
+        let js_state = js_moq_get_session_state(session_id);
+        match js_state.as_str() {
+            "catalog" | "playing" => {
+                // Check if we need to parse the catalog
+                if self.catalog.is_none() {
+                    if let Some(catalog_json) = js_moq_get_catalog(session_id) {
+                        self.parse_catalog(&catalog_json);
+                    }
+                }
+                if self.catalog.is_some()
+                    && !matches!(
+                        self.state,
+                        WebMoqSessionState::Playing | WebMoqSessionState::CatalogReady
+                    )
+                {
+                    self.state = WebMoqSessionState::CatalogReady;
+                }
+            }
+            "error" => {
+                let err = js_moq_get_error(session_id).unwrap_or_default();
+                self.state = WebMoqSessionState::Error(err);
+            }
+            "closed" => {
+                self.state = WebMoqSessionState::Closed;
+            }
+            _ => {}
+        }
+    }
+
+    fn parse_catalog(&mut self, json: &str) {
+        // Parse the catalog JSON from moq-transport-bridge.js
+        let Ok(parsed) = js_sys::JSON::parse(json) else {
+            return;
+        };
+
+        let mut video = Vec::new();
+        let mut audio = Vec::new();
+
+        // Parse video renditions
+        if let Ok(video_arr) = js_sys::Reflect::get(&parsed, &"video".into()) {
+            if let Some(arr) = video_arr.dyn_ref::<js_sys::Array>() {
+                for i in 0..arr.length() {
+                    let item = arr.get(i);
+                    let name = get_str(&item, "name").unwrap_or_default();
+                    let codec = get_str(&item, "codec").unwrap_or_default();
+                    let width = get_u32(&item, "width");
+                    let height = get_u32(&item, "height");
+                    let framerate = get_f32(&item, "framerate");
+                    let description = get_str(&item, "description");
+                    let (container_kind, timescale) = get_container(&item);
+
+                    video.push(WebMoqVideoRendition {
+                        name,
+                        codec,
+                        width,
+                        height,
+                        framerate,
+                        container_kind,
+                        timescale,
+                        description,
+                    });
+                }
+            }
+        }
+
+        // Parse audio renditions
+        if let Ok(audio_arr) = js_sys::Reflect::get(&parsed, &"audio".into()) {
+            if let Some(arr) = audio_arr.dyn_ref::<js_sys::Array>() {
+                for i in 0..arr.length() {
+                    let item = arr.get(i);
+                    let name = get_str(&item, "name").unwrap_or_default();
+                    let codec = get_str(&item, "codec").unwrap_or_default();
+                    let sample_rate = get_u32(&item, "sampleRate");
+                    let channels = get_u32(&item, "channels");
+                    let description = get_str(&item, "description");
+                    let (container_kind, timescale) = get_container(&item);
+
+                    audio.push(WebMoqAudioRendition {
+                        name,
+                        codec,
+                        sample_rate,
+                        channels,
+                        container_kind,
+                        timescale,
+                        description,
+                    });
+                }
+            }
+        }
+
+        self.catalog = Some(WebMoqCatalog { video, audio });
+    }
+
+    /// Starts video and audio playback from the catalog.
+    /// Call after poll_state() returns CatalogReady.
+    pub async fn start_playback(&mut self) -> Result<(), VideoError> {
+        let session_id = self
+            .session_id
+            .ok_or_else(|| VideoError::OpenFailed("Not connected".to_string()))?;
+
+        let catalog = self
+            .catalog
+            .as_ref()
+            .ok_or_else(|| VideoError::OpenFailed("No catalog".to_string()))?
+            .clone();
+
+        // Start first video rendition
+        if let Some(v) = catalog.video.first() {
+            self.start_video(session_id, v)?;
+        }
+
+        // Start first audio rendition (async for AudioContext init)
+        if let Some(a) = catalog.audio.first() {
+            self.start_audio(session_id, a).await;
+        }
+
+        self.state = WebMoqSessionState::Playing;
+        Ok(())
+    }
+
+    fn start_video(
+        &mut self,
+        session_id: u32,
+        rendition: &WebMoqVideoRendition,
+    ) -> Result<(), VideoError> {
+        // Create callbacks
+        let shared = self.video_shared.clone();
+        let frame_cb = Closure::new(move |timestamp: f64, w: u32, h: u32, duration: f64| {
+            let mut state = shared.borrow_mut();
+            state.latest_frame = Some(WebMoqFrameInfo {
+                timestamp_us: timestamp as i64,
+                width: w,
+                height: h,
+                duration_us: duration as i64,
+            });
+            state.frame_ready = true;
+            state.frame_count += 1;
+        });
+
+        let shared_err = self.video_shared.clone();
+        let error_cb = Closure::new(move |error: String| {
+            let mut state = shared_err.borrow_mut();
+            state.error_message = Some(error);
+        });
+
+        let decoder_id = js_moq_start_video(
+            session_id,
+            &rendition.name,
+            &rendition.codec,
+            rendition.width,
+            rendition.height,
+            &rendition.container_kind,
+            rendition.timescale,
+            rendition.description.clone(),
+            frame_cb.as_ref().unchecked_ref(),
+            error_cb.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| VideoError::DecoderInit(format!("Failed to start video: {:?}", e)))?;
+
+        self.video_decoder_id = Some(decoder_id);
+        self.video_width = rendition.width;
+        self.video_height = rendition.height;
+        self._video_frame_cb = Some(frame_cb);
+        self._video_error_cb = Some(error_cb);
+
+        tracing::info!(
+            "WebMoqSession: Started video decoder {} for {}",
+            decoder_id,
+            rendition.name
+        );
+        Ok(())
+    }
+
+    async fn start_audio(&mut self, session_id: u32, rendition: &WebMoqAudioRendition) {
+        match js_moq_start_audio(
+            session_id,
+            &rendition.name,
+            &rendition.codec,
+            rendition.sample_rate,
+            rendition.channels,
+            &rendition.container_kind,
+            rendition.timescale,
+            rendition.description.clone(),
+        )
+        .await
+        {
+            Ok(id_val) => {
+                let id = id_val.as_f64().unwrap_or(-1.0) as i32;
+                if id >= 0 {
+                    self.audio_id = Some(id);
+                    // Apply current volume/mute state
+                    js_moq_set_audio_muted(id, self.muted);
+                    js_moq_set_audio_volume(id, self.volume);
+                    tracing::info!("WebMoqSession: Started audio {} for {}", id, rendition.name);
+                } else {
+                    tracing::warn!(
+                        "WebMoqSession: Audio codec {} not supported",
+                        rendition.codec
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("WebMoqSession: Audio start failed: {:?}", e);
+            }
+        }
+    }
+
+    /// Polls for a new decoded video frame.
+    pub fn poll_frame(&mut self) -> Option<WebMoqFrameInfo> {
+        let mut state = self.video_shared.borrow_mut();
+        if state.frame_ready {
+            state.frame_ready = false;
+            if let Some(ref frame) = state.latest_frame {
+                self.video_width = frame.width;
+                self.video_height = frame.height;
+            }
+            state.latest_frame.clone()
+        } else {
+            None
+        }
+    }
+
+    /// Gets the latest decoded VideoFrame for GPU texture copy.
+    pub fn get_video_frame(&self) -> Option<VideoFrame> {
+        self.video_decoder_id.and_then(js_moq_get_video_frame)
+    }
+
+    /// Copies the current video frame to a wgpu texture.
+    ///
+    /// `moqGetVideoFrame` transfers ownership (nulls out JS handle), so we own it.
+    /// After the GPU copy we extract and `.close()` the frame to avoid GC warnings.
+    pub fn copy_to_wgpu_texture(
+        &self,
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+    ) -> Result<(), VideoError> {
+        let frame = self
+            .get_video_frame()
+            .ok_or_else(|| VideoError::DecodeFailed("No video frame available".to_string()))?;
+
+        let width = frame.display_width();
+        let height = frame.display_height();
+
+        let source_info = wgpu::CopyExternalImageSourceInfo {
+            source: wgpu::ExternalImageSource::VideoFrame(frame),
+            origin: wgpu::Origin2d::ZERO,
+            flip_y: false,
+        };
+
+        queue.copy_external_image_to_texture(
+            &source_info,
+            wgpu::CopyExternalImageDestInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+                color_space: wgpu::PredefinedColorSpace::Srgb,
+                premultiplied_alpha: false,
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        // Close the VideoFrame to release GPU resources (prevents GC warning)
+        if let wgpu::ExternalImageSource::VideoFrame(vf) = source_info.source {
+            vf.close();
+        }
+
+        Ok(())
+    }
+
+    /// Returns the video dimensions.
+    pub fn video_dimensions(&self) -> (u32, u32) {
+        (self.video_width, self.video_height)
+    }
+
+    /// Returns the current session state.
+    pub fn state(&self) -> &WebMoqSessionState {
+        &self.state
+    }
+
+    /// Returns the catalog if available.
+    pub fn catalog(&self) -> Option<&WebMoqCatalog> {
+        self.catalog.as_ref()
+    }
+
+    /// Returns the total video frame count.
+    pub fn video_frame_count(&self) -> u64 {
+        self.video_shared.borrow().frame_count
+    }
+
+    /// Sets the audio muted state.
+    pub fn set_muted(&mut self, muted: bool) {
+        self.muted = muted;
+        if let Some(id) = self.audio_id {
+            js_moq_set_audio_muted(id, muted);
+        }
+    }
+
+    /// Returns whether audio is muted.
+    pub fn is_muted(&self) -> bool {
+        self.muted
+    }
+
+    /// Sets the audio volume (0.0 to 1.0).
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = volume.clamp(0.0, 1.0);
+        if let Some(id) = self.audio_id {
+            js_moq_set_audio_volume(id, self.volume);
+        }
+    }
+
+    /// Returns the current volume.
+    pub fn volume(&self) -> f32 {
+        self.volume
+    }
+
+    /// Toggles mute state.
+    pub fn toggle_mute(&mut self) {
+        self.set_muted(!self.muted);
+    }
+
+    /// Returns the WebTransport URL.
+    pub fn webtransport_url(&self) -> String {
+        self.url.webtransport_url()
+    }
+
+    /// Returns the MoQ namespace.
+    pub fn namespace(&self) -> &str {
+        self.url.namespace()
+    }
+
+    /// Returns true if this URL is a MoQ URL.
+    pub fn is_moq_url(url: &str) -> bool {
+        WebMoqUrl::is_moq_url(url)
+    }
+
+    /// Returns extended stats for diagnostics overlay.
+    pub fn get_extended_stats(&self) -> Option<WebMoqStats> {
+        let session_id = self.session_id?;
+        let val = js_moq_get_extended_stats(session_id);
+        if val.is_null() || val.is_undefined() {
+            return None;
+        }
+
+        Some(WebMoqStats {
+            connection_version: get_u32(&val, "connectionVersion"),
+            video_decode_queue_size: get_u32(&val, "videoDecodeQueueSize"),
+            audio_decode_queue_size: get_u32(&val, "audioDecodeQueueSize"),
+            audio_context_state: get_str(&val, "audioContextState")
+                .unwrap_or_else(|| "closed".to_string()),
+            audio_stalled: js_sys::Reflect::get(&val, &"audioStalled".into())
+                .ok()
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            audio_timestamp_ms: js_sys::Reflect::get(&val, &"audioTimestampMs".into())
+                .ok()
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+            audio_frame_count: get_u32(&val, "audioFrameCount"),
+            audio_underflow_samples: get_u32(&val, "audioUnderflowSamples"),
+            audio_buffer_length: get_u32(&val, "audioBufferLength"),
+            audio_buffer_capacity: get_u32(&val, "audioBufferCapacity"),
+        })
+    }
+}
+
+/// Extended stats for MoQ diagnostics overlay.
+#[derive(Debug, Clone, Default)]
+pub struct WebMoqStats {
+    /// MoQ protocol version (e.g., 0xff070001)
+    pub connection_version: u32,
+    /// Number of encoded video chunks waiting to be decoded
+    pub video_decode_queue_size: u32,
+    /// Number of encoded audio chunks waiting to be decoded
+    pub audio_decode_queue_size: u32,
+    /// AudioContext state ("running", "suspended", "closed")
+    pub audio_context_state: String,
+    /// Whether the audio worklet ring buffer is stalled (buffering)
+    pub audio_stalled: bool,
+    /// Audio playback timestamp in ms
+    pub audio_timestamp_ms: f64,
+    /// Total decoded audio frames
+    pub audio_frame_count: u32,
+    /// Cumulative audio underflow samples
+    pub audio_underflow_samples: u32,
+    /// Current ring buffer fill level (samples)
+    pub audio_buffer_length: u32,
+    /// Ring buffer total capacity (samples)
+    pub audio_buffer_capacity: u32,
+}
+
+impl Drop for WebMoqSession {
+    fn drop(&mut self) {
+        if let Some(id) = self.video_decoder_id.take() {
+            js_moq_close_video(id);
+        }
+        if let Some(id) = self.audio_id.take() {
+            js_moq_close_audio(id);
+        }
+        if let Some(id) = self.session_id.take() {
+            js_moq_disconnect(id);
+        }
+    }
+}
+
+// ============================================================================
+// JS interop helpers
+// ============================================================================
+
+fn get_str(obj: &JsValue, key: &str) -> Option<String> {
+    js_sys::Reflect::get(obj, &key.into())
+        .ok()
+        .and_then(|v| v.as_string())
+}
+
+fn get_u32(obj: &JsValue, key: &str) -> u32 {
+    js_sys::Reflect::get(obj, &key.into())
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0) as u32
+}
+
+fn get_f32(obj: &JsValue, key: &str) -> Option<f32> {
+    js_sys::Reflect::get(obj, &key.into())
+        .ok()
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32)
+}
+
+fn get_container(obj: &JsValue) -> (String, u32) {
+    let container = js_sys::Reflect::get(obj, &"container".into()).ok();
+    if let Some(ref c) = container {
+        let kind = get_str(c, "kind").unwrap_or_else(|| "legacy".to_string());
+        let timescale = get_u32(c, "timescale");
+        (kind, timescale)
+    } else {
+        ("legacy".to_string(), 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_moq_url_parse() {
-        let url = WebMoqUrl::parse("moqs://relay.example.com/live/stream").unwrap();
-        assert_eq!(url.host, "relay.example.com");
-        assert_eq!(url.port, 443);
-        assert!(url.use_tls);
-        assert_eq!(url.namespace, "live");
-        assert_eq!(url.track, Some("stream".to_string()));
-    }
-
-    #[test]
-    fn test_moq_url_no_tls() {
-        let url = WebMoqUrl::parse("moq://localhost:4443/test/video").unwrap();
+    fn test_moq_url_parse_with_auth_path() {
+        let url = WebMoqUrl::parse("moq://localhost:4443/anon/bbb").unwrap();
         assert_eq!(url.host, "localhost");
         assert_eq!(url.port, 4443);
         assert!(!url.use_tls);
-        assert_eq!(url.webtransport_url(), "http://localhost:4443");
+        assert_eq!(url.auth_path, Some("anon".to_string()));
+        assert_eq!(url.namespace, "bbb");
+        assert_eq!(url.webtransport_url(), "http://localhost:4443/anon");
+    }
+
+    #[test]
+    fn test_moq_url_parse_no_auth_path() {
+        let url = WebMoqUrl::parse("moqs://relay.example.com/live").unwrap();
+        assert_eq!(url.host, "relay.example.com");
+        assert_eq!(url.port, 443);
+        assert!(url.use_tls);
+        assert_eq!(url.auth_path, None);
+        assert_eq!(url.namespace, "live");
+        assert_eq!(url.webtransport_url(), "https://relay.example.com:443");
     }
 
     #[test]

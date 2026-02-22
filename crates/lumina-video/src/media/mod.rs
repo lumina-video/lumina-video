@@ -152,7 +152,9 @@ pub use web_video::{
 
 #[cfg(target_arch = "wasm32")]
 pub use web_moq_decoder::{
-    codec_strings, WebMoqDecoder, WebMoqDecoderState, WebMoqFrameInfo, WebMoqTexture, WebMoqUrl,
+    codec_strings, WebMoqAudioRendition, WebMoqCatalog, WebMoqDecoder, WebMoqDecoderState,
+    WebMoqFrameInfo, WebMoqSession, WebMoqSessionState, WebMoqStats, WebMoqTexture, WebMoqUrl,
+    WebMoqVideoRendition,
 };
 
 /// Maximum texture size wgpu can handle without panicking.
