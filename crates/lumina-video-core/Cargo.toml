@@ -78,6 +78,8 @@ block2 = { workspace = true }
 objc2-core-foundation = { version = "0.3", features = ["CFNumber", "CFDictionary", "CFString"] }
 metal = { workspace = true }
 wgpu = { version = "24" }
+dispatch2 = "0.3"
+profiling = { version = "1.0" }
 
 # Windows native Media Foundation decoder
 [target.'cfg(target_os = "windows")'.dependencies]

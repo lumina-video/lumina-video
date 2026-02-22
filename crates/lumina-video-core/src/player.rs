@@ -186,6 +186,26 @@ impl CorePlayer {
             }
         };
 
+        // iOS: dispatch decoder creation to main queue for any-thread safety.
+        // run_on_main: if already on main thread, runs inline (no dispatch).
+        // Otherwise dispatches synchronously to main queue and waits.
+        // MacOSVideoDecoder::new() internally calls MainThreadMarker::new()
+        // which succeeds because run_on_main guarantees main-thread execution.
+        #[cfg(target_os = "ios")]
+        let ios_decoder_result: Option<Result<MacOSVideoDecoder, VideoError>> = {
+            if is_avfoundation_supported_container(&url) {
+                tracing::info!(
+                    "Initializing iOS VideoToolbox decoder (dispatching to main queue)"
+                );
+                let url_clone = url.clone();
+                Some(dispatch2::run_on_main(move |_mtm| {
+                    MacOSVideoDecoder::new(&url_clone)
+                }))
+            } else {
+                None
+            }
+        };
+
         #[cfg(target_os = "linux")]
         let linux_metrics_holder = Arc::clone(&self.linux_zero_copy_metrics);
 
@@ -216,15 +236,16 @@ impl CorePlayer {
 
             #[cfg(target_os = "ios")]
             let result: Result<Box<dyn VideoDecoderBackend + Send>, VideoError> = {
-                if is_avfoundation_supported_container(&url) {
-                    tracing::info!("Initializing iOS VideoToolbox decoder");
-                    MacOSVideoDecoder::new(&url)
-                        .map(|d| Box::new(d) as Box<dyn VideoDecoderBackend + Send>)
-                } else {
-                    Err(VideoError::DecoderInit(format!(
+                match ios_decoder_result {
+                    Some(Ok(d)) => {
+                        tracing::info!("Using iOS VideoToolbox hardware decoder");
+                        Ok(Box::new(d) as Box<dyn VideoDecoderBackend + Send>)
+                    }
+                    Some(Err(e)) => Err(e),
+                    None => Err(VideoError::DecoderInit(format!(
                         "Unsupported container format on iOS: {}",
                         url
-                    )))
+                    ))),
                 }
             };
 
