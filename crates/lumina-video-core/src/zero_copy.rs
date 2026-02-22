@@ -27,7 +27,7 @@
 //! | Linux | Vulkan | DMABuf (VA-API, V4L2) | Partial (single-plane only) |
 //! | Android | Vulkan | AHardwareBuffer (MediaCodec) | Rust ready, Java pending |
 //! | Windows | D3D12 | D3D11 Shared Handle | Partial (missing fence sync) |
-//! | iOS | Metal | IOSurface | Not yet implemented |
+//! | iOS | Metal | IOSurface | Shared with macOS (Metal/IOSurface) |
 //! | Web/WASM | WebGPU | N/A | Not supported (no external memory) |
 //!
 //! # Feature Flag
@@ -40,7 +40,7 @@
 //! lumina-video = { version = "..." }
 //! ```
 //!
-//! To disable zero-copy (e.g., for unsupported platforms like iOS or WASM),
+//! To disable zero-copy (e.g., for unsupported platforms like WASM),
 //! use `default-features = false`:
 //!
 //! ```toml
@@ -48,7 +48,7 @@
 //! lumina-video = { version = "...", default-features = false, features = ["macos-native-video"] }
 //! ```
 //!
-//! **Note:** On unsupported platforms (iOS, WASM, etc.), compilation will fail
+//! **Note:** On unsupported platforms (WASM, etc.), compilation will fail
 //! with a clear error message about platform support if zero-copy is enabled.
 //!
 //! # How It Works
@@ -109,7 +109,7 @@ compile_error!(
 ///
 /// # Supported Platforms
 ///
-/// - macOS: Metal backend with IOSurface
+/// - macOS/iOS: Metal backend with IOSurface
 /// - Linux: Vulkan backend with DMABuf
 /// - Android: Vulkan backend with AHardwareBuffer
 /// - Windows: D3D12 backend with D3D11 shared handles

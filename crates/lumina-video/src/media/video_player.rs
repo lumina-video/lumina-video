@@ -403,7 +403,9 @@ impl VideoPlayer {
         #[cfg(feature = "moq")]
         if let Some(ref promise) = self.moq_init_promise {
             if promise.ready().is_some() {
-                let promise = self.moq_init_promise.take().unwrap();
+                let Some(promise) = self.moq_init_promise.take() else {
+                    return false;
+                };
                 self.moq_init_thread = None;
                 match promise.try_take() {
                     Ok(Ok(decoder)) => {
