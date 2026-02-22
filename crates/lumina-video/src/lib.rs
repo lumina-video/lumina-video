@@ -64,7 +64,7 @@ pub use media::{
     SYNC_DRIFT_THRESHOLD_MS,
 };
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use media::{FfmpegDecoder, FfmpegDecoderBuilder, HwAccelConfig};
 
 #[cfg(target_os = "android")]

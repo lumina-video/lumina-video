@@ -56,11 +56,11 @@ pub use lumina_video_core::network;
 pub use lumina_video_core::player;
 
 // Platform-specific re-exports
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use lumina_video_core::macos_video;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use lumina_video_core::audio_decoder;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use lumina_video_core::video_decoder;
 
 #[cfg(target_os = "linux")]
@@ -83,6 +83,7 @@ pub use lumina_video_core::windows_audio;
 // Zero-copy module
 #[cfg(any(
     target_os = "macos",
+    target_os = "ios",
     target_os = "linux",
     target_os = "android",
     all(target_os = "windows", feature = "windows-native-video")
@@ -129,7 +130,7 @@ pub use video::{
     VideoFrame, VideoMetadata, VideoPlayerHandle, VideoState,
 };
 pub use video_controls::{VideoControls, VideoControlsConfig, VideoControlsResponse};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use video_decoder::{FfmpegDecoder, FfmpegDecoderBuilder, HwAccelConfig};
 #[cfg(not(target_arch = "wasm32"))]
 pub use video_player::{VideoPlayer, VideoPlayerExt, VideoPlayerResponse};
@@ -137,7 +138,7 @@ pub use video_player::{VideoPlayer, VideoPlayerExt, VideoPlayerResponse};
 #[cfg(target_os = "android")]
 pub use android_video::{AndroidVideoDecoder, AndroidZeroCopySnapshot, ZeroCopyStatus};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use macos_video::{MacOSVideoDecoder, MacOSZeroCopyStatsSnapshot};
 
 #[cfg(target_os = "linux")]
@@ -165,6 +166,7 @@ pub use nostr_discovery::{DiscoveryEvent, MoqStream, NostrDiscovery, StreamStatu
 
 #[cfg(any(
     target_os = "macos",
+    target_os = "ios",
     target_os = "linux",
     target_os = "android",
     all(target_os = "windows", feature = "windows-native-video")

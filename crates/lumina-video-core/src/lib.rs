@@ -41,11 +41,11 @@ pub mod player;
 
 // === Platform decoders ===
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod macos_video;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod audio_decoder;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod video_decoder;
 
 #[cfg(target_os = "linux")]
@@ -69,6 +69,7 @@ pub mod windows_audio;
 
 #[cfg(any(
     target_os = "macos",
+    target_os = "ios",
     target_os = "linux",
     target_os = "android",
     all(target_os = "windows", feature = "windows-native-video")
