@@ -36,6 +36,8 @@ pub mod sync_metrics;
 pub mod triple_buffer;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod network;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod player;
 
 // === Platform decoders ===
 

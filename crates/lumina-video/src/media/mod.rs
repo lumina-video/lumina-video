@@ -52,6 +52,8 @@ pub use lumina_video_core::sync_metrics;
 pub use lumina_video_core::triple_buffer;
 #[cfg(not(target_arch = "wasm32"))]
 pub use lumina_video_core::network;
+#[cfg(not(target_arch = "wasm32"))]
+pub use lumina_video_core::player;
 
 // Platform-specific re-exports
 #[cfg(target_os = "macos")]
