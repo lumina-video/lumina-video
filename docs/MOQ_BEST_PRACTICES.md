@@ -1,6 +1,6 @@
 # MoQ Best Practices for lumina-video
 
-MoQ-specific protocol, transport, and media rules for the lumina-video project. For general Rust development standards, see [AGENTS.md](AGENTS.md). For VOD A/V sync patterns, see [NATIVE_AV_SYNC.md](crates/lumina-video/src/media/NATIVE_AV_SYNC.md).
+MoQ-specific protocol, transport, and media rules for the lumina-video project. For general Rust development standards, see [AGENTS.md](../AGENTS.md). For VOD A/V sync patterns, see [NATIVE_AV_SYNC.md](../crates/lumina-video/src/media/NATIVE_AV_SYNC.md).
 
 Based on MoQ Transport draft-15 (via moq-lite).
 
@@ -68,7 +68,7 @@ Reference: `crates/lumina-video/src/media/moq/worker.rs` — audio track at prio
 ### Timeline Rules
 - Tracks sharing the same namespace share the same timeline.
 - Timestamps are integer-based: `numerator / timebase`. Never use floating-point for media timestamps.
-- Audio is the master clock for video frame selection (see [NATIVE_AV_SYNC.md](crates/lumina-video/src/media/NATIVE_AV_SYNC.md) for detailed rationale).
+- Audio is the master clock for video frame selection (see [NATIVE_AV_SYNC.md](../crates/lumina-video/src/media/NATIVE_AV_SYNC.md) for detailed rationale).
 
 ### MoQ-Specific Pitfalls
 - **Publisher vs viewer time**: MoQ PTS uses publisher wall-clock time (~7200s into a stream) while the viewer starts at ~0s. Do NOT bind MoQ audio position to `FrameScheduler` — the position jump will freeze video playback.
