@@ -190,9 +190,7 @@ struct DiagnosticsPanel: View {
             DiagRow(label: "Measured FPS",
                     value: String(format: "%.1f", viewModel.measuredFPS))
             DiagRow(label: "A/V sync",
-                    value: "AVPlayer (native)")
-            DiagRow(label: "Clock drift",
-                    value: viewModel.clockDriftLabel)
+                    value: viewModel.isLive ? viewModel.clockDriftLabel : "AVPlayer (native)")
         }
         .padding(10)
         .background(Color(.secondarySystemBackground))
@@ -237,6 +235,9 @@ final class VideoViewModel: ObservableObject {
     @Published var nominalFPS: Float?
     @Published var measuredFPS: Double = 0
     @Published var clockDriftLabel: String = "—"
+
+    /// True for live streams (MoQ), false for VOD (HLS/MP4). Clock drift only shown for live.
+    var isLive: Bool { duration == nil }
 
     @Published var isMuted = true {
         didSet { player?.is_muted = isMuted }
