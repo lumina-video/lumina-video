@@ -781,6 +781,11 @@ impl WebVideoTexture {
         }
     }
 
+    /// Returns the underlying wgpu texture.
+    pub fn texture(&self) -> &wgpu::Texture {
+        &self.texture
+    }
+
     /// Returns the bind group for rendering.
     pub fn bind_group(&self) -> &wgpu::BindGroup {
         &self.bind_group

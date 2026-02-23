@@ -90,10 +90,6 @@ const MOQ_RELAYS: &[(&str, &str)] = &[
     ("cdn.moq.dev (anon)", "moqs://cdn.moq.dev:443/anon"),
     ("cdn.moq.dev", "moqs://cdn.moq.dev:443"),
     ("localhost (anon)", "moq://localhost:4443/anon"),
-    (
-        "Cloudflare (interop)",
-        "moqs://interop-relay.cloudflare.mediaoverquic.com:443",
-    ),
     ("zap.stream (US)", "moqs://api-core.zap.stream:1443"),
     ("zap.stream (UK)", "moqs://api-uk.zap.stream:1443"),
 ];
