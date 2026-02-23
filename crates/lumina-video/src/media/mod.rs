@@ -74,7 +74,7 @@ pub use lumina_video_core::linux_video_gst;
 pub use lumina_video_core::android_video;
 #[cfg(target_os = "android")]
 pub use lumina_video_core::android_vulkan;
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "android-zero-copy"))]
 pub use lumina_video_core::ndk_image_reader;
 
 #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
