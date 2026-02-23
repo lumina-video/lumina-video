@@ -14,7 +14,8 @@ target
 .gradle
 .git
 /dist
-/packages
+/packages/*
+!/packages/lumina_video_flutter/
 .direnv/
 # SPM build artifacts
 .build/
