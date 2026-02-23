@@ -6,7 +6,7 @@
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/lumina-video/lumina-video)
 
 
-> ⚠️ **Experimental** 👷 - macOS, Linux, and Web are tested and working with zero-copy GPU rendering. Android achieves 1 GPU hop. Windows is untested.
+> ⚠️ **Experimental** 👷 - macOS, Linux, Web, and iOS are tested and working with zero-copy GPU rendering. Android achieves 1 GPU hop. Windows is untested.
 
 Hardware-accelerated embedded video player for [egui](https://github.com/emilk/egui) with zero-copy GPU rendering. Decoded frames are delivered as [`wgpu::Texture`](https://docs.rs/wgpu) — no CPU roundtrips on supported platforms.
 
@@ -215,6 +215,62 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 </details>
 
 <details>
+<summary><b>iOS</b></summary>
+
+**Prerequisites:** macOS, Xcode 15+, [Rust toolchain](https://rustup.rs/), iOS target (`rustup target add aarch64-apple-ios aarch64-apple-ios-sim`)
+
+lumina-video provides a native Swift wrapper (`LuminaVideoBridge`) around a C FFI layer, giving iOS apps zero-copy Metal rendering via IOSurface.
+
+```bash
+# Build the Rust static library for iOS Simulator (arm64)
+./ios/build-ios.sh sim
+
+# Build for device
+./ios/build-ios.sh device
+```
+
+**Swift Package integration:**
+
+The `LuminaVideoBridge` Swift package at `ios/lumina-video-bridge/` provides:
+- `LuminaVideoPlayer` — `ObservableObject` with play/pause/seek/volume/mute
+- `LuminaVideoFrame` — decoded frame with `IOSurface` for zero-copy Metal rendering
+- `LuminaVideoDiagnostics` — FFI lifecycle counters
+
+```swift
+import LuminaVideoBridge
+
+let player = try LuminaVideoPlayer(url: "https://example.com/video.m3u8")
+player.delegate = self
+player.play()
+
+// Delegate receives frames at vsync:
+func luminaPlayer(_ player: LuminaVideoPlayer, didReceiveFrame frame: LuminaVideoFrame) {
+    // frame.ioSurface → MTLTexture via device.makeTexture(descriptor:iosurface:plane:)
+}
+```
+
+**Architecture:** `Rust (VideoToolbox/AVPlayer) → C FFI → Swift wrapper → SwiftUI/Metal`
+
+AVPlayer handles both video and audio natively with guaranteed A/V sync. Video frames are delivered as IOSurfaces for zero-copy Metal rendering — no CPU readback.
+
+**Test harness app:**
+
+```bash
+# Install xcodegen and generate project
+brew install xcodegen
+cd ios/test-harness
+xcodegen generate
+
+# Build and run on simulator
+xcodebuild -project LuminaTestHarness.xcodeproj \
+  -scheme LuminaTestHarness \
+  -destination 'platform=iOS Simulator,name=iPhone 16 Pro' \
+  EXCLUDED_ARCHS=x86_64 build
+```
+
+</details>
+
+<details>
 <summary><b>Windows</b></summary>
 
 **Prerequisites:** Windows 10+, [Rust toolchain](https://rustup.rs/), LLVM (for FFmpeg audio)
@@ -245,7 +301,8 @@ cargo run --package lumina-video-demo --features windows-native-video
 
 | Platform | Decoder | Zero-Copy | Status |
 |----------|---------|-----------|--------|
-| macOS | VideoToolbox + FFmpeg | Yes (MP4) | **Tested** |
+| macOS | VideoToolbox + FFmpeg | Yes (IOSurface) | **Tested** |
+| iOS | VideoToolbox (AVPlayer) | Yes (IOSurface → Metal) | **Tested** |
 | Linux | GStreamer + VA-API | Yes (DMABuf) | **Tested** |
 | Android | ExoPlayer | 1 GPU hop* | **Tested** |
 | Web | HTMLVideoElement | GPU-to-GPU | **Tested** |
@@ -273,6 +330,7 @@ cargo run --package lumina-video-demo --features windows-native-video
 | Platform | What's Included | Feature Flag |
 |----------|-----------------|--------------|
 | macOS | VideoToolbox + FFmpeg (MKV/WebM) | None (always-on) |
+| iOS | VideoToolbox (AVPlayer) + Metal | None (always-on) |
 | Linux | GStreamer + Vulkan DMABuf | None (always-on) |
 | Android | MediaCodec + Vulkan AHardwareBuffer | None (always-on) |
 | Web | HTMLVideoElement + WebGPU | None (always-on) |
@@ -428,7 +486,7 @@ cargo build --features vendored-runtime
 cargo build --features windows-native-video
 ```
 
-**[Android build guide →](docs/ANDROID.md)**
+**[Android build guide →](docs/ANDROID.md)** | **[iOS build guide →](docs/IOS.md)**
 
 ## Architecture
 
@@ -443,10 +501,22 @@ lumina-video                            GPU backend: wgpu (Vulkan, Metal, DX12, 
 ├── sync_metrics.rs    # A/V drift tracking and quality metrics
 ├── moq_audio.rs       # MoQ audio pipeline (AAC/Opus decode → ring buffer)
 ├── moq_decoder.rs     # MoQ video decode + shared state (VTDecoder, MediaCodec)
-├── macos_video.rs     # VideoToolbox (macOS)
+├── macos_video.rs     # VideoToolbox + AVPlayer (macOS/iOS)
 ├── linux_video.rs     # GStreamer + VA-API (Linux)
 ├── windows_video.rs   # Media Foundation + DXVA (Windows)
 └── android_video.rs   # MediaCodec (Android)
+
+ios/
+├── lumina-video-bridge/     # Swift Package wrapping C FFI
+│   ├── CHeaders/            # C header + modulemap for FFI
+│   └── Sources/LuminaVideoBridge/
+│       ├── LuminaVideoPlayer.swift      # ObservableObject, CADisplayLink polling
+│       ├── LuminaVideoFrame.swift       # IOSurface ownership wrapper
+│       ├── LuminaVideoPlayerDelegate.swift
+│       ├── LuminaVideoState.swift
+│       ├── LuminaVideoError.swift
+│       └── LuminaDiagnostics.swift
+└── test-harness/            # Minimal SwiftUI + Metal test app (xcodegen)
 ```
 
 **[Zero-copy internals →](docs/ZERO-COPY.md)** | **[A/V sync details →](docs/AV-SYNC.md)**
@@ -457,11 +527,11 @@ lumina-video                            GPU backend: wgpu (Vulkan, Metal, DX12, 
 |---------|----------|----------|-------------|-----|
 | **HW Decode** | Yes (native) | Web only | No | No |
 | **Rendering** | Zero-copy GPU | CPU decode, GPU convert | CPU upload | CPU upload |
-| **Android/Web** | Yes / Yes | No / Yes | No | No |
+| **iOS/Android/Web** | Yes / Yes / Yes | No / No / Yes | No | No |
 | **External deps** | macOS: FFmpeg; others: none | FFmpeg | FFmpeg+SDL2 | FFmpeg |
 | **License** | MIT/Apache-2.0 | MIT/Apache | MIT | MIT |
 
-**lumina-video**: Hardware-accelerated decoding + zero-copy GPU rendering. Android, Web, and desktop (macOS/Linux tested; Windows WIP).
+**lumina-video**: Hardware-accelerated decoding + zero-copy GPU rendering. iOS, Android, Web, and desktop (macOS/Linux tested; Windows WIP).
 
 **re_video**: Part of Rerun SDK. Native uses FFmpeg software decode + GPU conversion; Web uses browser WebCodecs (HW accelerated). No native Android.
 
