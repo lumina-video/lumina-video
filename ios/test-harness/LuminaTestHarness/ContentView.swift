@@ -302,33 +302,37 @@ final class VideoViewModel: ObservableObject {
     private func recordFrameArrival() {
         let now = CACurrentMediaTime()
         frameTimestamps.append(now)
+
         // Trim to window
         let cutoff = now - fpsWindowSeconds
         frameTimestamps.removeAll { $0 < cutoff }
-        if frameTimestamps.count >= 2 {
-            let span = frameTimestamps.last! - frameTimestamps.first!
+
+        if let first = frameTimestamps.first, let last = frameTimestamps.last,
+           frameTimestamps.count >= 2 {
+            let span = last - first
             if span > 0 {
                 measuredFPS = Double(frameTimestamps.count - 1) / span
             }
         }
 
         // Infer nominal FPS from unique position changes (content frame rate)
-        if nominalFPS == nil {
-            let pos = currentTime
-            if pos != lastFramePosition {
-                lastFramePosition = pos
-                uniquePositionTimestamps.append(now)
-                let uniqCutoff = now - 2.0 // 2s window for stability
-                uniquePositionTimestamps.removeAll { $0 < uniqCutoff }
-                if uniquePositionTimestamps.count >= 10 {
-                    let span = uniquePositionTimestamps.last! - uniquePositionTimestamps.first!
-                    if span > 0 {
-                        let raw = Double(uniquePositionTimestamps.count - 1) / span
-                        nominalFPS = snapToStandardFPS(raw)
-                    }
-                }
-            }
-        }
+        guard nominalFPS == nil else { return }
+        let pos = currentTime
+        guard pos != lastFramePosition else { return }
+
+        lastFramePosition = pos
+        uniquePositionTimestamps.append(now)
+        let uniqCutoff = now - 2.0
+        uniquePositionTimestamps.removeAll { $0 < uniqCutoff }
+
+        guard uniquePositionTimestamps.count >= 10,
+              let first = uniquePositionTimestamps.first,
+              let last = uniquePositionTimestamps.last else { return }
+        let span = last - first
+        guard span > 0 else { return }
+
+        let raw = Double(uniquePositionTimestamps.count - 1) / span
+        nominalFPS = snapToStandardFPS(raw)
     }
 
     private func snapToStandardFPS(_ fps: Double) -> Float {
@@ -460,13 +464,10 @@ private func fourCCToString(_ code: FourCharCode) -> String {
     case kAudioFormatLinearPCM:            return "PCM"
     default:
         // Decode FourCC bytes
-        let chars: [Character] = [
-            Character(UnicodeScalar((code >> 24) & 0xFF)!),
-            Character(UnicodeScalar((code >> 16) & 0xFF)!),
-            Character(UnicodeScalar((code >> 8) & 0xFF)!),
-            Character(UnicodeScalar(code & 0xFF)!)
-        ]
-        return String(chars).trimmingCharacters(in: .whitespaces)
+        let bytes = [code >> 24, code >> 16, code >> 8, code].map { $0 & 0xFF }
+        let chars = bytes.compactMap { UnicodeScalar($0) }.map { Character($0) }
+        let result = String(chars).trimmingCharacters(in: .whitespaces)
+        return result.isEmpty ? "0x\(String(code, radix: 16))" : result
     }
 }
 

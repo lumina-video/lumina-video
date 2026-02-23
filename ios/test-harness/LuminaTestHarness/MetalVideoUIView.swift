@@ -1,7 +1,8 @@
-import UIKit
+import IOSurface
+import LuminaVideoBridge
 import Metal
 import MetalKit
-import IOSurface
+import UIKit
 
 /// UIView backed by CAMetalLayer that renders IOSurface frames via Metal.
 ///
@@ -10,11 +11,16 @@ import IOSurface
 final class MetalVideoUIView: UIView {
     override class var layerClass: AnyClass { CAMetalLayer.self }
 
-    private var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
+    private var metalLayer: CAMetalLayer? { layer as? CAMetalLayer }
     private var device: MTLDevice?
     private var commandQueue: MTLCommandQueue?
     private var pipelineState: MTLRenderPipelineState?
     private var sampler: MTLSamplerState?
+
+    // Cached descriptor — reused when frame dimensions haven't changed
+    private var cachedTexDesc: MTLTextureDescriptor?
+    private var cachedDescWidth: Int = 0
+    private var cachedDescHeight: Int = 0
 
     /// Set by the SwiftUI coordinator to trigger redraws.
     var currentFrame: LuminaVideoFrame? {
@@ -32,7 +38,8 @@ final class MetalVideoUIView: UIView {
     }
 
     private func setup() {
-        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let metalLayer else { return }
         self.device = device
         self.commandQueue = device.makeCommandQueue()
 
@@ -69,6 +76,7 @@ final class MetalVideoUIView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        guard let metalLayer else { return }
         metalLayer.drawableSize = CGSize(
             width: bounds.width * metalLayer.contentsScale,
             height: bounds.height * metalLayer.contentsScale
@@ -76,19 +84,27 @@ final class MetalVideoUIView: UIView {
     }
 
     private func draw() {
-        guard let device, let commandQueue, let pipelineState, let sampler else { return }
+        guard let device, let commandQueue, let pipelineState, let sampler,
+              let metalLayer else { return }
         guard let frame = currentFrame, let ioSurface = frame.ioSurface else { return }
 
-        // Create texture from IOSurface — zero-copy
-        let texDesc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .bgra8Unorm,
-            width: frame.width,
-            height: frame.height,
-            mipmapped: false
-        )
-        texDesc.usage = [.shaderRead]
-        texDesc.storageMode = .shared
+        // Reuse texture descriptor when frame dimensions haven't changed
+        if frame.width != cachedDescWidth || frame.height != cachedDescHeight {
+            let desc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .bgra8Unorm,
+                width: frame.width,
+                height: frame.height,
+                mipmapped: false
+            )
+            desc.usage = [.shaderRead]
+            desc.storageMode = .shared
+            cachedTexDesc = desc
+            cachedDescWidth = frame.width
+            cachedDescHeight = frame.height
+        }
+        guard let texDesc = cachedTexDesc else { return }
 
+        // New texture each frame — each IOSurface is a different backing store
         guard let texture = device.makeTexture(
             descriptor: texDesc,
             iosurface: ioSurface as IOSurfaceRef,
@@ -116,6 +132,3 @@ final class MetalVideoUIView: UIView {
         commandBuffer.commit()
     }
 }
-
-// Import the frame type
-import LuminaVideoBridge
