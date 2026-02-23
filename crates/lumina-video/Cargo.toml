@@ -262,4 +262,5 @@ moq = ["async-channel", "bytes", "hang", "moq-lite", "moq-native", "nostr-sdk", 
 
 [lints.rust]
 # Allow objc crate's legacy cargo-clippy cfg check (fixed in newer versions but we use 0.2.x via metal-rs)
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(feature, values(\"cargo-clippy\"))"] }
+# Also allow android-zero-copy (planned feature, not yet in [features] table)
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(feature, values(\"cargo-clippy\", \"android-zero-copy\"))"] }
