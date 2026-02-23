@@ -1,0 +1,43 @@
+name: LuminaTestHarness
+options:
+  bundleIdPrefix: com.lumina.test
+  deploymentTarget:
+    iOS: "16.0"
+  xcodeVersion: "15.0"
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    SWIFT_STRICT_CONCURRENCY: minimal
+
+packages:
+  LuminaVideoBridge:
+    path: ../lumina-video-bridge
+
+targets:
+  LuminaTestHarness:
+    type: application
+    platform: iOS
+    sources:
+      - LuminaTestHarness
+    dependencies:
+      - package: LuminaVideoBridge
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lumina.test.harness
+        INFOPLIST_GENERATION_MODE: GeneratedByXcode
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: "YES"
+        LIBRARY_SEARCH_PATHS:
+          - "$(inherited)"
+          - "$(SRCROOT)/../../target/aarch64-apple-ios-sim/release"
+          - "$(SRCROOT)/../../target/aarch64-apple-ios/release"
+        EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
+        OTHER_LDFLAGS:
+          - "$(inherited)"
+          - "-lz"
+          - "-liconv"
+          - "-lbz2"
+          - "-lc++"

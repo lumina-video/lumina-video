@@ -19,6 +19,7 @@ public struct AudioSessionConfig {
 ///
 /// CADisplayLink strongly retains its target. Without this proxy, the cycle
 /// `LuminaVideoPlayer → displayLink → LuminaVideoPlayer` prevents deallocation.
+@MainActor
 private class DisplayLinkProxy {
     weak var target: LuminaVideoPlayer?
 
