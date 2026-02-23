@@ -23,6 +23,9 @@ targets = [
 ]
 
 [dependencies]
+# Core decode + zero-copy pipeline (egui-free)
+lumina-video-core = { path = "../lumina-video-core" }
+
 # Core egui
 egui = { workspace = true }
 eframe = { workspace = true }
@@ -240,7 +243,7 @@ default = []
 
 # Windows: Native Media Foundation + DXVA2/D3D11VA hardware acceleration
 # This is opt-in until the Windows zero-copy implementation is validated
-windows-native-video = ["windows", "rodio", "profiling"]
+windows-native-video = ["lumina-video-core/windows-native-video", "windows", "rodio", "profiling"]
 
 # Profiling support (enabled automatically with windows-native-video)
 profiling = ["dep:profiling"]
@@ -249,7 +252,7 @@ profiling = ["dep:profiling"]
 # This eliminates the need for users to install GStreamer system packages.
 # The vendored libraries are loaded from `vendor/linux-x86_64/lib/` relative to the executable.
 # LGPL compliance: See vendor/README.md for source availability and relinking instructions.
-vendored-runtime = []
+vendored-runtime = ["lumina-video-core/vendored-runtime"]
 
 # MoQ: Media over QUIC live streaming transport
 # Feeds encoded media into FFmpeg for decoding, reusing existing frame queue and A/V sync
@@ -259,4 +262,5 @@ moq = ["async-channel", "bytes", "hang", "moq-lite", "moq-native", "nostr-sdk", 
 
 [lints.rust]
 # Allow objc crate's legacy cargo-clippy cfg check (fixed in newer versions but we use 0.2.x via metal-rs)
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(feature, values(\"cargo-clippy\"))"] }
+# Also allow android-zero-copy (planned feature, not yet in [features] table)
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(feature, values(\"cargo-clippy\", \"android-zero-copy\"))"] }

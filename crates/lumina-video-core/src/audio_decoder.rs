@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use super::audio::AudioSamples;
+use crate::audio::AudioSamples;
 
 /// Audio decoder error types.
 #[derive(Debug, Clone)]

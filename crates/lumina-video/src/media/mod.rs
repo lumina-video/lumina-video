@@ -30,23 +30,78 @@
 //!
 //! This is a known working configuration and works with upstream egui/eframe.
 
-#[cfg(target_os = "android")]
-pub mod android_video;
-#[cfg(target_os = "android")]
-pub mod android_vulkan;
-pub mod audio;
-#[cfg(target_os = "macos")]
-pub mod audio_decoder;
+// =============================================================================
+// Re-export moved modules from lumina-video-core
+// =============================================================================
+// These re-exports preserve super:: paths for MoQ and other local consumers.
+
+pub use lumina_video_core::audio;
+pub use lumina_video_core::subtitles;
+pub use lumina_video_core::video;
+
+// audio_ring_buffer: pub in core for cross-crate access. NOT public API — do not stabilize.
+// Required by moq_audio.rs (super::audio_ring_buffer::RingBufferConfig).
+// Unused without the "moq" feature, but the cfg must match core's module gate.
+#[allow(unused_imports)]
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
-pub(crate) mod audio_ring_buffer;
+pub(crate) use lumina_video_core::audio_ring_buffer;
+
 #[cfg(not(target_arch = "wasm32"))]
-pub mod frame_queue;
+pub use lumina_video_core::frame_queue;
+#[cfg(not(target_arch = "wasm32"))]
+pub use lumina_video_core::network;
+#[cfg(not(target_arch = "wasm32"))]
+pub use lumina_video_core::player;
+#[cfg(not(target_arch = "wasm32"))]
+pub use lumina_video_core::sync_metrics;
+#[cfg(not(target_arch = "wasm32"))]
+pub use lumina_video_core::triple_buffer;
+
+// Platform-specific re-exports
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub use lumina_video_core::audio_decoder;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub use lumina_video_core::macos_video;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub use lumina_video_core::video_decoder;
+
 #[cfg(target_os = "linux")]
-pub mod linux_video;
+pub use lumina_video_core::linux_video;
 #[cfg(target_os = "linux")]
-pub mod linux_video_gst;
-#[cfg(target_os = "macos")]
-pub mod macos_video;
+pub use lumina_video_core::linux_video_gst;
+
+#[cfg(target_os = "android")]
+pub use lumina_video_core::android_video;
+#[cfg(target_os = "android")]
+pub use lumina_video_core::android_vulkan;
+#[cfg(all(target_os = "android", feature = "android-zero-copy"))]
+pub use lumina_video_core::ndk_image_reader;
+
+#[cfg(all(target_os = "windows", feature = "windows-native-video"))]
+pub use lumina_video_core::windows_audio;
+#[cfg(all(target_os = "windows", feature = "windows-native-video"))]
+pub use lumina_video_core::windows_video;
+
+// Zero-copy module
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "android",
+    all(target_os = "windows", feature = "windows-native-video")
+))]
+pub use lumina_video_core::zero_copy;
+
+// =============================================================================
+// Local modules (egui layer — stay in lumina-video)
+// =============================================================================
+
+pub mod video_controls;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod video_player;
+pub mod video_texture;
+
+// MoQ modules (stay in lumina-video, import from core via re-exports)
 #[cfg(all(not(target_arch = "wasm32"), feature = "moq"))]
 pub mod moq;
 #[cfg(all(
@@ -56,40 +111,18 @@ pub mod moq;
 pub(crate) mod moq_audio;
 #[cfg(all(not(target_arch = "wasm32"), feature = "moq"))]
 pub mod moq_decoder;
-#[cfg(target_os = "android")]
-pub mod ndk_image_reader;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod network;
 #[cfg(all(not(target_arch = "wasm32"), feature = "moq"))]
 pub mod nostr_discovery;
-pub mod subtitles;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod sync_metrics;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod triple_buffer;
-pub mod video;
-pub mod video_controls;
-#[cfg(target_os = "macos")]
-pub mod video_decoder;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod video_player;
-pub mod video_texture;
+
+// Web/WASM modules
 #[cfg(target_arch = "wasm32")]
 pub mod web_moq_decoder;
 #[cfg(target_arch = "wasm32")]
 pub mod web_video;
-#[cfg(all(target_os = "windows", feature = "windows-native-video"))]
-pub mod windows_audio;
-#[cfg(all(target_os = "windows", feature = "windows-native-video"))]
-pub mod windows_video;
-// Zero-copy module available on all platforms with native decoders
-#[cfg(any(
-    target_os = "macos",
-    target_os = "linux",
-    target_os = "android",
-    all(target_os = "windows", feature = "windows-native-video")
-))]
-pub mod zero_copy;
+
+// =============================================================================
+// Type re-exports
+// =============================================================================
 
 // Re-export main types
 pub use audio::{AudioConfig, AudioHandle, AudioPlayer, AudioSamples, AudioState, AudioSync};
@@ -99,7 +132,7 @@ pub use video::{
     VideoFrame, VideoMetadata, VideoPlayerHandle, VideoState,
 };
 pub use video_controls::{VideoControls, VideoControlsConfig, VideoControlsResponse};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use video_decoder::{FfmpegDecoder, FfmpegDecoderBuilder, HwAccelConfig};
 #[cfg(not(target_arch = "wasm32"))]
 pub use video_player::{VideoPlayer, VideoPlayerExt, VideoPlayerResponse};
@@ -107,7 +140,7 @@ pub use video_player::{VideoPlayer, VideoPlayerExt, VideoPlayerResponse};
 #[cfg(target_os = "android")]
 pub use android_video::{AndroidVideoDecoder, AndroidZeroCopySnapshot, ZeroCopyStatus};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use macos_video::{MacOSVideoDecoder, MacOSZeroCopyStatsSnapshot};
 
 #[cfg(target_os = "linux")]
@@ -135,6 +168,7 @@ pub use nostr_discovery::{DiscoveryEvent, MoqStream, NostrDiscovery, StreamStatu
 
 #[cfg(any(
     target_os = "macos",
+    target_os = "ios",
     target_os = "linux",
     target_os = "android",
     all(target_os = "windows", feature = "windows-native-video")

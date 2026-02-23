@@ -11,11 +11,11 @@ use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 
-use super::audio::AudioHandle;
+use crate::audio::AudioHandle;
 #[cfg(target_os = "macos")]
-use super::audio_decoder::AudioDecoder;
-use super::sync_metrics::{StallType, SyncMetrics};
-use super::video::{VideoDecoderBackend, VideoFrame};
+use crate::audio_decoder::AudioDecoder;
+use crate::sync_metrics::{StallType, SyncMetrics};
+use crate::video::{VideoDecoderBackend, VideoFrame};
 
 /// Default number of frames to buffer ahead.
 const DEFAULT_BUFFER_SIZE: usize = 5;
@@ -31,9 +31,9 @@ pub enum DecodeCommand {
     Seek(Duration),
     /// Stop the decode thread
     Stop,
-    /// Set muted state (Android only - audio controlled by ExoPlayer)
+    /// Set muted state (sent to platform decoder: AVPlayer on iOS/macOS, ExoPlayer on Android).
     SetMuted(bool),
-    /// Set volume level (Android only - audio controlled by ExoPlayer)
+    /// Set volume level (sent to platform decoder: AVPlayer on iOS/macOS, ExoPlayer on Android).
     SetVolume(f32),
 }
 
@@ -373,12 +373,12 @@ impl DecodeThread {
         let _ = self.command_tx.send(DecodeCommand::Stop);
     }
 
-    /// Sets the muted state (Android only - audio is controlled by ExoPlayer).
+    /// Sets the muted state (sent to platform decoder: AVPlayer on iOS/macOS, ExoPlayer on Android).
     pub fn set_muted(&self, muted: bool) {
         let _ = self.command_tx.send(DecodeCommand::SetMuted(muted));
     }
 
-    /// Sets the volume level (Android only - audio is controlled by ExoPlayer).
+    /// Sets the volume level (sent to platform decoder: AVPlayer on iOS/macOS, ExoPlayer on Android).
     pub fn set_volume(&self, volume: f32) {
         let _ = self.command_tx.send(DecodeCommand::SetVolume(volume));
     }
@@ -731,7 +731,7 @@ pub struct AudioThread {
     /// Flag to signal the thread should stop
     stop_flag: Arc<AtomicBool>,
     /// Audio handle for volume/mute control (shared with UI)
-    audio_handle: super::audio::AudioHandle,
+    audio_handle: crate::audio::AudioHandle,
 }
 
 #[cfg(target_os = "macos")]
@@ -744,7 +744,7 @@ impl AudioThread {
     pub fn new(url: &str, video_start_time: Option<Duration>) -> Option<Self> {
         let (command_tx, command_rx) = crossbeam_channel::unbounded();
         let stop_flag = Arc::new(AtomicBool::new(false));
-        let audio_handle = super::audio::AudioHandle::new();
+        let audio_handle = crate::audio::AudioHandle::new();
         audio_handle.set_available(true);
 
         // Set video start time BEFORE thread spawn to avoid race with finalize_stream_pts_offset
@@ -767,7 +767,7 @@ impl AudioThread {
     }
 
     /// Returns the audio handle for UI control.
-    pub fn handle(&self) -> super::audio::AudioHandle {
+    pub fn handle(&self) -> crate::audio::AudioHandle {
         self.audio_handle.clone()
     }
 
@@ -807,9 +807,9 @@ impl Drop for AudioThread {
 #[cfg(target_os = "macos")]
 fn process_audio_command(
     cmd: DecodeCommand,
-    player: &mut super::audio::AudioPlayer,
+    player: &mut crate::audio::AudioPlayer,
     decoder: &mut AudioDecoder,
-    producer: &crate::media::audio_ring_buffer::RingBufferProducer,
+    producer: &crate::audio_ring_buffer::RingBufferProducer,
     first_samples: &mut bool,
 ) -> CommandResult {
     match cmd {
@@ -839,12 +839,12 @@ fn process_audio_command(
 #[cfg(target_os = "macos")]
 fn audio_thread_main(
     url: String,
-    handle: super::audio::AudioHandle,
+    handle: crate::audio::AudioHandle,
     command_rx: crossbeam_channel::Receiver<DecodeCommand>,
     stop_flag: Arc<AtomicBool>,
 ) {
-    use super::audio::AudioPlayer;
-    use crate::media::audio_ring_buffer::RingBufferConfig;
+    use crate::audio::AudioPlayer;
+    use crate::audio_ring_buffer::RingBufferConfig;
 
     // Query device sample rate first so ring buffer capacity matches actual output rate
     let device_sample_rate = match AudioPlayer::query_device_sample_rate() {
@@ -2687,7 +2687,7 @@ impl Default for FrameScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::media::video::{CpuFrame, DecodedFrame, PixelFormat, Plane};
+    use crate::video::{CpuFrame, DecodedFrame, PixelFormat, Plane};
 
     fn make_test_frame(pts: Duration) -> VideoFrame {
         let plane = Plane {
@@ -2754,7 +2754,7 @@ mod tests {
 
     /// Bind an AudioHandle with a specific position for drift controller tests.
     fn bind_test_audio_metrics_only(s: &mut FrameScheduler, pos: Duration) {
-        let h = crate::media::audio::AudioHandle::new();
+        let h = crate::audio::AudioHandle::new();
         h.set_available(true);
         h.set_audio_format(48_000, 2);
         h.set_audio_base_pts(Duration::ZERO);

@@ -1251,6 +1251,7 @@ checksum = "89a09f22a6c6069a18470eb92d2298acf25463f14256d24778e1230d789a2aec"
 dependencies = [
  "bitflags 2.10.0",
  "block2 0.6.2",
+ "libc",
  "objc2 0.6.3",
 ]
 
@@ -2905,6 +2906,7 @@ dependencies = [
  "jni",
  "js-sys",
  "libc",
+ "lumina-video-core",
  "metal",
  "moq-lite",
  "moq-native",
@@ -2961,6 +2963,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumina-video-core"
+version = "0.2.2"
+dependencies = [
+ "android-activity",
+ "ash",
+ "block2 0.6.2",
+ "bytemuck",
+ "cpal",
+ "crossbeam-channel",
+ "dispatch2",
+ "drm-fourcc",
+ "ffmpeg-next",
+ "gstreamer",
+ "gstreamer-allocators",
+ "gstreamer-app",
+ "gstreamer-video",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "jni",
+ "libc",
+ "metal",
+ "ndk",
+ "ndk-context",
+ "ndk-sys 0.6.0+11769913",
+ "objc2 0.6.3",
+ "objc2-av-foundation",
+ "objc2-core-foundation",
+ "objc2-core-media",
+ "objc2-core-video",
+ "objc2-foundation 0.3.2",
+ "objc2-video-toolbox",
+ "opus",
+ "parking_lot",
+ "poll-promise",
+ "profiling",
+ "rodio",
+ "rustls",
+ "symphonia-codec-aac",
+ "symphonia-core",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "url",
+ "webpki-roots 1.0.4",
+ "wgpu",
+ "wgpu-hal",
+ "windows 0.58.0",
+]
+
+[[package]]
 name = "lumina-video-demo"
 version = "0.2.2"
 dependencies = [
@@ -2972,6 +3026,15 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "lumina-video-ios"
+version = "0.2.2"
+dependencies = [
+ "lumina-video-core",
+ "parking_lot",
+ "tracing",
 ]
 
 [[package]]

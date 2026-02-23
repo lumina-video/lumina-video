@@ -80,12 +80,12 @@ use objc2_foundation::{
     NSCopying, NSMutableDictionary, NSNumber, NSObjectProtocol, NSString, NSURL,
 };
 
-use super::video::{
+use crate::video::{
     CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend, VideoError,
     VideoFrame, VideoMetadata,
 };
 
-use super::video::MacOSGpuSurface;
+use crate::video::MacOSGpuSurface;
 
 // FFI declarations for IOSurface
 extern "C" {
@@ -1357,6 +1357,14 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
     fn set_muted(&mut self, muted: bool) -> Result<(), VideoError> {
         unsafe { self.player.setMuted(muted) };
         tracing::debug!("MacOSVideoDecoder: muted={}", muted);
+        Ok(())
+    }
+
+    /// Set volume for AVPlayer audio (0.0 = silent, 1.0 = full).
+    fn set_volume(&mut self, volume: f32) -> Result<(), VideoError> {
+        let clamped = volume.clamp(0.0, 1.0);
+        unsafe { self.player.setVolume(clamped) };
+        tracing::debug!("MacOSVideoDecoder: volume={}", clamped);
         Ok(())
     }
 

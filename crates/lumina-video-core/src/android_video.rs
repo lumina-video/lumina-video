@@ -50,7 +50,7 @@ use jni::objects::{GlobalRef, JClass, JObject, JValue};
 use jni::sys::{jint, jlong};
 use jni::{JNIEnv, JavaVM};
 
-use super::video::{
+use crate::video::{
     CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend, VideoError,
     VideoFrame, VideoMetadata,
 };
