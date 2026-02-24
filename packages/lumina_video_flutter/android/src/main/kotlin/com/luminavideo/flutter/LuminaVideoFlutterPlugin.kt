@@ -44,6 +44,11 @@ private class PlayerEntry(
 class LuminaVideoFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware {
 
     companion object {
+        // NOTE: Global mutable state — intentional rule exception.
+        // Must survive plugin instance recreation across hot restarts. If this
+        // were instance state, hot restart would reset it to 1, colliding with
+        // stale native player IDs still alive in the process. AtomicInteger is
+        // defensive (main-thread-only access, but zero cost).
         private val nextPlayerId = AtomicInteger(1)
     }
 

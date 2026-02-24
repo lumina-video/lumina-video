@@ -1,6 +1,7 @@
 import Flutter
 import UIKit
 import AVFoundation
+import ObjectiveC
 
 /// Per-player state. Implements FlutterTexture for zero-copy IOSurface rendering.
 private class PlayerEntry: NSObject, FlutterTexture, FlutterStreamHandler {
@@ -10,13 +11,16 @@ private class PlayerEntry: NSObject, FlutterTexture, FlutterStreamHandler {
     var displayLink: CADisplayLink?
     var eventChannel: FlutterEventChannel?
     var eventSink: FlutterEventSink?
-    var latestPixelBuffer: CVPixelBuffer?
-    let lock = NSLock()
-    var lastState: Int32 = -1
-    var lastEventPush: CFTimeInterval = 0
     var videoWidth: Int = 0
     var videoHeight: Int = 0
     var wasPlayingBeforeBackground = false
+    var lastState: Int32 = -1
+    var lastEventPush: CFTimeInterval = 0
+
+    // Lock-free pixel buffer exchange between main thread (producer) and
+    // raster thread (consumer). Uses Unmanaged to allow atomic pointer swap
+    // without mutex contention in the frame-critical path.
+    private var _pixelBufferPtr: UnsafeMutableRawPointer? = nil
 
     // Diagnostics
     var frameCount: Int = 0
@@ -31,13 +35,56 @@ private class PlayerEntry: NSObject, FlutterTexture, FlutterStreamHandler {
         super.init()
     }
 
+    /// Stores a new pixel buffer (main thread). Lock-free — single atomic swap.
+    func setPixelBuffer(_ newBuffer: CVPixelBuffer) {
+        let retained = Unmanaged.passRetained(newBuffer).toOpaque()
+        let old = atomicExchange(&_pixelBufferPtr, retained)
+        if let old = old {
+            Unmanaged<CVPixelBuffer>.fromOpaque(old).release()
+        }
+    }
+
+    /// Clears the pixel buffer (main thread, during destroy).
+    func clearPixelBuffer() {
+        let old = atomicExchange(&_pixelBufferPtr, nil)
+        if let old = old {
+            Unmanaged<CVPixelBuffer>.fromOpaque(old).release()
+        }
+    }
+
     // MARK: - FlutterTexture
 
+    /// Called by Flutter raster thread. Lock-free — atomic load + retain.
     func copyPixelBuffer() -> Unmanaged<CVPixelBuffer>? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let pb = latestPixelBuffer else { return nil }
-        return Unmanaged.passRetained(pb)
+        guard let ptr = atomicLoad(&_pixelBufferPtr) else { return nil }
+        // Retain for Flutter engine — it will release after GPU upload.
+        return Unmanaged<CVPixelBuffer>.fromOpaque(ptr).retain()
+    }
+
+    // MARK: - Lock-free atomics
+
+    /// Atomic exchange: stores `new` and returns old value.
+    private func atomicExchange(
+        _ location: UnsafeMutablePointer<UnsafeMutableRawPointer?>,
+        _ new: UnsafeMutableRawPointer?
+    ) -> UnsafeMutableRawPointer? {
+        // OSAtomicCompareAndSwapPtrBarrier is deprecated; use a simple
+        // unfair lock-free CAS loop. In practice this never spins because
+        // the main thread is the only writer.
+        while true {
+            let old = location.pointee
+            if OSAtomicCompareAndSwapPtrBarrier(old, new, UnsafeMutablePointer(location)) {
+                return old
+            }
+        }
+    }
+
+    /// Atomic load — reads current value with acquire barrier.
+    private func atomicLoad(
+        _ location: UnsafeMutablePointer<UnsafeMutableRawPointer?>
+    ) -> UnsafeMutableRawPointer? {
+        OSMemoryBarrier()
+        return location.pointee
     }
 
     // MARK: - FlutterStreamHandler
@@ -56,13 +103,27 @@ private class PlayerEntry: NSObject, FlutterTexture, FlutterStreamHandler {
     }
 }
 
+// MARK: - DisplayLink → playerId association (no per-frame heap allocation)
+
+private var displayLinkPlayerIdKey: UInt8 = 0
+
+private extension CADisplayLink {
+    var playerId: Int? {
+        get { objc_getAssociatedObject(self, &displayLinkPlayerIdKey) as? Int }
+        set { objc_setAssociatedObject(self, &displayLinkPlayerIdKey, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+    }
+}
+
 public class LuminaVideoFlutterPlugin: NSObject, FlutterPlugin {
     private var textureRegistry: FlutterTextureRegistry
     private var messenger: FlutterBinaryMessenger
     private var players: [Int: PlayerEntry] = [:]
 
-    /// Monotonic player ID counter. Static — survives plugin instance recreation.
-    /// Accessed only on main thread (MethodChannel handler).
+    // NOTE: Global mutable state — intentional rule exception.
+    // Must survive plugin instance recreation across hot restarts. If this were
+    // instance state, hot restart would reset it to 1, colliding with stale
+    // native player IDs still alive in the process. Accessed only on main thread
+    // (MethodChannel handler is always dispatched to main).
     private static var nextPlayerId: Int = 1
 
     init(textureRegistry: FlutterTextureRegistry, messenger: FlutterBinaryMessenger) {
@@ -270,10 +331,9 @@ public class LuminaVideoFlutterPlugin: NSObject, FlutterPlugin {
         entry.eventChannel?.setStreamHandler(nil)
         entry.eventChannel = nil
 
-        // 3. Nil pixel buffer under lock — prevents raster thread from returning stale buffer
-        entry.lock.lock()
-        entry.latestPixelBuffer = nil
-        entry.lock.unlock()
+        // 3. Clear pixel buffer (lock-free) — prevents raster thread from
+        //    returning stale buffer after unregisterTexture
+        entry.clearPixelBuffer()
 
         // 4. Unregister texture
         textureRegistry.unregisterTexture(entry.textureId)
@@ -290,17 +350,17 @@ public class LuminaVideoFlutterPlugin: NSObject, FlutterPlugin {
 
     private func startDisplayLink(for entry: PlayerEntry) {
         let link = CADisplayLink(target: self, selector: #selector(displayLinkFired(_:)))
-        // Store playerId in the link's name-value coding isn't available,
-        // so we use the link's reference equality to find the entry.
-        // Actually, we store the entry reference via a wrapper approach.
-        // Simpler: iterate players to find the matching link.
+        // Associate playerId for O(1) dictionary lookup in the tick handler,
+        // avoiding per-frame linear scan + closure allocation.
+        link.playerId = entry.playerId
         link.add(to: .main, forMode: .common)
         entry.displayLink = link
     }
 
     @objc private func displayLinkFired(_ link: CADisplayLink) {
-        // Find the entry owning this display link
-        guard let entry = players.values.first(where: { $0.displayLink === link }) else {
+        // O(1) lookup via associated playerId — no per-frame heap allocation.
+        guard let playerId = link.playerId,
+              let entry = players[playerId] else {
             link.invalidate()
             return
         }
@@ -321,7 +381,12 @@ public class LuminaVideoFlutterPlugin: NSObject, FlutterPlugin {
                 entry.fpsWindowStart = now
             }
 
-            // Get IOSurface for zero-copy texture.
+            // Zero-copy texture path: CVPixelBufferCreateWithIOSurface wraps
+            // the GPU-resident IOSurface without any CPU pixel copy. The Rust
+            // decoder outputs BGRA8 IOSurfaces via VideoToolbox; this call
+            // creates a CVPixelBuffer backed by the same IOSurface memory.
+            // Flutter's raster thread reads the CVPixelBuffer directly as a
+            // GPU texture — no intermediate copy at any stage.
             if let surfaceUnmanaged = lumina_frame_iosurface(framePtr) {
                 entry.isZeroCopy = true
                 let ioSurface = surfaceUnmanaged.takeUnretainedValue()
@@ -335,9 +400,8 @@ public class LuminaVideoFlutterPlugin: NSObject, FlutterPlugin {
                 lumina_frame_release(framePtr)
 
                 if status == kCVReturnSuccess, let pb = pixelBuffer {
-                    entry.lock.lock()
-                    entry.latestPixelBuffer = pb.takeRetainedValue()
-                    entry.lock.unlock()
+                    // Lock-free atomic swap — no mutex in frame-critical path.
+                    entry.setPixelBuffer(pb.takeRetainedValue())
                     textureRegistry.textureFrameAvailable(entry.textureId)
                 }
             } else {
@@ -349,7 +413,6 @@ public class LuminaVideoFlutterPlugin: NSObject, FlutterPlugin {
             if w > 0 && h > 0 && (w != entry.videoWidth || h != entry.videoHeight) {
                 entry.videoWidth = w
                 entry.videoHeight = h
-                // Push event immediately on size change
                 pushEvent(entry: entry)
             }
         }

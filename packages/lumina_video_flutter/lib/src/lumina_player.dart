@@ -165,20 +165,26 @@ enum _LifecycleState { uninitialized, creating, ready, error, disposed }
 /// player.dispose();
 /// ```
 class LuminaPlayer extends ValueNotifier<LuminaPlayerValue> {
-  LuminaPlayer() : super(const LuminaPlayerValue.uninitialized());
+  /// Creates a new player instance.
+  ///
+  /// [onCleanupError] is called when best-effort cleanup (dispose/tryDestroy)
+  /// fails. Defaults to [debugPrint]. Pass a custom callback for structured
+  /// logging (e.g., Sentry, Crashlytics).
+  LuminaPlayer({
+    void Function(String message)? onCleanupError,
+  })  : _onCleanupError = onCleanupError ?? debugPrint,
+        super(const LuminaPlayerValue.uninitialized());
 
   static const _channel = MethodChannel('lumina_video_flutter');
   static const _createTimeout = Duration(seconds: 10);
 
-  /// Hook for cleanup failure telemetry. Called when _tryDestroy() or
-  /// dispose()'s close() fails. Defaults to [debugPrint]. Override for
-  /// structured logging (e.g., Sentry, Crashlytics).
-  static void Function(String message) onCleanupError = debugPrint;
+  /// Instance-level cleanup error callback. No global mutable state.
+  final void Function(String message) _onCleanupError;
 
   /// Safe wrapper — ensures callback throws never break cleanup control flow.
-  static void _reportCleanupError(String message) {
+  void _reportCleanupError(String message) {
     try {
-      onCleanupError(message);
+      _onCleanupError(message);
     } catch (_) {
       // Swallow — telemetry failure must never mask original cleanup failure.
     }
@@ -229,7 +235,13 @@ class LuminaPlayer extends ValueNotifier<LuminaPlayerValue> {
         'create',
         {'url': url},
       );
-      _playerId = (result!['playerId'] as num).toInt();
+      if (result == null) {
+        throw const LuminaVideoException(
+          code: 'NULL_RESPONSE',
+          message: 'Platform returned null from create',
+        );
+      }
+      _playerId = (result['playerId'] as num).toInt();
       if (!_createCompleter!.isCompleted) _createCompleter!.complete();
 
       if (_shouldAbort) {
