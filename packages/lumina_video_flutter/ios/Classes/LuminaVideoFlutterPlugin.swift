@@ -23,6 +23,7 @@ private class PlayerEntry: NSObject, FlutterTexture, FlutterStreamHandler {
     var fpsWindowStart: CFTimeInterval = 0
     var currentFps: Double = 0
     var isZeroCopy: Bool = false
+    var sourceUrl: String = ""
 
     init(playerPtr: OpaquePointer, playerId: Int) {
         self.playerPtr = playerPtr
@@ -168,6 +169,7 @@ public class LuminaVideoFlutterPlugin: NSObject, FlutterPlugin {
         LuminaVideoFlutterPlugin.nextPlayerId += 1
 
         let entry = PlayerEntry(playerPtr: validPtr, playerId: playerId)
+        entry.sourceUrl = url
 
         // Register texture
         entry.textureId = textureRegistry.register(entry)
@@ -381,7 +383,10 @@ public class LuminaVideoFlutterPlugin: NSObject, FlutterPlugin {
         event["maxFps"] = UIScreen.main.maximumFramesPerSecond
         event["zeroCopy"] = entry.isZeroCopy
         event["videoCodec"] = "VideoToolbox"
-        event["audioCodec"] = "AAC (FFmpeg)"
+        event["audioCodec"] = "Native"
+        if let ext = URL(string: entry.sourceUrl)?.pathExtension.lowercased(), !ext.isEmpty {
+            event["format"] = ext.uppercased()
+        }
 
         return event
     }

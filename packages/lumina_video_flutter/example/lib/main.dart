@@ -153,10 +153,14 @@ class _DiagnosticOverlay extends StatelessWidget {
     final zeroCopy = value.zeroCopy;
     final videoCodec = value.videoCodec;
     final audioCodec = value.audioCodec;
+    final format = value.format;
 
     final lines = <String>[
-      if (fps != null) 'FPS: ${fps.toStringAsFixed(1)}${maxFps != null ? ' / $maxFps' : ''}',
-      if (zeroCopy != null) zeroCopy ? 'Zero-copy (IOSurface)' : 'GPU copy (SurfaceTexture)',
+      if (format != null) 'Format: $format',
+      if (fps != null)
+        'FPS: ${fps.toStringAsFixed(1)}${maxFps != null ? ' / $maxFps' : ''}',
+      if (zeroCopy != null)
+        zeroCopy ? 'Zero-copy (IOSurface)' : 'GPU copy (SurfaceTexture)',
       if (videoCodec != null) 'Video: $videoCodec',
       if (audioCodec != null) 'Audio: $audioCodec',
     ];

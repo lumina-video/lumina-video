@@ -38,6 +38,7 @@ private class PlayerEntry(
     var frameCount: Int = 0,
     var fpsWindowStart: Long = System.nanoTime(),
     var currentFps: Double = 0.0,
+    var sourceUrl: String = "",
 )
 
 class LuminaVideoFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware {
@@ -214,6 +215,7 @@ class LuminaVideoFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             positionUpdater = positionUpdater,
             eventChannel = eventChannel,
             eventSink = entry.eventSink,
+            sourceUrl = url,
         )
         players[playerId] = finalEntry
 
@@ -323,6 +325,11 @@ class LuminaVideoFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         val audioFormat = entry.player.audioFormat
         if (audioFormat != null) {
             map["audioCodec"] = mapMimeToCodecName(audioFormat.sampleMimeType)
+        }
+        val ext = android.net.Uri.parse(entry.sourceUrl).lastPathSegment
+            ?.substringAfterLast('.', "")?.uppercase()
+        if (!ext.isNullOrEmpty()) {
+            map["format"] = ext
         }
 
         return map

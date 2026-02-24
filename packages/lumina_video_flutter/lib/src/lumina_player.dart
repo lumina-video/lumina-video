@@ -48,6 +48,7 @@ class LuminaPlayerValue {
     this.zeroCopy,
     this.videoCodec,
     this.audioCodec,
+    this.format,
   });
 
   const LuminaPlayerValue.uninitialized()
@@ -61,7 +62,8 @@ class LuminaPlayerValue {
         maxFps = null,
         zeroCopy = null,
         videoCodec = null,
-        audioCodec = null;
+        audioCodec = null,
+        format = null;
 
   /// Flutter texture ID, or -1 if not yet registered.
   final int textureId;
@@ -96,6 +98,9 @@ class LuminaPlayerValue {
   /// Audio decoder/codec name (e.g. "AAC (FFmpeg)"), or null if unknown.
   final String? audioCodec;
 
+  /// Container format (e.g. "MP4", "WEBM"), or null if unknown.
+  final String? format;
+
   /// Whether the player has a valid texture ready for rendering.
   bool get isInitialized => textureId >= 0;
 
@@ -111,6 +116,7 @@ class LuminaPlayerValue {
     bool? zeroCopy,
     String? videoCodec,
     String? audioCodec,
+    String? format,
   }) {
     return LuminaPlayerValue(
       textureId: textureId ?? this.textureId,
@@ -124,6 +130,7 @@ class LuminaPlayerValue {
       zeroCopy: zeroCopy ?? this.zeroCopy,
       videoCodec: videoCodec ?? this.videoCodec,
       audioCodec: audioCodec ?? this.audioCodec,
+      format: format ?? this.format,
     );
   }
 
@@ -242,6 +249,7 @@ class LuminaPlayer extends ValueNotifier<LuminaPlayerValue> {
         zeroCopy: snap.zeroCopy,
         videoCodec: snap.videoCodec,
         audioCodec: snap.audioCodec,
+        format: snap.format,
       );
 
       if (snap.state == LuminaPlaybackState.error) {
@@ -418,6 +426,7 @@ class LuminaPlayer extends ValueNotifier<LuminaPlayerValue> {
         zeroCopy: snap.zeroCopy,
         videoCodec: snap.videoCodec,
         audioCodec: snap.audioCodec,
+        format: snap.format,
       );
     } catch (e) {
       if (!_isTerminal && !_shouldAbort) {
@@ -445,6 +454,7 @@ class LuminaPlayer extends ValueNotifier<LuminaPlayerValue> {
     bool? zeroCopy,
     String? videoCodec,
     String? audioCodec,
+    String? format,
   }) _parseSnapshot(
     Map<dynamic, dynamic> map, {
     LuminaPlaybackState? fallbackState,
@@ -492,6 +502,8 @@ class LuminaPlayer extends ValueNotifier<LuminaPlayerValue> {
     final videoCodec = (rawVideoCodec is String) ? rawVideoCodec : null;
     final rawAudioCodec = map['audioCodec'];
     final audioCodec = (rawAudioCodec is String) ? rawAudioCodec : null;
+    final rawFormat = map['format'];
+    final format = (rawFormat is String) ? rawFormat : null;
 
     return (
       state: resolvedState,
@@ -504,6 +516,7 @@ class LuminaPlayer extends ValueNotifier<LuminaPlayerValue> {
       zeroCopy: zeroCopy,
       videoCodec: videoCodec,
       audioCodec: audioCodec,
+      format: format,
     );
   }
 
