@@ -12,3 +12,6 @@ crate-type = ["staticlib", "lib"]
 lumina-video-core = { path = "../lumina-video-core" }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+cpal = { workspace = true }

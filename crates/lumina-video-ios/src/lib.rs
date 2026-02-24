@@ -526,3 +526,118 @@ pub extern "C" fn lumina_diagnostics_snapshot(out: *mut LuminaDiagnostics) -> i3
         Ok(())
     })
 }
+
+// =========================================================================
+// Audio smoke test (iOS only)
+// =========================================================================
+
+/// Plays a 440 Hz sine tone for `duration_secs` via cpal.
+///
+/// Blocks the calling thread for the given duration. Swift callers should
+/// dispatch to a background queue.
+///
+/// **Caller must configure AVAudioSession (.playback) before calling.**
+///
+/// Returns `LUMINA_OK` (0) on success, `LUMINA_ERROR_INIT_FAILED` (3) if no
+/// output device or unsupported sample format, `LUMINA_ERROR_INTERNAL` (5) on
+/// other errors.
+#[cfg(target_os = "ios")]
+#[no_mangle]
+pub extern "C" fn lumina_audio_smoke_test(duration_secs: f64) -> i32 {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::SampleFormat;
+
+    ffi_boundary(|| {
+        tracing::info!("lumina_audio_smoke_test: caller must have configured AVAudioSession before this point");
+
+        // Validate duration
+        let duration_secs = duration_secs.clamp(0.1, 30.0);
+        tracing::info!("lumina_audio_smoke_test: duration={duration_secs:.1}s");
+
+        // Get default output device
+        let host = cpal::default_host();
+        let device = host.default_output_device().ok_or_else(|| {
+            tracing::error!("lumina_audio_smoke_test: no default output device");
+            LuminaError::InitFailed
+        })?;
+
+        // Query default config
+        let supported = device.default_output_config().map_err(|e| {
+            tracing::error!("lumina_audio_smoke_test: default_output_config failed: {e}");
+            LuminaError::InitFailed
+        })?;
+
+        // cpal 0.17: SampleRate is a u32 type alias, not a newtype struct
+        let sample_rate = supported.sample_rate();
+        let channels = supported.channels().min(2) as u32;
+        let format = supported.sample_format();
+
+        tracing::info!(
+            "lumina_audio_smoke_test: device sample_rate={sample_rate} channels={channels} format={format:?}"
+        );
+
+        // iOS cpal should always be F32
+        if format != SampleFormat::F32 {
+            tracing::error!(
+                "lumina_audio_smoke_test: unsupported sample format {format:?}, expected F32"
+            );
+            return Err(LuminaError::InitFailed);
+        }
+
+        let config = cpal::StreamConfig {
+            channels: channels as u16,
+            sample_rate,
+            buffer_size: cpal::BufferSize::Default,
+        };
+
+        // 440 Hz sine wave generator
+        let mut phase: f32 = 0.0;
+        let phase_inc = 440.0 / sample_rate as f32;
+        let amplitude: f32 = 0.25;
+
+        let stream = device
+            .build_output_stream(
+                &config,
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    for sample in data.chunks_mut(channels as usize) {
+                        let value = (phase * std::f32::consts::TAU).sin() * amplitude;
+                        for s in sample.iter_mut() {
+                            *s = value;
+                        }
+                        phase += phase_inc;
+                        if phase >= 1.0 {
+                            phase -= 1.0;
+                        }
+                    }
+                },
+                |err| {
+                    tracing::error!("lumina_audio_smoke_test: stream error: {err}");
+                },
+                None, // default timeout
+            )
+            .map_err(|e| {
+                tracing::error!("lumina_audio_smoke_test: build_output_stream failed: {e}");
+                LuminaError::InitFailed
+            })?;
+
+        stream.play().map_err(|e| {
+            tracing::error!("lumina_audio_smoke_test: stream.play() failed: {e}");
+            LuminaError::InitFailed
+        })?;
+
+        tracing::info!("lumina_audio_smoke_test: playing 440 Hz tone...");
+        std::thread::sleep(Duration::from_secs_f64(duration_secs));
+        // stream drops here, stopping playback
+        tracing::info!("lumina_audio_smoke_test: done");
+
+        Ok(())
+    })
+}
+
+/// Stub for non-iOS targets so the symbol always exists in tests.
+#[cfg(not(target_os = "ios"))]
+#[no_mangle]
+pub extern "C" fn lumina_audio_smoke_test(_duration_secs: f64) -> i32 {
+    tracing::warn!("lumina_audio_smoke_test: not supported on this platform");
+    LuminaError::InitFailed.as_raw()
+}
