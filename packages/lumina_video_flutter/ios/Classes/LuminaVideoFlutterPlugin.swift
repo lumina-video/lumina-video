@@ -107,30 +107,52 @@ public class LuminaVideoFlutterPlugin: NSObject, FlutterPlugin {
         case "play":
             handlePlayerCommand(call, result: result) { entry in
                 guard let ptr = entry.playerPtr else { return }
-                lumina_player_play(ptr)
+                entry.displayLink?.isPaused = false
+                let err = lumina_player_play(ptr)
+                if err != LUMINA_OK {
+                    let info = self.mapLuminaError(err)
+                    result(FlutterError(code: info.code, message: info.message, details: nil))
+                    return
+                }
+                result(nil)
             }
         case "pause":
             handlePlayerCommand(call, result: result) { entry in
                 guard let ptr = entry.playerPtr else { return }
-                lumina_player_pause(ptr)
+                let err = lumina_player_pause(ptr)
+                if err != LUMINA_OK {
+                    let info = self.mapLuminaError(err)
+                    result(FlutterError(code: info.code, message: info.message, details: nil))
+                    return
+                }
+                result(nil)
             }
         case "seek":
             handlePlayerCommand(call, result: result) { entry in
                 guard let ptr = entry.playerPtr, let args = call.arguments as? [String: Any],
                       let position = args["position"] as? Double else { return }
-                lumina_player_seek(ptr, position)
+                entry.displayLink?.isPaused = false
+                let err = lumina_player_seek(ptr, position)
+                if err != LUMINA_OK {
+                    let info = self.mapLuminaError(err)
+                    result(FlutterError(code: info.code, message: info.message, details: nil))
+                    return
+                }
+                result(nil)
             }
         case "setMuted":
             handlePlayerCommand(call, result: result) { entry in
                 guard let ptr = entry.playerPtr, let args = call.arguments as? [String: Any],
                       let muted = args["muted"] as? Bool else { return }
                 lumina_player_set_muted(ptr, muted)
+                result(nil)
             }
         case "setVolume":
             handlePlayerCommand(call, result: result) { entry in
                 guard let ptr = entry.playerPtr, let args = call.arguments as? [String: Any],
                       let volume = args["volume"] as? Int else { return }
                 lumina_player_set_volume(ptr, Int32(volume))
+                result(nil)
             }
         case "destroy":
             handleDestroy(call, result: result)
@@ -206,7 +228,6 @@ public class LuminaVideoFlutterPlugin: NSObject, FlutterPlugin {
             return
         }
         action(entry)
-        result(nil)
     }
 
     // MARK: - Destroy

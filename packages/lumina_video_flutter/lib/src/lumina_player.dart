@@ -217,6 +217,7 @@ class LuminaPlayer extends ValueNotifier<LuminaPlayerValue> {
   /// Throws [LuminaVideoException] if initialization fails.
   /// Throws [StateError] if already opened or closed during init.
   Future<void> open(String url) async {
+    if (_isDisposed) throw StateError('LuminaPlayer is disposed');
     if (_lifecycle != _LifecycleState.uninitialized) {
       throw StateError('LuminaPlayer already opened');
     }

@@ -78,17 +78,20 @@ class LuminaVideoFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             "create" -> handleCreate(call, result)
             "play" -> handlePlayerCommand(call, result) { it.player.play() }
             "pause" -> handlePlayerCommand(call, result) { it.player.pause() }
-            "seek" -> handlePlayerCommand(call, result) { entry ->
-                val position = call.argument<Double>("position") ?: return@handlePlayerCommand
-                entry.player.seekTo((position * 1000).toLong())
+            "seek" -> {
+                val position = call.argument<Double>("position")
+                if (position == null) { result.error("INVALID_ARGS", "Missing position", null); return }
+                handlePlayerCommand(call, result) { it.player.seekTo((position * 1000).toLong()) }
             }
-            "setMuted" -> handlePlayerCommand(call, result) { entry ->
-                val muted = call.argument<Boolean>("muted") ?: return@handlePlayerCommand
-                entry.player.volume = if (muted) 0f else 1f
+            "setMuted" -> {
+                val muted = call.argument<Boolean>("muted")
+                if (muted == null) { result.error("INVALID_ARGS", "Missing muted", null); return }
+                handlePlayerCommand(call, result) { it.player.volume = if (muted) 0f else 1f }
             }
-            "setVolume" -> handlePlayerCommand(call, result) { entry ->
-                val volume = call.argument<Int>("volume") ?: return@handlePlayerCommand
-                entry.player.volume = (volume / 100f).coerceIn(0f, 1f)
+            "setVolume" -> {
+                val volume = call.argument<Int>("volume")
+                if (volume == null) { result.error("INVALID_ARGS", "Missing volume", null); return }
+                handlePlayerCommand(call, result) { it.player.volume = (volume / 100f).coerceIn(0f, 1f) }
             }
             "destroy" -> handleDestroy(call, result)
             "_debugGetPlayersLive" -> {

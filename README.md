@@ -276,9 +276,11 @@ xcodebuild -project LuminaTestHarness.xcodeproj \
 <details>
 <summary><b>Flutter</b></summary>
 
-**Prerequisites:** macOS, Xcode 15+, [Rust toolchain](https://rustup.rs/), [Flutter SDK](https://docs.flutter.dev/get-started/install), CocoaPods
+**Prerequisites:** macOS, [Flutter SDK](https://docs.flutter.dev/get-started/install), CocoaPods (iOS), Android SDK 26+ (Android)
 
-The `lumina_video_flutter` plugin wraps lumina-video's C FFI (iOS) and ExoPlayer (Android) for hardware-accelerated, zero-copy video playback in Flutter apps.
+The `lumina_video_flutter` plugin wraps lumina-video's C FFI (iOS) and ExoPlayer (Android) for hardware-accelerated video playback in Flutter apps.
+
+**iOS setup** (requires Xcode 15+, [Rust toolchain](https://rustup.rs/)):
 
 ```bash
 # 1. Build the Rust static library for iOS
@@ -291,10 +293,15 @@ xcodebuild -create-xcframework \
   -library target/aarch64-apple-ios-sim/release/liblumina_video_ios.a \
   -headers include/ \
   -output packages/lumina_video_flutter/ios/Frameworks/LuminaVideo.xcframework
+```
 
-# 3. Run the example app
+**Android setup:** No native build step — ExoPlayer is pulled from Maven. Just ensure `minSdk >= 26` in your app's `build.gradle.kts`.
+
+**Run the example app:**
+
+```bash
 cd packages/lumina_video_flutter/example
-flutter run
+flutter run  # auto-selects connected device (iOS or Android)
 ```
 
 **Dart API:**
@@ -319,9 +326,11 @@ await player.close();
 player.dispose();
 ```
 
-**Architecture:** `Rust (VideoToolbox) → C FFI → Swift (CADisplayLink + IOSurface → CVPixelBuffer) → Flutter Texture` on iOS. `ExoPlayer → SurfaceTexture → Flutter Texture` on Android.
+**Architecture:**
+- **iOS:** `Rust (VideoToolbox) → C FFI → Swift (CADisplayLink + IOSurface → CVPixelBuffer) → Flutter Texture` — zero-copy
+- **Android:** `ExoPlayer → SurfaceTexture → Flutter Texture` — GPU copy
 
-> **Simulator:** arm64 only. Video renders as black frame (no IOSurface on simulator). Use a physical device for testing.
+> **iOS Simulator:** arm64 only. Video renders as black frame (no IOSurface on simulator). Use a physical device for testing.
 
 </details>
 
