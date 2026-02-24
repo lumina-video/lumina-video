@@ -380,7 +380,7 @@ public class LuminaVideoFlutterPlugin: NSObject, FlutterPlugin {
         if entry.currentFps > 0 {
             event["fps"] = entry.currentFps
         }
-        event["maxFps"] = UIScreen.main.maximumFramesPerSecond
+        // maxFps omitted on iOS — C FFI does not expose video source framerate
         event["zeroCopy"] = entry.isZeroCopy
         event["videoCodec"] = "VideoToolbox"
         event["audioCodec"] = "Native"

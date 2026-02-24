@@ -27,7 +27,7 @@ private class PlayerEntry(
     val player: ExoPlayer,
     val textureEntry: TextureRegistry.SurfaceTextureEntry,
     val surface: Surface,
-    val playerListener: Player.Listener,
+    var playerListener: Player.Listener,
     val positionUpdater: Runnable,
     val eventChannel: EventChannel,
     var eventSink: EventChannel.EventSink? = null,
@@ -137,20 +137,22 @@ class LuminaVideoFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         val channelName = "lumina_video_flutter/events/$playerId"
         val eventChannel = EventChannel(messenger, channelName)
 
+        // Single entry object — all closures capture this reference
         val entry = PlayerEntry(
             player = exoPlayer,
             textureEntry = textureEntry,
             surface = surface,
-            playerListener = object : Player.Listener {},  // placeholder, replaced below
+            playerListener = object : Player.Listener {},  // replaced below
             positionUpdater = positionUpdater,
             eventChannel = eventChannel,
+            sourceUrl = url,
         )
+        players[playerId] = entry
 
         // Set up stream handler with onListen snapshot
         eventChannel.setStreamHandler(object : EventChannel.StreamHandler {
             override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
                 entry.eventSink = events
-                // Emit snapshot immediately
                 events?.success(buildEventMap(entry))
             }
 
@@ -186,44 +188,30 @@ class LuminaVideoFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 ))
             }
         }
-
+        entry.playerListener = listener
         exoPlayer.addListener(listener)
         exoPlayer.setVideoSurface(surface)
 
         // Per-frame callback for FPS measurement
         exoPlayer.setVideoFrameMetadataListener { _, _, _, _ ->
-            val e = players[playerId] ?: return@setVideoFrameMetadataListener
-            e.frameCount++
+            entry.frameCount++
             val now = System.nanoTime()
-            val elapsed = (now - e.fpsWindowStart) / 1_000_000_000.0
+            val elapsed = (now - entry.fpsWindowStart) / 1_000_000_000.0
             if (elapsed >= 1.0) {
-                e.currentFps = e.frameCount / elapsed
-                e.frameCount = 0
-                e.fpsWindowStart = now
+                entry.currentFps = entry.frameCount / elapsed
+                entry.frameCount = 0
+                entry.fpsWindowStart = now
             }
         }
 
         exoPlayer.setMediaItem(MediaItem.fromUri(url))
         exoPlayer.prepare()
 
-        // Store with real listener reference
-        val finalEntry = PlayerEntry(
-            player = exoPlayer,
-            textureEntry = textureEntry,
-            surface = surface,
-            playerListener = listener,
-            positionUpdater = positionUpdater,
-            eventChannel = eventChannel,
-            eventSink = entry.eventSink,
-            sourceUrl = url,
-        )
-        players[playerId] = finalEntry
-
         // Start position timer
         handler.postDelayed(positionUpdater, 250)
 
         // Return initial state
-        val response = buildEventMap(finalEntry).toMutableMap()
+        val response = buildEventMap(entry).toMutableMap()
         response["playerId"] = playerId
         response["textureId"] = textureEntry.id()
         result.success(response)
@@ -313,9 +301,9 @@ class LuminaVideoFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         if (entry.currentFps > 0) {
             map["fps"] = entry.currentFps
         }
-        val displayRefreshRate = activity?.windowManager?.defaultDisplay?.refreshRate?.toInt()
-        if (displayRefreshRate != null) {
-            map["maxFps"] = displayRefreshRate
+        val videoFrameRate = entry.player.videoFormat?.frameRate
+        if (videoFrameRate != null && videoFrameRate > 0) {
+            map["maxFps"] = videoFrameRate.toInt()
         }
         map["zeroCopy"] = false // Android uses SurfaceTexture (GPU copy), not zero-copy IOSurface
         val videoFormat = entry.player.videoFormat
