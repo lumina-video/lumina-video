@@ -274,6 +274,58 @@ xcodebuild -project LuminaTestHarness.xcodeproj \
 </details>
 
 <details>
+<summary><b>Flutter</b></summary>
+
+**Prerequisites:** macOS, Xcode 15+, [Rust toolchain](https://rustup.rs/), [Flutter SDK](https://docs.flutter.dev/get-started/install), CocoaPods
+
+The `lumina_video_flutter` plugin wraps lumina-video's C FFI (iOS) and ExoPlayer (Android) for hardware-accelerated, zero-copy video playback in Flutter apps.
+
+```bash
+# 1. Build the Rust static library for iOS
+./scripts/build-ios.sh
+
+# 2. Create the XCFramework
+xcodebuild -create-xcframework \
+  -library target/aarch64-apple-ios/release/liblumina_video_ios.a \
+  -headers include/ \
+  -library target/aarch64-apple-ios-sim/release/liblumina_video_ios.a \
+  -headers include/ \
+  -output packages/lumina_video_flutter/ios/Frameworks/LuminaVideo.xcframework
+
+# 3. Run the example app
+cd packages/lumina_video_flutter/example
+flutter run
+```
+
+**Dart API:**
+
+```dart
+import 'package:lumina_video_flutter/lumina_video_flutter.dart';
+
+final player = LuminaPlayer();
+await player.open('https://example.com/video.mp4');
+await player.play();
+
+// In build:
+ValueListenableBuilder<LuminaPlayerValue>(
+  valueListenable: player,
+  builder: (_, val, __) => val.isInitialized
+      ? Texture(textureId: val.textureId)
+      : const CircularProgressIndicator(),
+)
+
+// Cleanup:
+await player.close();
+player.dispose();
+```
+
+**Architecture:** `Rust (VideoToolbox) → C FFI → Swift (CADisplayLink + IOSurface → CVPixelBuffer) → Flutter Texture` on iOS. `ExoPlayer → SurfaceTexture → Flutter Texture` on Android.
+
+> **Simulator:** arm64 only. Video renders as black frame (no IOSurface on simulator). Use a physical device for testing.
+
+</details>
+
+<details>
 <summary><b>Windows</b></summary>
 
 **Prerequisites:** Windows 10+, [Rust toolchain](https://rustup.rs/), LLVM (for FFmpeg audio)
@@ -489,7 +541,7 @@ cargo build --features vendored-runtime
 cargo build --features windows-native-video
 ```
 
-**[Android build guide →](docs/ANDROID.md)** | **[iOS build guide →](docs/IOS.md)**
+**[Android build guide →](docs/ANDROID.md)** | **[iOS build guide →](docs/IOS.md)** | **[Flutter plugin →](packages/lumina_video_flutter/)**
 
 ## Architecture
 
@@ -524,6 +576,11 @@ ios/
 │       ├── LuminaVideoError.swift
 │       └── LuminaDiagnostics.swift
 └── test-harness/            # Minimal SwiftUI + Metal test app (xcodegen)
+
+packages/lumina_video_flutter/  # Flutter plugin
+├── lib/src/lumina_player.dart  # Dart API (LuminaPlayer, LuminaPlayerValue)
+├── ios/                        # Swift plugin (CADisplayLink + IOSurface → CVPixelBuffer)
+└── android/                    # Kotlin plugin (ExoPlayer + SurfaceTexture)
 ```
 
 **[Zero-copy internals →](docs/ZERO-COPY.md)** | **[A/V sync details →](docs/AV-SYNC.md)**
