@@ -7,6 +7,10 @@ android {
     namespace = "com.luminavideo.flutter"
     compileSdk = 35
 
+    buildFeatures {
+        buildConfig = true
+    }
+
     defaultConfig {
         minSdk = 26
     }
