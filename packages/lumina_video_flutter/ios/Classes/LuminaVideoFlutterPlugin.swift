@@ -128,9 +128,13 @@ public class LuminaVideoFlutterPlugin: NSObject, FlutterPlugin {
                 result(nil)
             }
         case "seek":
+            guard let args = call.arguments as? [String: Any],
+                  let position = args["position"] as? Double else {
+                result(FlutterError(code: "INVALID_ARGS", message: "Missing position", details: nil))
+                return
+            }
             handlePlayerCommand(call, result: result) { entry in
-                guard let ptr = entry.playerPtr, let args = call.arguments as? [String: Any],
-                      let position = args["position"] as? Double else { return }
+                guard let ptr = entry.playerPtr else { return }
                 entry.displayLink?.isPaused = false
                 let err = lumina_player_seek(ptr, position)
                 if err != LUMINA_OK {
@@ -141,16 +145,24 @@ public class LuminaVideoFlutterPlugin: NSObject, FlutterPlugin {
                 result(nil)
             }
         case "setMuted":
+            guard let args = call.arguments as? [String: Any],
+                  let muted = args["muted"] as? Bool else {
+                result(FlutterError(code: "INVALID_ARGS", message: "Missing muted", details: nil))
+                return
+            }
             handlePlayerCommand(call, result: result) { entry in
-                guard let ptr = entry.playerPtr, let args = call.arguments as? [String: Any],
-                      let muted = args["muted"] as? Bool else { return }
+                guard let ptr = entry.playerPtr else { return }
                 lumina_player_set_muted(ptr, muted)
                 result(nil)
             }
         case "setVolume":
+            guard let args = call.arguments as? [String: Any],
+                  let volume = args["volume"] as? Int else {
+                result(FlutterError(code: "INVALID_ARGS", message: "Missing volume", details: nil))
+                return
+            }
             handlePlayerCommand(call, result: result) { entry in
-                guard let ptr = entry.playerPtr, let args = call.arguments as? [String: Any],
-                      let volume = args["volume"] as? Int else { return }
+                guard let ptr = entry.playerPtr else { return }
                 lumina_player_set_volume(ptr, Int32(volume))
                 result(nil)
             }

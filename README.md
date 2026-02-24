@@ -588,8 +588,11 @@ ios/
 
 packages/lumina_video_flutter/  # Flutter plugin
 ├── lib/src/lumina_player.dart  # Dart API (LuminaPlayer, LuminaPlayerValue)
+├── pubspec.yaml                # Package manifest
 ├── ios/                        # Swift plugin (CADisplayLink + IOSurface → CVPixelBuffer)
-└── android/                    # Kotlin plugin (ExoPlayer + SurfaceTexture)
+├── android/                    # Kotlin plugin (ExoPlayer + SurfaceTexture)
+├── test/                       # Dart unit tests
+└── example/                    # Example Flutter app
 ```
 
 **[Zero-copy internals →](docs/ZERO-COPY.md)** | **[A/V sync details →](docs/AV-SYNC.md)**

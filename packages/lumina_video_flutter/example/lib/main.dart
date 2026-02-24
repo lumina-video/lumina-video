@@ -25,6 +25,7 @@ class PlayerPage extends StatefulWidget {
 
 class _PlayerPageState extends State<PlayerPage> {
   late final _player = LuminaPlayer();
+  bool _muted = false;
 
   static const _testUrl =
       'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4';
@@ -41,6 +42,11 @@ class _PlayerPageState extends State<PlayerPage> {
   void dispose() {
     _player.dispose();
     super.dispose();
+  }
+
+  void _toggleMute() {
+    setState(() => _muted = !_muted);
+    _player.setMuted(_muted);
   }
 
   @override
@@ -77,7 +83,12 @@ class _PlayerPageState extends State<PlayerPage> {
                   ),
                 ),
               ),
-              _Controls(player: _player, value: val),
+              _Controls(
+                player: _player,
+                value: val,
+                muted: _muted,
+                onMuteToggled: _toggleMute,
+              ),
             ],
           );
         },
@@ -87,10 +98,17 @@ class _PlayerPageState extends State<PlayerPage> {
 }
 
 class _Controls extends StatelessWidget {
-  const _Controls({required this.player, required this.value});
+  const _Controls({
+    required this.player,
+    required this.value,
+    required this.muted,
+    required this.onMuteToggled,
+  });
 
   final LuminaPlayer player;
   final LuminaPlayerValue value;
+  final bool muted;
+  final VoidCallback onMuteToggled;
 
   String _formatTime(double seconds) {
     if (seconds < 0) return '--:--';
@@ -113,12 +131,15 @@ class _Controls extends StatelessWidget {
               onChanged: (v) => player.seek(v),
             ),
           Row(
-            mainAxisAlignment: MainAxisAlignment.center,
             children: [
               Text(_formatTime(value.position)),
               const SizedBox(width: 8),
               Text('/ ${_formatTime(value.duration)}'),
               const Spacer(),
+              IconButton(
+                icon: Icon(muted ? Icons.volume_off : Icons.volume_up),
+                onPressed: onMuteToggled,
+              ),
               IconButton(
                 icon: Icon(
                   value.state == LuminaPlaybackState.playing
