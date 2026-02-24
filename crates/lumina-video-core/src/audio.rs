@@ -521,7 +521,12 @@ impl std::fmt::Debug for AudioSamples {
 // cpal-based audio player (macOS, Linux, Android)
 // ============================================================================
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "android"
+))]
 mod cpal_impl {
     use super::*;
     use crate::audio_ring_buffer::{
@@ -581,7 +586,7 @@ mod cpal_impl {
                 .default_output_config()
                 .map_err(|e| format!("Failed to get default output config: {e}"))?;
 
-            let device_sample_rate = supported_config.sample_rate().0;
+            let device_sample_rate = supported_config.sample_rate();
             let sample_format = supported_config.sample_format();
             let device_channels = supported_config.channels().clamp(1, 2);
             let mut stream_sample_rate = output_sample_rate.unwrap_or(device_sample_rate);
@@ -617,13 +622,13 @@ mod cpal_impl {
             #[cfg(target_os = "linux")]
             let stream_config = cpal::StreamConfig {
                 channels: device_channels,
-                sample_rate: cpal::SampleRate(stream_sample_rate),
+                sample_rate: stream_sample_rate,
                 buffer_size: cpal::BufferSize::Fixed(1024),
             };
             #[cfg(not(target_os = "linux"))]
             let stream_config = cpal::StreamConfig {
                 channels: device_channels,
-                sample_rate: cpal::SampleRate(stream_sample_rate),
+                sample_rate: stream_sample_rate,
                 buffer_size: cpal::BufferSize::Default,
             };
 
@@ -677,7 +682,7 @@ mod cpal_impl {
             let config = device
                 .default_output_config()
                 .map_err(|e| format!("Failed to get default output config: {e}"))?;
-            Ok(config.sample_rate().0)
+            Ok(config.sample_rate())
         }
 
         /// Returns the device sample rate.
@@ -909,8 +914,8 @@ mod cpal_impl {
         configs.into_iter().any(|cfg| {
             cfg.channels() == channels
                 && cfg.sample_format() == sample_format
-                && sample_rate >= cfg.min_sample_rate().0
-                && sample_rate <= cfg.max_sample_rate().0
+                && sample_rate >= cfg.min_sample_rate()
+                && sample_rate <= cfg.max_sample_rate()
         })
     }
 }
@@ -919,7 +924,12 @@ mod cpal_impl {
 // Placeholder implementation (platforms without cpal support)
 // ============================================================================
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "android"
+)))]
 mod placeholder_impl {
     use super::*;
 
@@ -955,10 +965,20 @@ mod placeholder_impl {
 }
 
 // Re-export the appropriate implementation
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "android"
+))]
 pub use cpal_impl::AudioPlayer;
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "android"
+)))]
 pub use placeholder_impl::AudioPlayer;
 
 #[cfg(test)]

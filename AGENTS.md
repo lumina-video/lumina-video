@@ -2,6 +2,8 @@
 
 Rules are enforced. If you skip one, your PR will be rejected.
 
+For Flutter plugin work, see [FLUTTER_AGENTS.md](FLUTTER_AGENTS.md).
+
 ## Before Every Commit
 
 ```bash
