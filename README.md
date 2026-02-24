@@ -274,6 +274,67 @@ xcodebuild -project LuminaTestHarness.xcodeproj \
 </details>
 
 <details>
+<summary><b>Flutter</b></summary>
+
+**Prerequisites:** macOS, [Flutter SDK](https://docs.flutter.dev/get-started/install), CocoaPods (iOS), Android SDK 26+ (Android)
+
+The `lumina_video_flutter` plugin wraps lumina-video's C FFI (iOS) and ExoPlayer (Android) for hardware-accelerated video playback in Flutter apps.
+
+**iOS setup** (requires Xcode 15+, [Rust toolchain](https://rustup.rs/)):
+
+```bash
+# 1. Build the Rust static library for iOS
+./scripts/build-ios.sh
+
+# 2. Create the XCFramework
+xcodebuild -create-xcframework \
+  -library target/aarch64-apple-ios/release/liblumina_video_ios.a \
+  -headers include/ \
+  -library target/aarch64-apple-ios-sim/release/liblumina_video_ios.a \
+  -headers include/ \
+  -output packages/lumina_video_flutter/ios/Frameworks/LuminaVideo.xcframework
+```
+
+**Android setup:** No native build step — ExoPlayer is pulled from Maven. Just ensure `minSdk >= 26` in your app's `build.gradle.kts`.
+
+**Run the example app:**
+
+```bash
+cd packages/lumina_video_flutter/example
+flutter run  # auto-selects connected device (iOS or Android)
+```
+
+**Dart API:**
+
+```dart
+import 'package:lumina_video_flutter/lumina_video_flutter.dart';
+
+final player = LuminaPlayer();
+await player.open('https://example.com/video.mp4');
+await player.play();
+
+// In build:
+ValueListenableBuilder<LuminaPlayerValue>(
+  valueListenable: player,
+  builder: (_, val, __) => val.isInitialized
+      ? Texture(textureId: val.textureId)
+      : const CircularProgressIndicator(),
+)
+
+// Cleanup:
+await player.close();
+player.dispose();
+```
+
+**Architecture:**
+- **iOS:** `Rust (VideoToolbox) → C FFI → Swift (CADisplayLink + IOSurface → CVPixelBuffer) → Flutter Texture` — zero-copy
+- **Android:** `ExoPlayer → SurfaceTexture → Flutter Texture` — GPU copy
+
+> **iOS Simulator:** arm64 only. Video renders as black frame (no IOSurface on simulator). Use a physical device for testing.
+
+</details>
+
+<details>
 <summary><b>Windows</b></summary>
 
 **Prerequisites:** Windows 10+, [Rust toolchain](https://rustup.rs/), LLVM (for FFmpeg audio)
@@ -489,7 +550,7 @@ cargo build --features vendored-runtime
 cargo build --features windows-native-video
 ```
 
-**[Android build guide →](docs/ANDROID.md)** | **[iOS build guide →](docs/IOS.md)**
+**[Android build guide →](docs/ANDROID.md)** | **[iOS build guide →](docs/IOS.md)** | **[Flutter plugin →](packages/lumina_video_flutter/)**
 
 ## Architecture
 
@@ -524,6 +585,14 @@ ios/
 │       ├── LuminaVideoError.swift
 │       └── LuminaDiagnostics.swift
 └── test-harness/            # Minimal SwiftUI + Metal test app (xcodegen)
+
+packages/lumina_video_flutter/  # Flutter plugin
+├── lib/src/lumina_player.dart  # Dart API (LuminaPlayer, LuminaPlayerValue)
+├── pubspec.yaml                # Package manifest
+├── ios/                        # Swift plugin (CADisplayLink + IOSurface → CVPixelBuffer)
+├── android/                    # Kotlin plugin (ExoPlayer + SurfaceTexture)
+├── test/                       # Dart unit tests
+└── example/                    # Example Flutter app
 ```
 
 **[Zero-copy internals →](docs/ZERO-COPY.md)** | **[A/V sync details →](docs/AV-SYNC.md)**
