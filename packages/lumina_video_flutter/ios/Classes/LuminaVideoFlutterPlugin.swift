@@ -1,7 +1,6 @@
 import Flutter
 import UIKit
 import AVFoundation
-import CLuminaVideo
 
 /// Per-player state. Implements FlutterTexture for zero-copy IOSurface rendering.
 private class PlayerEntry: NSObject, FlutterTexture, FlutterStreamHandler {
@@ -271,24 +270,26 @@ public class LuminaVideoFlutterPlugin: NSObject, FlutterPlugin {
             let w = Int(lumina_frame_width(framePtr))
             let h = Int(lumina_frame_height(framePtr))
 
-            // Get IOSurface for zero-copy texture
+            // Get IOSurface for zero-copy texture.
+            // lumina_frame_iosurface returns Unmanaged<IOSurfaceRef>? (+0, no ownership).
+            // takeUnretainedValue() extracts without changing refcount; ARC retains (+1).
+            // CVPixelBufferCreateWithIOSurface retains IOSurface internally.
+            // lumina_frame_release drops Rust's retain. CVPixelBuffer keeps IOSurface
+            // alive until Flutter engine finishes rendering.
             if let surfaceUnmanaged = lumina_frame_iosurface(framePtr) {
                 let ioSurface = surfaceUnmanaged.takeUnretainedValue()
-                // SAFETY: CVPixelBufferCreateWithIOSurface retains the IOSurface.
-                // lumina_frame_release below drops the Rust retain.
-                // CVPixelBuffer keeps IOSurface alive until Flutter finishes rendering.
-                var pixelBuffer: CVPixelBuffer?
-                CVPixelBufferCreateWithIOSurface(
+                var pixelBuffer: Unmanaged<CVPixelBuffer>?
+                let status = CVPixelBufferCreateWithIOSurface(
                     nil,
-                    ioSurface as IOSurfaceRef,
+                    ioSurface,
                     nil,
                     &pixelBuffer
                 )
                 lumina_frame_release(framePtr)
 
-                if let pb = pixelBuffer {
+                if status == kCVReturnSuccess, let pb = pixelBuffer {
                     entry.lock.lock()
-                    entry.latestPixelBuffer = pb
+                    entry.latestPixelBuffer = pb.takeRetainedValue()
                     entry.lock.unlock()
                     textureRegistry.textureFrameAvailable(entry.textureId)
                 }

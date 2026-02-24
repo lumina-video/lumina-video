@@ -24,7 +24,6 @@ Pod::Spec.new do |s|
 
   s.source_files     = 'Classes/**/*.swift', 'Classes/CLuminaVideo/include/*.h'
   s.public_header_files = 'Classes/CLuminaVideo/include/LuminaVideo.h'
-  s.module_map       = 'Classes/CLuminaVideo/module.modulemap'
   s.preserve_paths   = 'Classes/CLuminaVideo/**'
 
   s.vendored_frameworks = 'Frameworks/LuminaVideo.xcframework'
