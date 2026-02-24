@@ -18,6 +18,12 @@ private class PlayerEntry: NSObject, FlutterTexture, FlutterStreamHandler {
     var videoHeight: Int = 0
     var wasPlayingBeforeBackground = false
 
+    // Diagnostics
+    var frameCount: Int = 0
+    var fpsWindowStart: CFTimeInterval = 0
+    var currentFps: Double = 0
+    var isZeroCopy: Bool = false
+
     init(playerPtr: OpaquePointer, playerId: Int) {
         self.playerPtr = playerPtr
         self.playerId = playerId
@@ -270,13 +276,19 @@ public class LuminaVideoFlutterPlugin: NSObject, FlutterPlugin {
             let w = Int(lumina_frame_width(framePtr))
             let h = Int(lumina_frame_height(framePtr))
 
+            // FPS tracking
+            entry.frameCount += 1
+            let now = CACurrentMediaTime()
+            let elapsed = now - entry.fpsWindowStart
+            if elapsed >= 1.0 {
+                entry.currentFps = Double(entry.frameCount) / elapsed
+                entry.frameCount = 0
+                entry.fpsWindowStart = now
+            }
+
             // Get IOSurface for zero-copy texture.
-            // lumina_frame_iosurface returns Unmanaged<IOSurfaceRef>? (+0, no ownership).
-            // takeUnretainedValue() extracts without changing refcount; ARC retains (+1).
-            // CVPixelBufferCreateWithIOSurface retains IOSurface internally.
-            // lumina_frame_release drops Rust's retain. CVPixelBuffer keeps IOSurface
-            // alive until Flutter engine finishes rendering.
             if let surfaceUnmanaged = lumina_frame_iosurface(framePtr) {
+                entry.isZeroCopy = true
                 let ioSurface = surfaceUnmanaged.takeUnretainedValue()
                 var pixelBuffer: Unmanaged<CVPixelBuffer>?
                 let status = CVPixelBufferCreateWithIOSurface(
@@ -294,6 +306,7 @@ public class LuminaVideoFlutterPlugin: NSObject, FlutterPlugin {
                     textureRegistry.textureFrameAvailable(entry.textureId)
                 }
             } else {
+                entry.isZeroCopy = false
                 lumina_frame_release(framePtr)
             }
 
@@ -360,6 +373,16 @@ public class LuminaVideoFlutterPlugin: NSObject, FlutterPlugin {
             event["videoHeight"] = entry.videoHeight
         }
         if let error = error { event["error"] = error }
+
+        // Diagnostics
+        if entry.currentFps > 0 {
+            event["fps"] = entry.currentFps
+        }
+        event["maxFps"] = UIScreen.main.maximumFramesPerSecond
+        event["zeroCopy"] = entry.isZeroCopy
+        event["videoCodec"] = "VideoToolbox"
+        event["audioCodec"] = "AAC (FFmpeg)"
+
         return event
     }
 

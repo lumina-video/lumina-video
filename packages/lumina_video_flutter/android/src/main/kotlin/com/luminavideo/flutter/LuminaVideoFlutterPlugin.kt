@@ -13,6 +13,7 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.video.VideoFrameMetadataListener
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
@@ -33,6 +34,10 @@ private class PlayerEntry(
     var videoWidth: Int = 0,
     var videoHeight: Int = 0,
     var wasPlayingBeforeBackground: Boolean = false,
+    // Diagnostics
+    var frameCount: Int = 0,
+    var fpsWindowStart: Long = System.nanoTime(),
+    var currentFps: Double = 0.0,
 )
 
 class LuminaVideoFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware {
@@ -183,6 +188,20 @@ class LuminaVideoFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         exoPlayer.addListener(listener)
         exoPlayer.setVideoSurface(surface)
+
+        // Per-frame callback for FPS measurement
+        exoPlayer.setVideoFrameMetadataListener { _, _, _, _ ->
+            val e = players[playerId] ?: return@setVideoFrameMetadataListener
+            e.frameCount++
+            val now = System.nanoTime()
+            val elapsed = (now - e.fpsWindowStart) / 1_000_000_000.0
+            if (elapsed >= 1.0) {
+                e.currentFps = e.frameCount / elapsed
+                e.frameCount = 0
+                e.fpsWindowStart = now
+            }
+        }
+
         exoPlayer.setMediaItem(MediaItem.fromUri(url))
         exoPlayer.prepare()
 
@@ -287,7 +306,43 @@ class LuminaVideoFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             map["videoHeight"] = entry.videoHeight
         }
         if (error != null) map["error"] = error
+
+        // Diagnostics
+        if (entry.currentFps > 0) {
+            map["fps"] = entry.currentFps
+        }
+        val displayRefreshRate = activity?.windowManager?.defaultDisplay?.refreshRate?.toInt()
+        if (displayRefreshRate != null) {
+            map["maxFps"] = displayRefreshRate
+        }
+        map["zeroCopy"] = false // Android uses SurfaceTexture (GPU copy), not zero-copy IOSurface
+        val videoFormat = entry.player.videoFormat
+        if (videoFormat != null) {
+            map["videoCodec"] = mapMimeToCodecName(videoFormat.sampleMimeType)
+        }
+        val audioFormat = entry.player.audioFormat
+        if (audioFormat != null) {
+            map["audioCodec"] = mapMimeToCodecName(audioFormat.sampleMimeType)
+        }
+
         return map
+    }
+
+    private fun mapMimeToCodecName(mime: String?): String {
+        return when (mime) {
+            "video/avc" -> "H.264"
+            "video/hevc" -> "H.265"
+            "video/x-vnd.on2.vp8" -> "VP8"
+            "video/x-vnd.on2.vp9" -> "VP9"
+            "video/av01" -> "AV1"
+            "audio/mp4a-latm" -> "AAC"
+            "audio/opus" -> "Opus"
+            "audio/mpeg" -> "MP3"
+            "audio/vorbis" -> "Vorbis"
+            "audio/ac3" -> "AC-3"
+            "audio/eac3" -> "E-AC-3"
+            else -> mime ?: "Unknown"
+        }
     }
 
     private fun pushEvent(entry: PlayerEntry, error: Map<String, Any?>? = null) {

@@ -64,7 +64,16 @@ class _PlayerPageState extends State<PlayerPage> {
                     aspectRatio: val.videoSize != null
                         ? val.videoSize!.width / val.videoSize!.height
                         : 16 / 9,
-                    child: Texture(textureId: val.textureId),
+                    child: Stack(
+                      children: [
+                        Texture(textureId: val.textureId),
+                        Positioned(
+                          top: 8,
+                          left: 8,
+                          child: _DiagnosticOverlay(value: val),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
               ),
@@ -127,6 +136,47 @@ class _Controls extends StatelessWidget {
             ],
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _DiagnosticOverlay extends StatelessWidget {
+  const _DiagnosticOverlay({required this.value});
+
+  final LuminaPlayerValue value;
+
+  @override
+  Widget build(BuildContext context) {
+    final fps = value.fps;
+    final maxFps = value.maxFps;
+    final zeroCopy = value.zeroCopy;
+    final videoCodec = value.videoCodec;
+    final audioCodec = value.audioCodec;
+
+    final lines = <String>[
+      if (fps != null) 'FPS: ${fps.toStringAsFixed(1)}${maxFps != null ? ' / $maxFps' : ''}',
+      if (zeroCopy != null) zeroCopy ? 'Zero-copy (IOSurface)' : 'GPU copy (SurfaceTexture)',
+      if (videoCodec != null) 'Video: $videoCodec',
+      if (audioCodec != null) 'Audio: $audioCodec',
+    ];
+
+    if (lines.isEmpty) return const SizedBox.shrink();
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: Colors.black54,
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Text(
+        lines.join('\n'),
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 11,
+          fontFamily: 'monospace',
+          height: 1.4,
+        ),
       ),
     );
   }

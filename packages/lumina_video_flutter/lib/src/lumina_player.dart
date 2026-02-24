@@ -43,6 +43,11 @@ class LuminaPlayerValue {
     this.duration = -1.0,
     this.videoSize,
     this.error,
+    this.fps,
+    this.maxFps,
+    this.zeroCopy,
+    this.videoCodec,
+    this.audioCodec,
   });
 
   const LuminaPlayerValue.uninitialized()
@@ -51,7 +56,12 @@ class LuminaPlayerValue {
         position = 0.0,
         duration = -1.0,
         videoSize = null,
-        error = null;
+        error = null,
+        fps = null,
+        maxFps = null,
+        zeroCopy = null,
+        videoCodec = null,
+        audioCodec = null;
 
   /// Flutter texture ID, or -1 if not yet registered.
   final int textureId;
@@ -71,6 +81,21 @@ class LuminaPlayerValue {
   /// Error details when [state] == [LuminaPlaybackState.error].
   final LuminaVideoException? error;
 
+  /// Measured decode FPS (frames polled per second), or null if not yet measured.
+  final double? fps;
+
+  /// Display max refresh rate (Hz), or null if unknown.
+  final int? maxFps;
+
+  /// Whether zero-copy rendering is active (IOSurface on iOS), or null if unknown.
+  final bool? zeroCopy;
+
+  /// Video decoder/codec name (e.g. "VideoToolbox", "H.264"), or null if unknown.
+  final String? videoCodec;
+
+  /// Audio decoder/codec name (e.g. "AAC (FFmpeg)"), or null if unknown.
+  final String? audioCodec;
+
   /// Whether the player has a valid texture ready for rendering.
   bool get isInitialized => textureId >= 0;
 
@@ -81,6 +106,11 @@ class LuminaPlayerValue {
     double? duration,
     Size? videoSize,
     LuminaVideoException? error,
+    double? fps,
+    int? maxFps,
+    bool? zeroCopy,
+    String? videoCodec,
+    String? audioCodec,
   }) {
     return LuminaPlayerValue(
       textureId: textureId ?? this.textureId,
@@ -89,6 +119,11 @@ class LuminaPlayerValue {
       duration: duration ?? this.duration,
       videoSize: videoSize ?? this.videoSize,
       error: error ?? this.error,
+      fps: fps ?? this.fps,
+      maxFps: maxFps ?? this.maxFps,
+      zeroCopy: zeroCopy ?? this.zeroCopy,
+      videoCodec: videoCodec ?? this.videoCodec,
+      audioCodec: audioCodec ?? this.audioCodec,
     );
   }
 
@@ -202,6 +237,11 @@ class LuminaPlayer extends ValueNotifier<LuminaPlayerValue> {
         duration: snap.duration,
         videoSize: snap.videoSize,
         error: snap.error,
+        fps: snap.fps,
+        maxFps: snap.maxFps,
+        zeroCopy: snap.zeroCopy,
+        videoCodec: snap.videoCodec,
+        audioCodec: snap.audioCodec,
       );
 
       if (snap.state == LuminaPlaybackState.error) {
@@ -373,6 +413,11 @@ class LuminaPlayer extends ValueNotifier<LuminaPlayerValue> {
         duration: snap.duration,
         videoSize: snap.videoSize,
         error: snap.error,
+        fps: snap.fps,
+        maxFps: snap.maxFps,
+        zeroCopy: snap.zeroCopy,
+        videoCodec: snap.videoCodec,
+        audioCodec: snap.audioCodec,
       );
     } catch (e) {
       if (!_isTerminal && !_shouldAbort) {
@@ -395,6 +440,11 @@ class LuminaPlayer extends ValueNotifier<LuminaPlayerValue> {
     double duration,
     Size? videoSize,
     LuminaVideoException? error,
+    double? fps,
+    int? maxFps,
+    bool? zeroCopy,
+    String? videoCodec,
+    String? audioCodec,
   }) _parseSnapshot(
     Map<dynamic, dynamic> map, {
     LuminaPlaybackState? fallbackState,
@@ -431,12 +481,29 @@ class LuminaPlayer extends ValueNotifier<LuminaPlayerValue> {
       );
     }
 
+    // Diagnostic fields — all optional
+    final rawFps = map['fps'];
+    final fps = (rawFps is num) ? rawFps.toDouble() : null;
+    final rawMaxFps = map['maxFps'];
+    final maxFps = (rawMaxFps is num) ? rawMaxFps.toInt() : null;
+    final rawZeroCopy = map['zeroCopy'];
+    final zeroCopy = (rawZeroCopy is bool) ? rawZeroCopy : null;
+    final rawVideoCodec = map['videoCodec'];
+    final videoCodec = (rawVideoCodec is String) ? rawVideoCodec : null;
+    final rawAudioCodec = map['audioCodec'];
+    final audioCodec = (rawAudioCodec is String) ? rawAudioCodec : null;
+
     return (
       state: resolvedState,
       position: position,
       duration: duration,
       videoSize: _parseSize(map),
       error: error,
+      fps: fps,
+      maxFps: maxFps,
+      zeroCopy: zeroCopy,
+      videoCodec: videoCodec,
+      audioCodec: audioCodec,
     );
   }
 
