@@ -121,7 +121,7 @@ pub(crate) struct MoqAudioShared {
     /// loop detects the stale heartbeat and forces teardown + resubscribe.
     pub last_audio_forward_frame_at: parking_lot::Mutex<Option<std::time::Instant>>,
     /// Ring buffer metrics updated by the audio thread for observability.
-    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "linux", target_os = "android"))]
     pub ring_buffer_metrics: parking_lot::Mutex<super::audio_ring_buffer::RingBufferMetrics>,
 }
 
@@ -134,7 +134,7 @@ impl MoqAudioShared {
             audio_status: parking_lot::Mutex::new(MoqAudioStatus::Unavailable),
             alive: std::sync::atomic::AtomicBool::new(false),
             last_audio_forward_frame_at: parking_lot::Mutex::new(None),
-            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "linux", target_os = "android"))]
             ring_buffer_metrics: parking_lot::Mutex::new(Default::default()),
         }
     }
@@ -334,7 +334,7 @@ impl MoqStatsHandle {
     pub fn snapshot(&self) -> MoqStatsSnapshot {
         let metadata = self.shared.metadata.lock().clone();
 
-        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "linux", target_os = "android"))]
         let (ring_buffer_fill_percent, ring_buffer_stall_count, ring_buffer_overflow_count) = {
             let rb = self.shared.audio.ring_buffer_metrics.lock().clone();
             let fill_pct = if rb.capacity_samples > 0 {
@@ -344,7 +344,7 @@ impl MoqStatsHandle {
             };
             (fill_pct, rb.stall_count, rb.overflow_count)
         };
-        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux", target_os = "android")))]
         let (ring_buffer_fill_percent, ring_buffer_stall_count, ring_buffer_overflow_count) =
             (0.0f32, 0u64, 0u64);
 
