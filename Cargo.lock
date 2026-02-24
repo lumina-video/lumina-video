@@ -3075,6 +3075,7 @@ name = "lumina-video-ios"
 version = "0.2.2"
 dependencies = [
  "cpal 0.17.1",
+ "lumina-video",
  "lumina-video-core",
  "parking_lot",
  "tracing",

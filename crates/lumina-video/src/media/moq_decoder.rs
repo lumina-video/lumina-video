@@ -48,28 +48,28 @@
 //! - `seek()` returns an error (live streams don't support seeking)
 //! - `is_eof()` returns true only when the stream actually ends
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use super::moq::{AudioTrackInfo, MoqTransportConfig, MoqUrl, VideoTrackInfo};
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 use super::video::{CpuFrame, Plane};
 use super::video::{
     DecodedFrame, HwAccelType, PixelFormat, VideoDecoderBackend, VideoError, VideoFrame,
     VideoMetadata,
 };
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use super::video_decoder::HwAccelConfig;
 
 use async_channel::{Receiver, Sender};
 use parking_lot::Mutex;
 use tokio::runtime::Handle;
 
-// macOS-specific imports for VTDecompressionSession zero-copy
-#[cfg(target_os = "macos")]
+// Apple-specific imports for VTDecompressionSession zero-copy
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use super::video::MacOSGpuSurface;
 
 /// Hard failsafe timeout for startup gating (seconds). Used by worker IDR gate
@@ -163,7 +163,7 @@ pub struct MoqDecoderConfig {
     /// Transport configuration
     pub transport: MoqTransportConfig,
     /// Hardware acceleration configuration (macOS only)
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub hw_accel: HwAccelConfig,
     /// Maximum latency for track subscription (frames older than this are skipped)
     pub max_latency_ms: u64,
@@ -182,7 +182,7 @@ impl Default for MoqDecoderConfig {
     fn default() -> Self {
         Self {
             transport: MoqTransportConfig::default(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             hw_accel: HwAccelConfig::default(),
             max_latency_ms: 500, // 500ms max latency for live streaming
             enable_audio: true,
@@ -479,98 +479,98 @@ pub struct MoqDecoder {
     #[allow(dead_code)]
     start_time: std::time::Instant,
     /// macOS VTDecompressionSession for hardware decoding (zero-copy)
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     vt_decoder: Option<macos_vt::VTDecoder>,
     /// H.264 AVCC NAL length field size (1, 2, or 4 bytes), from avcC.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     h264_nal_length_size: usize,
     /// True if stream is AVCC format (from catalog avcC). Used for correct NAL
     /// parsing in `find_nal_types_for_format`, avoiding the `data_is_annex_b`
     /// heuristic which misclassifies 256-511 byte NALs.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     is_avcc: bool,
     /// True after 3+ consecutive decode errors; decoder must wait for next IDR
     /// to resync. Cleared only when a real IDR (NAL type 5) arrives.
     /// The VT session is destroyed on sustained decode failures.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     waiting_for_idr_after_error: bool,
     /// Consecutive decode error count. Isolated errors (1-2) skip the frame but
     /// keep the VT session alive. At 3+ consecutive errors, the session is
     /// destroyed and `waiting_for_idr_after_error` is set. Reset to 0 on
     /// successful decode or IDR resync.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     consecutive_decode_errors: u32,
     /// Lightweight DPB grace: skip non-IDR frames after an isolated VT callback
     /// error (consecutive_decode_errors == 1 only). Bypasses note_idr_wait_progress()
     /// to avoid premature resubscribe. Bounded by timeout/drop budget;
     /// on expiry, escalates to waiting_for_idr_after_error for normal recovery.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     skip_pframes_until_idr: bool,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     dpb_grace_started_at: Option<std::time::Instant>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     dpb_grace_dropped_frames: u32,
     /// Observed real-IDR cadence (EMA, microseconds). Used to adapt DPB grace
     /// timeout/drop budget to stream cadence instead of fixed constants.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     observed_idr_interval_us: Option<u64>,
     /// Last seen real-IDR PTS (microseconds) for cadence estimation.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     last_idr_pts_us: Option<u64>,
     /// Strict recovery gate: after VT session recreation for recovery, only
     /// allow non-IDR frames once a real IDR decodes successfully on the fresh
     /// session.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     require_clean_idr_after_recreate: bool,
     /// True until the one-shot VT session recreation has fired.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     needs_session_recreation: bool,
     /// If set, defer VT session (re)creation until this instant.
     /// This avoids blocking sleeps on decode paths while still enforcing
     /// a quiesce window after session destruction.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     quiesce_until: Option<std::time::Instant>,
     /// Counts VT session creations for lifecycle diagnostics.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     vt_session_count: u32,
     /// Opt-in diagnostics for frame-level forensic logging around decode errors.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     forensic_enabled: bool,
     /// Rolling window of most-recent submitted frames (for N-3 context on failure).
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     forensic_recent: VecDeque<ForensicFrameSample>,
     /// Active post-error capture window (+3 frames after failing frame).
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     forensic_post_error: Option<PostErrorCapture>,
     /// Monotonic frame sequence number for forensic logs.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     forensic_seq: u64,
     /// Approximate group index, incremented on keyframe boundaries.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     forensic_group_index: u64,
     /// Start of current "waiting for IDR" starvation window.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     idr_wait_started_at: Option<std::time::Instant>,
     /// Number of frames dropped in current IDR starvation window.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     idr_wait_dropped_frames: u32,
     /// Number of keyframe boundaries seen that still lacked a real IDR while
     /// waiting for IDR recovery.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     idr_wait_broken_keyframe_boundaries: u8,
     /// Last time a decoder-side video re-subscribe request was emitted.
     /// Used to prevent rapid request churn when stream metadata is unstable.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     idr_last_resubscribe_request_at: Option<std::time::Instant>,
     /// Start of the current RequiredFrameDropped storm-cycle window.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     required_drop_window_started_at: Option<std::time::Instant>,
     /// Number of storm cycles observed in the current window.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     required_drop_storms_in_window: u8,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[derive(Clone, Copy, Debug)]
 struct ForensicFrameSample {
     seq: u64,
@@ -585,7 +585,7 @@ struct ForensicFrameSample {
     nal_count: usize,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[derive(Clone, Copy, Debug)]
 struct PostErrorCapture {
     trigger_seq: u64,
@@ -651,7 +651,7 @@ impl MoqDecoder {
         });
 
         let initial_volume = config.initial_volume;
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         let forensic_enabled = std::env::var("LUMINA_MOQ_ERROR_FORENSICS")
             .map(|v| v != "0")
             .unwrap_or(false);
@@ -660,9 +660,9 @@ impl MoqDecoder {
             config,
             shared,
             frame_rx,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             active_hw_type: HwAccelType::VideoToolbox,
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             active_hw_type: HwAccelType::None,
             _owned_runtime: owned_runtime,
             _runtime: runtime,
@@ -679,55 +679,55 @@ impl MoqDecoder {
             },
             last_frame_time: None,
             start_time: std::time::Instant::now(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             vt_decoder: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             h264_nal_length_size: 4,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             is_avcc: false, // updated when VT session is created from catalog avcC
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             waiting_for_idr_after_error: false,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             consecutive_decode_errors: 0,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             skip_pframes_until_idr: false,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             dpb_grace_started_at: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             dpb_grace_dropped_frames: 0,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             observed_idr_interval_us: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             last_idr_pts_us: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             require_clean_idr_after_recreate: false,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             needs_session_recreation: true,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             quiesce_until: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             vt_session_count: 0,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             forensic_enabled,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             forensic_recent: VecDeque::with_capacity(8),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             forensic_post_error: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             forensic_seq: 0,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             forensic_group_index: 0,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             idr_wait_started_at: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             idr_wait_dropped_frames: 0,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             idr_wait_broken_keyframe_boundaries: 0,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             idr_last_resubscribe_request_at: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             required_drop_window_started_at: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             required_drop_storms_in_window: 0,
         })
     }
@@ -739,7 +739,8 @@ impl MoqDecoder {
         config: MoqDecoderConfig,
         frame_tx: Sender<MoqVideoFrame>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        super::moq::worker::run_moq_worker(shared, url, config, frame_tx, "macOS").await
+        let platform = if cfg!(target_os = "ios") { "iOS" } else { "macOS" };
+        super::moq::worker::run_moq_worker(shared, url, config, frame_tx, platform).await
     }
 
     /// Returns true if this URL is a MoQ URL.
@@ -911,7 +912,7 @@ impl MoqDecoder {
     /// Only accepts real IDR (NAL type 5) as valid resync point. I-frames (NAL type 1
     /// with is_keyframe=true) cannot initialize a fresh VT session because they need
     /// existing DPB reference frames.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn should_wait_for_idr(&self, moq_frame: &MoqVideoFrame) -> bool {
         if !self.waiting_for_idr_after_error {
             return false;
@@ -925,7 +926,7 @@ impl MoqDecoder {
         !is_idr // only real IDR can clear the resync gate
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn fnv1a64(data: &[u8]) -> u64 {
         // Deterministic lightweight fingerprint for cross-run frame matching.
         let mut hash: u64 = 0xcbf29ce484222325;
@@ -936,7 +937,7 @@ impl MoqDecoder {
         hash
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn record_forensic_sample(&mut self, moq_frame: &MoqVideoFrame, nal_types: &[u8]) {
         if !self.forensic_enabled {
             return;
@@ -998,7 +999,7 @@ impl MoqDecoder {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn log_forensic_error_window(&mut self) {
         if !self.forensic_enabled {
             return;
@@ -1039,7 +1040,7 @@ impl MoqDecoder {
         });
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn reset_idr_wait_tracking(&mut self) {
         self.idr_wait_started_at = None;
         self.idr_wait_dropped_frames = 0;
@@ -1050,7 +1051,7 @@ impl MoqDecoder {
     ///
     /// Tries catalog avcC description first, falls back to keyframe SPS/PPS
     /// extraction. Respects quiesce window after session destruction.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn ensure_vt_session(&mut self, moq_frame: &MoqVideoFrame) -> Result<(), VideoError> {
         if self.vt_decoder.is_some() {
             return Ok(());
@@ -1127,7 +1128,7 @@ impl MoqDecoder {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn request_video_resubscribe_with_cooldown(&mut self) -> bool {
         const RESUBSCRIBE_REQUEST_COOLDOWN: Duration = Duration::from_millis(800);
         let now = std::time::Instant::now();
@@ -1148,7 +1149,7 @@ impl MoqDecoder {
         false
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn note_idr_wait_progress(&mut self, nal_type: u8, frame_len: usize, is_keyframe: bool) {
         // Keep recovery bounded: if a real IDR doesn't arrive quickly, force
         // re-subscribe so we can rejoin on a fresh group boundary.
@@ -1211,7 +1212,7 @@ impl MoqDecoder {
         self.idr_wait_broken_keyframe_boundaries = 0;
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn note_required_drop_storm_cycle(&mut self) -> u8 {
         const STORM_ESCALATION_WINDOW: Duration = Duration::from_millis(4500);
 
@@ -1229,7 +1230,7 @@ impl MoqDecoder {
         self.required_drop_storms_in_window
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn note_real_idr_timestamp(&mut self, pts_us: u64) {
         // Ignore clearly invalid cadence deltas.
         const MIN_IDR_INTERVAL_US: u64 = 300_000;
@@ -1248,7 +1249,7 @@ impl MoqDecoder {
         self.last_idr_pts_us = Some(pts_us);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn dpb_grace_budget(&self) -> (Duration, u32) {
         // Base timeout from observed IDR cadence + margin for jitter/bursting.
         let observed_us = self.observed_idr_interval_us.unwrap_or(2_000_000);
@@ -1274,7 +1275,7 @@ impl MoqDecoder {
     ///
     /// On macOS, uses VTDecompressionSession for zero-copy hardware decoding.
     /// On other platforms, returns a placeholder (FFmpeg integration TODO).
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn decode_frame(&mut self, moq_frame: &MoqVideoFrame) -> Result<VideoFrame, VideoError> {
         // Initialize VTDecoder lazily (creates from catalog avcC or keyframe SPS/PPS)
         self.ensure_vt_session(moq_frame)?;
@@ -1697,7 +1698,7 @@ impl MoqDecoder {
     ///
     /// In a full implementation, this would use FFmpeg to decode H.264/H.265/AV1.
     /// For now, we return a placeholder frame to demonstrate the pipeline.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     fn decode_frame(&mut self, moq_frame: &MoqVideoFrame) -> Result<VideoFrame, VideoError> {
         let metadata = self.shared.metadata.lock();
         let width = metadata.width as usize;
@@ -1850,7 +1851,7 @@ impl MoqDecoder {
     /// Extracts SPS and PPS NAL units from H.264 Annex B bitstream.
     ///
     /// SPS NAL type = 7, PPS NAL type = 8
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn extract_h264_params(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), VideoError> {
         let mut sps: Option<Vec<u8>> = None;
         let mut pps: Option<Vec<u8>> = None;
@@ -2086,7 +2087,7 @@ impl VideoDecoderBackend for MoqDecoder {
 // NAL units from MoQ are fed directly to VTDecompressionSession, which outputs
 // CVPixelBuffers backed by IOSurface for zero-copy GPU rendering.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 mod macos_vt {
     use super::*;
     use objc2::rc::Retained;

@@ -21,10 +21,12 @@ let package = Package(
                 .linkedLibrary("lumina_video_ios"),
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("CoreMedia"),
+                .linkedFramework("CoreVideo"),
                 .linkedFramework("Metal"),
                 .linkedFramework("IOSurface"),
                 .linkedFramework("QuartzCore"),
                 .linkedFramework("Security"),
+                .linkedFramework("VideoToolbox"),
             ]
         ),
     ]

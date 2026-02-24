@@ -46,6 +46,11 @@ const LUMINA_STATE_ERROR: i32 = 5;
 
 /// Creates a new video player for the given URL.
 ///
+/// Supports `moq://` and `moqs://` URLs for live streaming (when built with
+/// the `moq` feature). MoQ decoder init happens on a background thread;
+/// the player starts in `Loading` state and transitions to `Ready`/`Error`
+/// once the connection is established.
+///
 /// # Safety
 /// - `url` must be a valid null-terminated UTF-8 C string.
 /// - `out_player` must be a valid non-null pointer to a `*mut LuminaPlayer`.
@@ -72,11 +77,20 @@ pub extern "C" fn lumina_player_create(
             return Err(LuminaError::InvalidUrl);
         }
 
+        // MoQ live stream path: async init on background thread
+        #[cfg(feature = "moq")]
+        if url_str.starts_with("moq://") || url_str.starts_with("moqs://") {
+            return create_moq_player(url_str, out_player);
+        }
+
+        // VOD path: CorePlayer + init_decoder (existing behavior)
         let mut core = CorePlayer::new(url_str);
         core.init_decoder();
 
         let player = Box::new(LuminaPlayer {
             core: Arc::new(Mutex::new(core)),
+            #[cfg(feature = "moq")]
+            moq_init: Mutex::new(None),
         });
 
         let raw = Box::into_raw(player);
@@ -89,6 +103,67 @@ pub extern "C" fn lumina_player_create(
         }
         Ok(())
     })
+}
+
+/// Creates a MoQ player with async decoder initialization.
+///
+/// The decoder connects to the relay on a background thread. The player
+/// starts in `Loading` state; `try_complete_moq_init()` drives it to
+/// `Ready` or `Error`.
+#[cfg(feature = "moq")]
+fn create_moq_player(
+    url_str: &str,
+    out_player: *mut *mut LuminaPlayer,
+) -> Result<(), LuminaError> {
+    use crate::handle::MoqInitState;
+    use lumina_video::media::{MoqDecoder, MoqDecoderConfig};
+
+    tracing::info!("Creating MoQ player for: {url_str}");
+
+    let mut config = MoqDecoderConfig::default();
+    // Disable audio — iOS MoQ is video-only for now
+    config.enable_audio = false;
+    // TODO: gate behind debug_assertions once real TLS certs are used in production
+    config.transport.disable_tls_verify = true;
+
+    let url_owned = url_str.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    std::thread::Builder::new()
+        .name("moq-init".into())
+        .spawn({
+            let url = url_owned.clone();
+            move || {
+                tracing::info!("MoQ init thread: connecting to {url}");
+                let result = MoqDecoder::new_with_config(&url, config)
+                    .map(|d| Box::new(d) as Box<dyn lumina_video_core::video::VideoDecoderBackend + Send>);
+                if let Err(ref e) = result {
+                    tracing::error!("MoQ decoder creation failed: {e}");
+                }
+                let _ = tx.send(result);
+            }
+        })
+        .map_err(|e| {
+            tracing::error!("Failed to spawn MoQ init thread: {e}");
+            LuminaError::Internal
+        })?;
+
+    // Create player shell in Loading state
+    let core = CorePlayer::new(&url_owned);
+    let player = Box::new(LuminaPlayer {
+        core: Arc::new(Mutex::new(core)),
+        moq_init: Mutex::new(Some(MoqInitState { rx, url: url_owned })),
+    });
+
+    let raw = Box::into_raw(player);
+    diagnostics::register_player(raw as *const u8);
+    #[cfg(debug_assertions)]
+    diagnostics::record_player_created();
+
+    unsafe {
+        *out_player = raw;
+    }
+    Ok(())
 }
 
 /// Destroys a video player and frees all resources.
@@ -148,6 +223,8 @@ pub extern "C" fn lumina_player_destroy(player: *mut *mut LuminaPlayer) -> i32 {
 pub extern "C" fn lumina_player_play(player: *mut LuminaPlayer) -> i32 {
     ffi_boundary(|| {
         let player = check_not_null!(player);
+        #[cfg(feature = "moq")]
+        player.try_complete_moq_init();
         player.with_core(|core| {
             // Complete init if still pending
             core.check_init_complete();
@@ -276,6 +353,8 @@ pub extern "C" fn lumina_player_state(player: *const LuminaPlayer) -> i32 {
             return LUMINA_STATE_ERROR;
         }
         let player = unsafe { &*player };
+        #[cfg(feature = "moq")]
+        player.try_complete_moq_init();
         let state = player.core.lock().state().clone();
         match state {
             VideoState::Loading => LUMINA_STATE_LOADING,
@@ -342,10 +421,13 @@ pub extern "C" fn lumina_player_poll_frame(player: *mut LuminaPlayer) -> *mut Lu
             return std::ptr::null_mut();
         }
         let player = unsafe { &*player };
+        #[cfg(feature = "moq")]
+        player.try_complete_moq_init();
         let frame = {
             let mut core = player.core.lock();
             // Drive init forward if needed
             core.check_init_complete();
+
             core.poll_frame()
         };
         // Lock dropped — boxing and diagnostics outside critical section
