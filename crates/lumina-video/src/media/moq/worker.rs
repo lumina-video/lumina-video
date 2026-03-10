@@ -313,10 +313,14 @@ async fn resubscribe_video_track(
         detail,
     );
 
-    *video_consumer = hang::container::OrderedConsumer::new(
-        moq_broadcast.subscribe_track(video_track),
-        max_latency,
-    );
+    let track_consumer = match moq_broadcast.subscribe_track(video_track) {
+        Ok(tc) => tc,
+        Err(e) => {
+            tracing::error!("MoQ {}: Failed to re-subscribe video track: {}", label, e);
+            return false;
+        }
+    };
+    *video_consumer = hang::container::OrderedConsumer::new(track_consumer, max_latency);
 
     // Audio runs in its own dedicated task and is not re-subscribed here.
 
@@ -397,7 +401,7 @@ pub(crate) async fn run_moq_worker(
         priority: 100,
     };
     let mut video_consumer = hang::container::OrderedConsumer::new(
-        moq_broadcast.subscribe_track(&video_track),
+        moq_broadcast.subscribe_track(&video_track)?,
         cat.max_latency,
     );
 
@@ -667,7 +671,7 @@ pub(crate) async fn run_moq_worker(
                         // Frame dump: record then check if we should disable
                         let mut disable_dump = false;
                         if let Some(ref mut dump) = frame_dump {
-                            match dump.record_frame(&data, frame.keyframe, frame.timestamp.as_micros() as u64) {
+                            match dump.record_frame(&data, frame.is_keyframe(), frame.timestamp.as_micros() as u64) {
                                 Ok(false) => disable_dump = true,
                                 Err(e) => {
                                     tracing::warn!("FrameDumpHook: I/O error ({}), disabling dump", e);
@@ -685,7 +689,7 @@ pub(crate) async fn run_moq_worker(
                             let start = *idr_gate_start.get_or_insert_with(std::time::Instant::now);
 
                             // Log first few keyframes BEFORE gate decision for diagnostics
-                            if frame.keyframe && idr_gate_groups_seen < 5 {
+                            if frame.is_keyframe() && idr_gate_groups_seen < 5 {
                                 let n = data.len().min(20);
                                 let is_avcc_fmt = idr_gate_enabled;
                                 let (nal_arr, nal_count) =
@@ -700,7 +704,7 @@ pub(crate) async fn run_moq_worker(
                                 );
                             }
 
-                            if frame.keyframe {
+                            if frame.is_keyframe() {
                                 idr_gate_groups_seen = idr_gate_groups_seen.saturating_add(1);
                             }
                             let elapsed = start.elapsed();
@@ -715,7 +719,7 @@ pub(crate) async fn run_moq_worker(
                                 MoqDecoder::find_nal_types_for_format(&data, nal_length_size, is_avcc);
                             let has_idr = nal_arr[..nal_count].contains(&5);
 
-                            if frame.keyframe && has_idr {
+                            if frame.is_keyframe() && has_idr {
                                 // Best case: real IDR at group boundary.
                                 tracing::info!(
                                     "MoQ {}: IDR gate cleared — real IDR at {}ms (groups_seen={})",
@@ -726,7 +730,7 @@ pub(crate) async fn run_moq_worker(
                                 waiting_for_valid_idr = false;
                                 idr_gate_broken_keyframes = 0;
                             } else {
-                                if frame.keyframe && !has_idr {
+                                if frame.is_keyframe() && !has_idr {
                                     idr_gate_broken_keyframes =
                                         idr_gate_broken_keyframes.saturating_add(1);
                                     tracing::warn!(
@@ -795,7 +799,7 @@ pub(crate) async fn run_moq_worker(
                         let moq_frame = MoqVideoFrame {
                             timestamp_us: frame.timestamp.as_micros() as u64,
                             data,
-                            is_keyframe: frame.keyframe,
+                            is_keyframe: frame.is_keyframe(),
                         };
 
                         if recv_count <= 10 {
@@ -1297,7 +1301,7 @@ async fn fetch_and_validate_catalog(
     label: &str,
 ) -> Result<CatalogResult, Box<dyn std::error::Error + Send + Sync>> {
     let mut catalog_consumer =
-        hang::CatalogConsumer::new(moq_broadcast.subscribe_track(&hang::Catalog::default_track()));
+        hang::CatalogConsumer::new(moq_broadcast.subscribe_track(&hang::Catalog::default_track())?);
     let catalog_timeout = Duration::from_secs(5);
     let catalog = match tokio::time::timeout(catalog_timeout, catalog_consumer.next()).await {
         Ok(Ok(Some(catalog))) => catalog,
@@ -1499,10 +1503,17 @@ fn setup_audio(
         name: track_name.to_string(),
         priority: 50,
     };
-    let audio_consumer = hang::container::OrderedConsumer::new(
-        moq_broadcast.subscribe_track(&audio_track),
-        max_latency,
-    );
+    let track_consumer = match moq_broadcast.subscribe_track(&audio_track) {
+        Ok(tc) => tc,
+        Err(e) => {
+            tracing::error!("MoQ {}: Failed to subscribe audio track: {}", label, e);
+            *shared.audio.audio_status.lock() = MoqAudioStatus::Unavailable;
+            return (None, None, None);
+        }
+    };
+    // Audio should never skip frames — use a large max_latency so OrderedConsumer
+    // delivers every frame without latency-based group skipping.
+    let audio_consumer = hang::container::OrderedConsumer::new(track_consumer, Duration::from_secs(30));
 
     let (tx, rx) = crossbeam_channel::bounded(config.audio_buffer_capacity);
     let live_sender = LiveEdgeSender::new(tx, rx.clone());
@@ -1595,8 +1606,26 @@ fn spawn_audio_forward_task(
         // select! loop provides defense-in-depth if this timeout fails to fire.
         const READ_TIMEOUT: Duration = Duration::from_secs(8);
         let mut last_periodic_log = std::time::Instant::now();
+        let mut max_read_us: u64 = 0;
+        let mut total_read_us: u64 = 0;
         loop {
-            match tokio::time::timeout(READ_TIMEOUT, audio_consumer.read()).await {
+            let read_start = std::time::Instant::now();
+            let result = tokio::time::timeout(READ_TIMEOUT, audio_consumer.read()).await;
+            let read_elapsed_us = read_start.elapsed().as_micros() as u64;
+            total_read_us += read_elapsed_us;
+            if read_elapsed_us > max_read_us {
+                max_read_us = read_elapsed_us;
+            }
+            // Log any read that takes >100ms — early warning of blocking
+            if read_elapsed_us > 100_000 {
+                tracing::warn!(
+                    "MoQ {}: audio read() took {}ms (frames so far: {})",
+                    label_owned,
+                    read_elapsed_us / 1000,
+                    frames_forwarded,
+                );
+            }
+            match result {
                 Ok(Ok(Some(frame))) => {
                     let data = assemble_payload(&frame.payload, &mut buf);
                     let pts_us = frame.timestamp.as_micros() as u64;
@@ -1623,34 +1652,39 @@ fn spawn_audio_forward_task(
                     // Periodic log every 5s to confirm liveness
                     if last_periodic_log.elapsed() >= Duration::from_secs(5) {
                         last_periodic_log = std::time::Instant::now();
+                        let avg_read_us = if frames_forwarded > 0 { total_read_us / frames_forwarded } else { 0 };
                         tracing::info!(
-                            "MoQ {}: audio forward alive: {} frames forwarded, last_pts={}us",
+                            "MoQ {}: audio forward alive: {} frames, last_pts={}us, avg_read={}us, max_read={}us",
                             label_owned,
                             frames_forwarded,
                             pts_us,
+                            avg_read_us,
+                            max_read_us,
                         );
                     }
                 }
                 Ok(Ok(None)) => {
-                    tracing::info!(
-                        "MoQ {}: Audio track ended (after {} frames)",
+                    tracing::warn!(
+                        "MoQ {}: Audio track ended (after {} frames, last read took {}ms)",
                         label_owned,
                         frames_forwarded,
+                        read_elapsed_us / 1000,
                     );
                     break;
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(
-                        "MoQ {}: Audio read error (after {} frames): {e}",
+                        "MoQ {}: Audio read error (after {} frames, last read took {}ms): {e}",
                         label_owned,
                         frames_forwarded,
+                        read_elapsed_us / 1000,
                     );
                     break;
                 }
                 Err(_elapsed) => {
                     // Single strike — exit immediately, don't reuse corrupted consumer
                     tracing::warn!(
-                        "MoQ {}: Audio read timeout ({}s, after {} frames) — consumer stalled, exiting for re-subscribe",
+                        "MoQ {}: Audio read TIMEOUT ({}s, after {} frames) — consumer stalled, exiting for re-subscribe",
                         label_owned,
                         READ_TIMEOUT.as_secs(),
                         frames_forwarded,

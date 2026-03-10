@@ -91,6 +91,12 @@ pub extern "C" fn lumina_player_create(
             core: Arc::new(Mutex::new(core)),
             #[cfg(feature = "moq")]
             moq_init: Mutex::new(None),
+            #[cfg(feature = "moq")]
+            moq_stats: Mutex::new(None),
+            #[cfg(feature = "moq")]
+            moq_audio_bound: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "moq")]
+            moq_audio_sync_master: std::sync::atomic::AtomicBool::new(false),
         });
 
         let raw = Box::into_raw(player);
@@ -115,16 +121,15 @@ fn create_moq_player(
     url_str: &str,
     out_player: *mut *mut LuminaPlayer,
 ) -> Result<(), LuminaError> {
-    use crate::handle::MoqInitState;
+    use crate::handle::{MoqInitResult, MoqInitState};
     use lumina_video::media::{MoqDecoder, MoqDecoderConfig};
 
     tracing::info!("Creating MoQ player for: {url_str}");
 
     let mut config = MoqDecoderConfig::default();
-    // Disable audio — iOS MoQ is video-only for now
-    config.enable_audio = false;
-    // TODO: gate behind debug_assertions once real TLS certs are used in production
-    config.transport.disable_tls_verify = true;
+    config.enable_audio = true;
+    // Only disable TLS verify in debug builds (self-signed relay certs)
+    config.transport.disable_tls_verify = cfg!(debug_assertions);
 
     let url_owned = url_str.to_string();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -135,8 +140,14 @@ fn create_moq_player(
             let url = url_owned.clone();
             move || {
                 tracing::info!("MoQ init thread: connecting to {url}");
-                let result = MoqDecoder::new_with_config(&url, config)
-                    .map(|d| Box::new(d) as Box<dyn lumina_video_core::video::VideoDecoderBackend + Send>);
+                let result = MoqDecoder::new_with_config(&url, config).map(|d| {
+                    let stats = d.stats_handle();
+                    MoqInitResult {
+                        decoder: Box::new(d)
+                            as Box<dyn lumina_video_core::video::VideoDecoderBackend + Send>,
+                        stats,
+                    }
+                });
                 if let Err(ref e) = result {
                     tracing::error!("MoQ decoder creation failed: {e}");
                 }
@@ -153,6 +164,9 @@ fn create_moq_player(
     let player = Box::new(LuminaPlayer {
         core: Arc::new(Mutex::new(core)),
         moq_init: Mutex::new(Some(MoqInitState { rx, url: url_owned })),
+        moq_stats: Mutex::new(None),
+        moq_audio_bound: std::sync::atomic::AtomicBool::new(false),
+        moq_audio_sync_master: std::sync::atomic::AtomicBool::new(false),
     });
 
     let raw = Box::into_raw(player);
@@ -423,6 +437,8 @@ pub extern "C" fn lumina_player_poll_frame(player: *mut LuminaPlayer) -> *mut Lu
         let player = unsafe { &*player };
         #[cfg(feature = "moq")]
         player.try_complete_moq_init();
+        #[cfg(feature = "moq")]
+        player.poll_moq_audio_handle();
         let frame = {
             let mut core = player.core.lock();
             // Drive init forward if needed
@@ -607,6 +623,80 @@ pub extern "C" fn lumina_diagnostics_snapshot(out: *mut LuminaDiagnostics) -> i3
 
         Ok(())
     })
+}
+
+// =========================================================================
+// MoQ audio diagnostics
+// =========================================================================
+
+/// Returns the MoQ audio status as an integer.
+///
+/// - 0: Not a MoQ stream (VOD) or MoQ feature not enabled
+/// - 1: Unavailable (audio not in catalog or not yet started)
+/// - 2: Starting (audio thread spawning)
+/// - 3: Running (cpal stream active)
+/// - 4: Error (audio thread failed)
+/// - 5: Handle bound (audio handle late-bound to player)
+///
+/// # Safety
+/// `player` must be a valid `LuminaPlayer` pointer (or NULL).
+#[no_mangle]
+pub extern "C" fn lumina_player_moq_audio_status(player: *const LuminaPlayer) -> i32 {
+    ffi_boundary_or(0, || {
+        if player.is_null() {
+            return 0;
+        }
+        #[cfg(feature = "moq")]
+        {
+            let player = unsafe { &*player };
+            let stats = player.moq_stats.lock();
+            if let Some(ref stats) = *stats {
+                if player
+                    .moq_audio_bound
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    return 5; // Handle bound
+                }
+                // Check if audio handle is available (thread alive)
+                if stats.audio_handle().is_some() {
+                    return 3; // Running but not yet bound
+                }
+                if stats.is_audio_alive() {
+                    return 2; // Starting
+                }
+                return 1; // Unavailable
+            }
+            0 // No MoQ stats yet
+        }
+        #[cfg(not(feature = "moq"))]
+        0
+    })
+}
+
+// =========================================================================
+// Tracing / logging
+// =========================================================================
+
+/// Initializes the Rust tracing subscriber (logs to stderr → Xcode console).
+///
+/// Call once at app startup before any player creation. Subsequent calls
+/// are no-ops (guarded by `std::sync::Once`).
+///
+/// # Safety
+/// No pointer arguments — always safe to call.
+#[no_mangle]
+pub extern "C" fn lumina_init_tracing() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_target(true)
+            .with_thread_ids(true)
+            .with_ansi(false)
+            .init();
+        tracing::info!("lumina_init_tracing: subscriber initialized");
+    });
 }
 
 // =========================================================================

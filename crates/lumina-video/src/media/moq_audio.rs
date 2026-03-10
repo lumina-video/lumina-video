@@ -327,6 +327,36 @@ const MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 100;
 /// this, insert silence to keep the ring buffer timeline correct.
 const GAP_THRESHOLD_US: u64 = 32_000; // 32ms
 
+/// Linear interpolation resampler for PCM audio.
+///
+/// Converts interleaved f32 samples from `in_rate` to `out_rate`. Handles arbitrary
+/// channel counts. No state between calls — suitable for independent frame-by-frame
+/// resampling where sub-sample continuity is not critical (ring buffer absorbs jitter).
+fn linear_resample(input: &[f32], channels: usize, in_rate: u32, out_rate: u32) -> Vec<f32> {
+    if in_rate == out_rate || input.is_empty() || channels == 0 {
+        return input.to_vec();
+    }
+    let in_frames = input.len() / channels;
+    let out_frames =
+        ((in_frames as u64) * (out_rate as u64) + (in_rate as u64 - 1)) / (in_rate as u64);
+    let ratio = in_rate as f64 / out_rate as f64;
+    let mut output = Vec::with_capacity(out_frames as usize * channels);
+    for i in 0..out_frames as usize {
+        let src_pos = i as f64 * ratio;
+        let idx = src_pos as usize;
+        let frac = (src_pos - idx as f64) as f32;
+        for ch in 0..channels {
+            let s0 = input.get(idx * channels + ch).copied().unwrap_or(0.0);
+            let s1 = input
+                .get((idx + 1) * channels + ch)
+                .copied()
+                .unwrap_or(s0);
+            output.push(s0 + (s1 - s0) * frac);
+        }
+    }
+    output
+}
+
 /// Audio thread main loop: receives AAC frames, decodes via symphonia, writes to ring buffer.
 ///
 /// Uses a lock-free ring buffer read by the cpal audio callback,
@@ -364,6 +394,19 @@ fn moq_audio_thread_main(
         }
     };
 
+    // Detect sample rate mismatch: iOS devices only support 48kHz, so when
+    // content is 44.1kHz, cpal falls back to device rate. Without resampling,
+    // the ring buffer drains ~8.8% faster than it fills → constant underruns.
+    let device_rate = player.device_sample_rate();
+    let needs_resample = device_rate != sample_rate;
+    if needs_resample {
+        tracing::info!(
+            "MoQ audio: content rate {}Hz != device rate {}Hz, will resample",
+            sample_rate,
+            device_rate,
+        );
+    }
+
     let mut decoder = match codec {
         MoqAudioCodec::Aac => {
             match SymphoniaAacDecoder::new(sample_rate, channels, description.as_ref()) {
@@ -393,7 +436,9 @@ fn moq_audio_thread_main(
         },
     };
 
-    audio_handle.set_audio_format(sample_rate, channels);
+    // Use device rate for position tracking: cpal reads at device_rate,
+    // so samples_played / device_rate gives correct wall-clock position.
+    audio_handle.set_audio_format(device_rate, channels);
 
     audio_shared
         .internal_audio_ready
@@ -450,6 +495,8 @@ fn moq_audio_thread_main(
 
                     // Gap detection: insert silence for PTS discontinuities > 32ms.
                     // Capped at 1s AND available buffer space to avoid overflow.
+                    // PTS math uses content sample_rate; silence uses device_rate
+                    // (ring buffer runs at device rate when resampling).
                     if let Some(prev_pts) = last_pts_us {
                         let expected_next = prev_pts
                             + (samples.data.len() as u64 * 1_000_000)
@@ -458,13 +505,11 @@ fn moq_audio_thread_main(
                         if actual > expected_next + GAP_THRESHOLD_US {
                             let gap_us = actual - expected_next;
                             let silence_samples =
-                                (gap_us as usize * sample_rate as usize * ch) / 1_000_000;
-                            // Cap at 1s, and also at available buffer space to prevent
-                            // silence from overflowing and overwriting valid audio.
+                                (gap_us as usize * device_rate as usize * ch) / 1_000_000;
                             let available =
                                 producer.capacity().saturating_sub(producer.fill_level());
                             let capped = silence_samples
-                                .min(sample_rate as usize * ch)
+                                .min(device_rate as usize * ch)
                                 .min(available);
                             if capped > 0 {
                                 let silence = vec![0.0f32; capped];
@@ -495,8 +540,17 @@ fn moq_audio_thread_main(
                         std::thread::sleep(Duration::from_millis(5));
                     }
 
-                    // Write decoded PCM directly to ring buffer (lock-free)
-                    producer.write(&samples.data);
+                    // Write decoded PCM to ring buffer, resampling if needed.
+                    // When device rate differs from content rate (e.g. 44.1kHz
+                    // content on 48kHz-only iOS), linear interpolation prevents
+                    // the ring buffer from draining faster than it fills.
+                    if needs_resample {
+                        let resampled =
+                            linear_resample(&samples.data, ch, sample_rate, device_rate);
+                        producer.write(&resampled);
+                    } else {
+                        producer.write(&samples.data);
+                    }
 
                     // Periodically flush ring buffer metrics for UI observability (~1/sec)
                     frames_since_metrics += 1;
