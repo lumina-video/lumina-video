@@ -112,6 +112,24 @@ opus = { workspace = true }
 symphonia-codec-aac = { workspace = true }
 symphonia-core = { workspace = true }
 
+# iOS native AVFoundation/VideoToolbox decoder (shared Apple frameworks with macOS)
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-av-foundation = { workspace = true }
+objc2-core-media = { workspace = true }
+objc2-core-video = { workspace = true }
+objc2-video-toolbox = { workspace = true }
+block2 = { workspace = true }
+objc2-core-foundation = { version = "0.3", features = ["CFNumber", "CFDictionary", "CFString"] }
+metal = { workspace = true }
+wgpu = { version = "24" }
+profiling = { version = "1.0" }
+cpal = { workspace = true }
+opus = { workspace = true }
+symphonia-codec-aac = { workspace = true }
+symphonia-core = { workspace = true }
+
 # Windows native Media Foundation decoder
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [

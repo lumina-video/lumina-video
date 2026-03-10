@@ -46,6 +46,11 @@ const LUMINA_STATE_ERROR: i32 = 5;
 
 /// Creates a new video player for the given URL.
 ///
+/// Supports `moq://` and `moqs://` URLs for live streaming (when built with
+/// the `moq` feature). MoQ decoder init happens on a background thread;
+/// the player starts in `Loading` state and transitions to `Ready`/`Error`
+/// once the connection is established.
+///
 /// # Safety
 /// - `url` must be a valid null-terminated UTF-8 C string.
 /// - `out_player` must be a valid non-null pointer to a `*mut LuminaPlayer`.
@@ -72,11 +77,20 @@ pub extern "C" fn lumina_player_create(
             return Err(LuminaError::InvalidUrl);
         }
 
+        // MoQ live stream path: async init on background thread
+        #[cfg(feature = "moq")]
+        if url_str.starts_with("moq://") || url_str.starts_with("moqs://") {
+            return create_moq_player(url_str, out_player);
+        }
+
+        // VOD path: CorePlayer + init_decoder (existing behavior)
         let mut core = CorePlayer::new(url_str);
         core.init_decoder();
 
         let player = Box::new(LuminaPlayer {
             core: Arc::new(Mutex::new(core)),
+            #[cfg(feature = "moq")]
+            moq_init: Mutex::new(None),
         });
 
         let raw = Box::into_raw(player);
@@ -89,6 +103,67 @@ pub extern "C" fn lumina_player_create(
         }
         Ok(())
     })
+}
+
+/// Creates a MoQ player with async decoder initialization.
+///
+/// The decoder connects to the relay on a background thread. The player
+/// starts in `Loading` state; `try_complete_moq_init()` drives it to
+/// `Ready` or `Error`.
+#[cfg(feature = "moq")]
+fn create_moq_player(
+    url_str: &str,
+    out_player: *mut *mut LuminaPlayer,
+) -> Result<(), LuminaError> {
+    use crate::handle::MoqInitState;
+    use lumina_video::media::{MoqDecoder, MoqDecoderConfig};
+
+    tracing::info!("Creating MoQ player for: {url_str}");
+
+    let mut config = MoqDecoderConfig::default();
+    // Disable audio — iOS MoQ is video-only for now
+    config.enable_audio = false;
+    // TODO: gate behind debug_assertions once real TLS certs are used in production
+    config.transport.disable_tls_verify = true;
+
+    let url_owned = url_str.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    std::thread::Builder::new()
+        .name("moq-init".into())
+        .spawn({
+            let url = url_owned.clone();
+            move || {
+                tracing::info!("MoQ init thread: connecting to {url}");
+                let result = MoqDecoder::new_with_config(&url, config)
+                    .map(|d| Box::new(d) as Box<dyn lumina_video_core::video::VideoDecoderBackend + Send>);
+                if let Err(ref e) = result {
+                    tracing::error!("MoQ decoder creation failed: {e}");
+                }
+                let _ = tx.send(result);
+            }
+        })
+        .map_err(|e| {
+            tracing::error!("Failed to spawn MoQ init thread: {e}");
+            LuminaError::Internal
+        })?;
+
+    // Create player shell in Loading state
+    let core = CorePlayer::new(&url_owned);
+    let player = Box::new(LuminaPlayer {
+        core: Arc::new(Mutex::new(core)),
+        moq_init: Mutex::new(Some(MoqInitState { rx, url: url_owned })),
+    });
+
+    let raw = Box::into_raw(player);
+    diagnostics::register_player(raw as *const u8);
+    #[cfg(debug_assertions)]
+    diagnostics::record_player_created();
+
+    unsafe {
+        *out_player = raw;
+    }
+    Ok(())
 }
 
 /// Destroys a video player and frees all resources.
@@ -148,6 +223,8 @@ pub extern "C" fn lumina_player_destroy(player: *mut *mut LuminaPlayer) -> i32 {
 pub extern "C" fn lumina_player_play(player: *mut LuminaPlayer) -> i32 {
     ffi_boundary(|| {
         let player = check_not_null!(player);
+        #[cfg(feature = "moq")]
+        player.try_complete_moq_init();
         player.with_core(|core| {
             // Complete init if still pending
             core.check_init_complete();
@@ -276,6 +353,8 @@ pub extern "C" fn lumina_player_state(player: *const LuminaPlayer) -> i32 {
             return LUMINA_STATE_ERROR;
         }
         let player = unsafe { &*player };
+        #[cfg(feature = "moq")]
+        player.try_complete_moq_init();
         let state = player.core.lock().state().clone();
         match state {
             VideoState::Loading => LUMINA_STATE_LOADING,
@@ -342,10 +421,13 @@ pub extern "C" fn lumina_player_poll_frame(player: *mut LuminaPlayer) -> *mut Lu
             return std::ptr::null_mut();
         }
         let player = unsafe { &*player };
+        #[cfg(feature = "moq")]
+        player.try_complete_moq_init();
         let frame = {
             let mut core = player.core.lock();
             // Drive init forward if needed
             core.check_init_complete();
+
             core.poll_frame()
         };
         // Lock dropped — boxing and diagnostics outside critical section
@@ -525,4 +607,119 @@ pub extern "C" fn lumina_diagnostics_snapshot(out: *mut LuminaDiagnostics) -> i3
 
         Ok(())
     })
+}
+
+// =========================================================================
+// Audio smoke test (iOS only)
+// =========================================================================
+
+/// Plays a 440 Hz sine tone for `duration_secs` via cpal.
+///
+/// Blocks the calling thread for the given duration. Swift callers should
+/// dispatch to a background queue.
+///
+/// **Caller must configure AVAudioSession (.playback) before calling.**
+///
+/// Returns `LUMINA_OK` (0) on success, `LUMINA_ERROR_INIT_FAILED` (3) if no
+/// output device or unsupported sample format, `LUMINA_ERROR_INTERNAL` (5) on
+/// other errors.
+#[cfg(target_os = "ios")]
+#[no_mangle]
+pub extern "C" fn lumina_audio_smoke_test(duration_secs: f64) -> i32 {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::SampleFormat;
+
+    ffi_boundary(|| {
+        tracing::info!("lumina_audio_smoke_test: caller must have configured AVAudioSession before this point");
+
+        // Validate duration
+        let duration_secs = duration_secs.clamp(0.1, 30.0);
+        tracing::info!("lumina_audio_smoke_test: duration={duration_secs:.1}s");
+
+        // Get default output device
+        let host = cpal::default_host();
+        let device = host.default_output_device().ok_or_else(|| {
+            tracing::error!("lumina_audio_smoke_test: no default output device");
+            LuminaError::InitFailed
+        })?;
+
+        // Query default config
+        let supported = device.default_output_config().map_err(|e| {
+            tracing::error!("lumina_audio_smoke_test: default_output_config failed: {e}");
+            LuminaError::InitFailed
+        })?;
+
+        // cpal 0.17: SampleRate is a u32 type alias, not a newtype struct
+        let sample_rate = supported.sample_rate();
+        let channels = supported.channels().min(2) as u32;
+        let format = supported.sample_format();
+
+        tracing::info!(
+            "lumina_audio_smoke_test: device sample_rate={sample_rate} channels={channels} format={format:?}"
+        );
+
+        // iOS cpal should always be F32
+        if format != SampleFormat::F32 {
+            tracing::error!(
+                "lumina_audio_smoke_test: unsupported sample format {format:?}, expected F32"
+            );
+            return Err(LuminaError::InitFailed);
+        }
+
+        let config = cpal::StreamConfig {
+            channels: channels as u16,
+            sample_rate,
+            buffer_size: cpal::BufferSize::Default,
+        };
+
+        // 440 Hz sine wave generator
+        let mut phase: f32 = 0.0;
+        let phase_inc = 440.0 / sample_rate as f32;
+        let amplitude: f32 = 0.25;
+
+        let stream = device
+            .build_output_stream(
+                &config,
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    for sample in data.chunks_mut(channels as usize) {
+                        let value = (phase * std::f32::consts::TAU).sin() * amplitude;
+                        for s in sample.iter_mut() {
+                            *s = value;
+                        }
+                        phase += phase_inc;
+                        if phase >= 1.0 {
+                            phase -= 1.0;
+                        }
+                    }
+                },
+                |err| {
+                    tracing::error!("lumina_audio_smoke_test: stream error: {err}");
+                },
+                None, // default timeout
+            )
+            .map_err(|e| {
+                tracing::error!("lumina_audio_smoke_test: build_output_stream failed: {e}");
+                LuminaError::InitFailed
+            })?;
+
+        stream.play().map_err(|e| {
+            tracing::error!("lumina_audio_smoke_test: stream.play() failed: {e}");
+            LuminaError::InitFailed
+        })?;
+
+        tracing::info!("lumina_audio_smoke_test: playing 440 Hz tone...");
+        std::thread::sleep(Duration::from_secs_f64(duration_secs));
+        // stream drops here, stopping playback
+        tracing::info!("lumina_audio_smoke_test: done");
+
+        Ok(())
+    })
+}
+
+/// Stub for non-iOS targets so the symbol always exists in tests.
+#[cfg(not(target_os = "ios"))]
+#[no_mangle]
+pub extern "C" fn lumina_audio_smoke_test(_duration_secs: f64) -> i32 {
+    tracing::warn!("lumina_audio_smoke_test: not supported on this platform");
+    LuminaError::InitFailed.as_raw()
 }

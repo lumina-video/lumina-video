@@ -274,6 +274,26 @@ typedef struct LuminaDiagnostics {
  */
 LuminaError lumina_diagnostics_snapshot(LuminaDiagnostics *out);
 
+/* ========================================================================= */
+/* Audio smoke test                                                           */
+/* ========================================================================= */
+
+/**
+ * Plays a 440 Hz sine tone for the given duration as a cpal audio smoke test.
+ *
+ * **Blocks the calling thread** for the specified duration. Dispatch to a
+ * background queue from Swift.
+ *
+ * **IMPORTANT:** The caller MUST configure AVAudioSession before calling:
+ *   - setCategory(.playback, options: .mixWithOthers)
+ *   - setActive(true)
+ *
+ * @param duration_secs  Duration in seconds (clamped to 0.1–30.0).
+ * @return LUMINA_OK on success, LUMINA_ERROR_INIT_FAILED if no output device
+ *         or unsupported sample format, LUMINA_ERROR_INTERNAL on other errors.
+ */
+LuminaError lumina_audio_smoke_test(double duration_secs);
+
 #ifdef __clang__
 #pragma clang assume_nonnull end
 #endif

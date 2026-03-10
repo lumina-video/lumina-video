@@ -23,7 +23,7 @@ pub mod video;
 /// NOT semver-stable. Do not depend on this module directly from external crates.
 /// May change or be removed in any minor version.
 #[doc(hidden)]
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "linux", target_os = "android"))]
 pub mod audio_ring_buffer;
 
 // === Native-only modules (not available on wasm32) ===

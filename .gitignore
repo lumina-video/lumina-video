@@ -57,3 +57,14 @@ code-simplifier-swift-ios.md
 test-ws-moq.mjs
 zapstore.yaml
 crates/lumina-video-web-demo/test-moq.html
+
+# External project checkouts
+/damus/
+/divine-mobile/
+
+# Local dev media/test data
+/dev/
+ffi_bool
+
+# iOS build artifacts
+ios/test-harness/build/

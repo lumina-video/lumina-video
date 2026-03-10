@@ -68,6 +68,7 @@ wgpu = { version = "24" }
 # iOS native AVFoundation/VideoToolbox decoder + zero-copy (shared Apple frameworks)
 [target.'cfg(target_os = "ios")'.dependencies]
 block2 = { workspace = true }
+cpal = { workspace = true }
 dispatch2 = "0.3"
 metal = { workspace = true }
 objc2 = { workspace = true }

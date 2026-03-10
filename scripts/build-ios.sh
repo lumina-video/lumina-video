@@ -88,6 +88,7 @@ EXPECTED_SYMBOLS=(
     "_lumina_frame_iosurface"
     "_lumina_frame_release"
     "_lumina_diagnostics_snapshot"
+    "_lumina_audio_smoke_test"
 )
 
 # =========================================================================

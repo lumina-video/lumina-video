@@ -21,7 +21,7 @@ egui-wgpu = "0.31.1"
 egui-winit = { version = "0.31.1" }
 
 # Video/audio dependencies
-cpal = "0.16"
+cpal = "0.17"
 ffmpeg-next = "8.0"
 opus = "0.3"
 symphonia-codec-aac = "0.5"
