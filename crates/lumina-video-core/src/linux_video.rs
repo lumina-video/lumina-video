@@ -2496,6 +2496,9 @@ impl VideoDecoderBackend for ZeroCopyGStreamerDecoder {
     }
 
     fn buffering_percent(&self) -> i32 {
+        if self.metadata.duration.is_none() && self.position > Duration::ZERO {
+            return 100;
+        }
         self.buffering_percent
     }
 
