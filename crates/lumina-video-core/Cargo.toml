@@ -117,5 +117,5 @@ windows-native-video = ["windows", "rodio"]
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(feature, values(\"cargo-clippy\"))"] }
 
-[target.'cfg(target_os = "macos")'.dev-dependencies]
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dev-dependencies]
 pollster = "0.4"

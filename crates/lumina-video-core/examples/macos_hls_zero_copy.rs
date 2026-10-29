@@ -1,4 +1,4 @@
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn main() {
     use std::time::{Duration, Instant};
 
@@ -14,7 +14,10 @@ fn main() {
         pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
             .expect("adapter");
     let (device, _queue) =
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_limits: adapter.limits(),
+            ..Default::default()
+        }))
             .expect("device");
 
     let mut decoder = MacOSVideoDecoder::new(&url).expect("decoder");
@@ -67,5 +70,5 @@ fn main() {
     );
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 fn main() {}
