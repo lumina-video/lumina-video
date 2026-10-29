@@ -301,7 +301,8 @@ impl SyncBaselineApp {
 }
 
 impl eframe::App for SyncBaselineApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &root.ctx().clone();
         // Start timer on first frame
         if self.start_time.is_none() {
             self.start_time = Some(Instant::now());
@@ -324,7 +325,7 @@ impl eframe::App for SyncBaselineApp {
         }
 
         // Render video
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(root, |ui| {
             if let Some(ref mut player) = self.player {
                 let size = ui.available_size();
                 ui.video_player(player, size);

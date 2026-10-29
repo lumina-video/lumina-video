@@ -28,8 +28,8 @@ opus = { workspace = true }
 symphonia-codec-aac = { workspace = true }
 symphonia-core = { workspace = true }
 webpki-roots = { workspace = true }
-wgpu = { version = "24" }
-wgpu-hal = { version = "24", features = ["vulkan"] }
+wgpu = { version = "30" }
+wgpu-hal = { version = "30", features = ["vulkan"] }
 
 # Linux GStreamer-based video decoder + zero-copy
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -44,7 +44,7 @@ libc = { version = "0.2" }
 opus = { workspace = true }
 symphonia-codec-aac = { workspace = true }
 symphonia-core = { workspace = true }
-wgpu = { version = "24", features = ["vulkan-portability"] }
+wgpu = { version = "30" }
 
 # macOS native AVFoundation/VideoToolbox decoder + zero-copy
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -63,7 +63,7 @@ opus = { workspace = true }
 profiling = { version = "1.0" }
 symphonia-codec-aac = { workspace = true }
 symphonia-core = { workspace = true }
-wgpu = { version = "24" }
+wgpu = { version = "30" }
 
 # iOS native AVFoundation/VideoToolbox decoder + zero-copy (shared Apple frameworks)
 [target.'cfg(target_os = "ios")'.dependencies]
@@ -78,7 +78,7 @@ objc2-core-video = { workspace = true }
 objc2-foundation = { workspace = true }
 objc2-video-toolbox = { workspace = true }
 profiling = { version = "1.0" }
-wgpu = { version = "24" }
+wgpu = { version = "30" }
 
 # Windows native Media Foundation decoder
 [target.'cfg(target_os = "windows")'.dependencies]

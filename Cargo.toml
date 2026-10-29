@@ -14,11 +14,11 @@ members = [
 # Core egui dependencies
 # NOTE: android-game-activity feature is added at crate level for Android builds (lumina-video-android)
 # to avoid pulling in ndk-sys on non-Android platforms
-eframe = { version = "0.31.1", default-features = false, features = [ "wgpu", "wayland", "x11" ] }
-egui = { version = "0.31.1", features = ["serde"] }
-egui-wgpu = "0.31.1"
+eframe = { version = "0.36.2", default-features = false, features = [ "wgpu", "wayland", "x11" ] }
+egui = { version = "0.36.2", features = ["serde"] }
+egui-wgpu = "0.36.2"
 # Disabled clipboard to avoid objc2 version conflict between arboard (0.3.x) and winit (0.2.x)
-egui-winit = { version = "0.31.1" }
+egui-winit = { version = "0.36.2" }
 
 # Video/audio dependencies
 cpal = "0.16"
@@ -71,14 +71,5 @@ strip = true
 # NOTE: objc2 0.5.x (winit) and 0.6.x (AVFoundation) coexist because they use different ObjC classes.
 # The Objective-C runtime handles dispatch correctly for both versions.
 
-# Patches for zero-copy video rendering
 [patch.crates-io]
-# Patched wgpu workspace crates to enable Linux DMABuf external memory extensions for zero-copy video
-# All interdependent wgpu crates must be patched together to avoid type mismatches
-naga = { git = "https://github.com/lumina-video/wgpu.git", branch = "linux-dmabuf-extensions" }
-wgpu-types = { git = "https://github.com/lumina-video/wgpu.git", branch = "linux-dmabuf-extensions" }
-wgpu-hal = { git = "https://github.com/lumina-video/wgpu.git", branch = "linux-dmabuf-extensions" }
-wgpu-core = { git = "https://github.com/lumina-video/wgpu.git", branch = "linux-dmabuf-extensions" }
-# Android: patched android-activity for JNI access
-android-activity = { git = "https://github.com/damus-io/android-activity", rev = "4ee16f1585e4a75031dc10785163d4b920f95805" }
-# Note: Android zero-copy uses raw ash/Vulkan, bypassing wgpu limitations for AHB import.
+android-activity = { git = "https://github.com/damus-io/android-activity", rev = "642d4b05836f6cc12c3bd775bcf0d1b467e2014d" }

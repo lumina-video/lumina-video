@@ -57,9 +57,9 @@ webpki-roots = { workspace = true }
 ash = { version = "0.38" }
 # wgpu-hal with vulkan feature for direct HAL access (zero-copy texture import)
 # Version MUST match egui-wgpu's wgpu-hal version for type compatibility
-wgpu-hal = { version = "24", features = ["vulkan"] }
+wgpu-hal = { version = "30", features = ["vulkan"] }
 # wgpu for zero-copy texture import (wgpu::Device, wgpu::Texture types)
-wgpu = { version = "24" }
+wgpu = { version = "30" }
 # libc for FD close() in zero-copy fence sync
 libc = { version = "0.2" }
 # Audio playback via cpal (wraps Oboe NDK on Android — same pipeline as desktop)
@@ -82,7 +82,7 @@ libc = { version = "0.2" }
 # DRM fourcc codes for video format mapping
 drm-fourcc = { version = "2.2" }
 # wgpu with HAL access for zero-copy Vulkan DMABuf import
-wgpu = { version = "24", features = ["vulkan-portability"] }
+wgpu = { version = "30" }
 cpal = { workspace = true }
 opus = { workspace = true }
 symphonia-codec-aac = { workspace = true }
@@ -101,7 +101,7 @@ objc2-core-foundation = { version = "0.3", features = ["CFNumber", "CFDictionary
 # metal-rs for zero-copy IOSurface → Metal texture import
 metal = { workspace = true }
 # wgpu with HAL access for zero-copy Metal IOSurface import
-wgpu = { version = "24" }
+wgpu = { version = "30" }
 # Profiling support
 profiling = { version = "1.0" }
 # FFmpeg for MKV/WebM container support (AVFoundation doesn't support these)
@@ -222,7 +222,7 @@ web-sys = { version = "0.3", features = [
     # "GpuImageCopyExternalImage",
 ] }
 # wgpu for WebGPU zero-copy texture operations
-wgpu = { version = "24" }
+wgpu = { version = "30" }
 
 [features]
 # ============================================================================

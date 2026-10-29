@@ -854,10 +854,11 @@ impl DemoApp {
         });
     }
 
-    fn show_video_picker(&mut self, ctx: &egui::Context) {
+    fn show_video_picker(&mut self, root: &mut egui::Ui) {
+        let ctx = root.ctx().clone();
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(egui::Color32::from_rgb(20, 20, 20)))
-            .show(ctx, |ui| {
+            .show(root, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() / 4.0);
 
@@ -948,14 +949,15 @@ impl DemoApp {
             });
     }
 
-    fn show_video_player(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+    fn show_video_player(&mut self, root: &mut egui::Ui, frame: &eframe::Frame) {
+        let ctx = root.ctx().clone();
         // Drive MoQ state machine
-        self.poll_moq_session(ctx);
+        self.poll_moq_session(&ctx);
 
         let is_moq = !matches!(self.moq_connect_state, MoqConnectState::Idle);
 
         self.update_controls_visibility();
-        self.handle_keyboard(ctx);
+        self.handle_keyboard(&ctx);
 
         // Request repaint
         if is_moq {
@@ -1011,7 +1013,7 @@ impl DemoApp {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(egui::Color32::BLACK))
-            .show(ctx, |ui| {
+            .show(root, |ui| {
                 let available_size = ui.available_size();
 
                 if is_moq {
@@ -1902,11 +1904,11 @@ impl DemoApp {
 }
 
 impl eframe::App for DemoApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn ui(&mut self, root: &mut egui::Ui, frame: &mut eframe::Frame) {
         if self.show_picker {
-            self.show_video_picker(ctx);
+            self.show_video_picker(root);
         } else {
-            self.show_video_player(ctx, frame);
+            self.show_video_player(root, frame);
         }
     }
 }
