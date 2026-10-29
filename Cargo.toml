@@ -57,8 +57,6 @@ objc2-core-media = { version = "0.3", features = ["CMTime", "CMTimeRange", "CMSa
 objc2-core-video = { version = "0.3", features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn", "CVBase", "objc2"] }
 objc2-video-toolbox = "0.3"
 block2 = "0.6"
-# metal-rs for zero-copy IOSurface → Metal texture import
-metal = "0.31"
 
 [profile.small]
 inherits = 'release'

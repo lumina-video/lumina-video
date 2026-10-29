@@ -771,8 +771,11 @@ impl MacOSVideoDecoder {
                 let pixel_format_str = pixel_format_to_string(pixel_format);
 
                 // Get Metal device name if available
-                let device_info = metal::Device::system_default()
-                    .map(|d| format!(", metal_device={}", d.name()))
+                let device_info = objc2_metal::MTLCreateSystemDefaultDevice()
+                    .map(|d| {
+                        use objc2_metal::MTLDevice;
+                        format!(", metal_device={}", d.name())
+                    })
                     .unwrap_or_default();
 
                 tracing::warn!(

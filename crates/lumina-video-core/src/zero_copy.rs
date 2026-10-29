@@ -286,9 +286,10 @@ impl ZeroCopyStats {
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod macos {
     use super::{with_hal, ZeroCopyError};
-    use metal::foreign_types::ForeignType;
-    use metal::objc::runtime::Object;
-    use metal::objc::*;
+    use objc2_metal::{
+        MTLDevice, MTLPixelFormat, MTLStorageMode, MTLTextureDescriptor, MTLTextureType,
+        MTLTextureUsage,
+    };
     use std::ffi::c_void;
     use tracing::{debug, info, warn};
 
@@ -311,11 +312,7 @@ pub mod macos {
     pub fn get_metal_device_info(device: &wgpu::Device) -> Option<String> {
         unsafe {
             with_hal::<wgpu::hal::api::Metal, Option<String>>(device, |hal_device| {
-                hal_device.map(|d| {
-                    let metal_device = d.raw_device();
-                    let guard = metal_device.lock();
-                    guard.name().to_string()
-                })
+                hal_device.map(|d| d.raw_device().name().to_string())
             })
         }
     }
@@ -367,76 +364,55 @@ pub mod macos {
                 ));
             };
 
-            // Get the raw Metal device
             let metal_device = hal_device.raw_device();
-            let metal_device_guard = metal_device.lock();
 
             debug!(
-                "Creating Metal texture from IOSurface via objc2 ({}x{} {:?}) on {}",
+                "Creating Metal texture from IOSurface ({}x{} {:?}) on {}",
                 width,
                 height,
                 format,
-                metal_device_guard.name()
+                metal_device.name()
             );
 
-            // Create Metal texture descriptor
-            let descriptor = metal::TextureDescriptor::new();
-            descriptor.set_texture_type(metal::MTLTextureType::D2);
             let metal_format = wgpu_format_to_metal(format)?;
-            descriptor.set_pixel_format(metal_format);
-            descriptor.set_width(width as u64);
-            descriptor.set_height(height as u64);
-            descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
-            // Note: For IOSurface-backed textures created via newTextureWithDescriptor:iosurface:plane:,
-            // Metal ignores the storage mode in the descriptor - the IOSurface dictates memory layout.
-            // macOS uses Managed (CPU+GPU); iOS uses Shared (unified memory).
+            let descriptor = MTLTextureDescriptor::new();
+            descriptor.setTextureType(MTLTextureType::Type2D);
+            descriptor.setPixelFormat(metal_format);
+            descriptor.setWidth(width as usize);
+            descriptor.setHeight(height as usize);
+            descriptor.setUsage(MTLTextureUsage::ShaderRead);
             #[cfg(target_os = "macos")]
-            descriptor.set_storage_mode(metal::MTLStorageMode::Managed);
+            descriptor.setStorageMode(MTLStorageMode::Managed);
             #[cfg(target_os = "ios")]
-            descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
+            descriptor.setStorageMode(MTLStorageMode::Shared);
 
-            // Get raw pointers for objc msg_send
-            let device_ptr = metal_device_guard.as_ptr();
-            let descriptor_ptr = descriptor.as_ptr();
-
-            // Call [MTLDevice newTextureWithDescriptor:iosurface:plane:]
-            // This is the key method that metal-rs doesn't expose
-            // Using objc crate's msg_send! (same as metal-rs uses internally)
-            let texture_ptr: *mut Object = msg_send![
-                device_ptr,
-                newTextureWithDescriptor: descriptor_ptr
-                iosurface: io_surface
-                plane: 0usize  // plane 0 for single-plane formats like BGRA
-            ];
-
-            if texture_ptr.is_null() {
+            let surface = &*(io_surface as *const objc2_io_surface::IOSurfaceRef);
+            let Some(metal_texture) =
+                metal_device.newTextureWithDescriptor_iosurface_plane(&descriptor, surface, 0)
+            else {
                 warn!("Metal newTextureWithDescriptor:iosurface:plane: returned null");
                 return Err(ZeroCopyError::TextureCreationFailed(
                     "Metal failed to create texture from IOSurface".to_string(),
                 ));
-            }
-
-            // Wrap the raw pointer as a metal::Texture
-            // The texture is retained by msg_send (returns +1 retain count)
-            let metal_texture = metal::Texture::from_ptr(texture_ptr as *mut metal::MTLTexture);
+            };
 
             info!(
                 "Created Metal texture from IOSurface: {}x{} {:?}",
                 width, height, format
             );
 
-            // Wrap as wgpu_hal::metal::Texture using the existing API
             let hal_texture = wgpu::hal::metal::Device::texture_from_raw(
                 metal_texture,
                 format,
-                metal::MTLTextureType::D2,
-                1, // array_layers
-                1, // mip_levels
+                MTLTextureType::Type2D,
+                1,
+                1,
                 wgpu::hal::CopyExtent {
                     width,
                     height,
                     depth: 1,
                 },
+                None,
             );
 
             Ok(hal_texture)
@@ -478,14 +454,14 @@ pub mod macos {
     /// Returns an error for unsupported formats instead of silently defaulting.
     pub fn wgpu_format_to_metal(
         format: wgpu::TextureFormat,
-    ) -> Result<metal::MTLPixelFormat, ZeroCopyError> {
+    ) -> Result<MTLPixelFormat, ZeroCopyError> {
         match format {
-            wgpu::TextureFormat::Bgra8Unorm => Ok(metal::MTLPixelFormat::BGRA8Unorm),
-            wgpu::TextureFormat::Rgba8Unorm => Ok(metal::MTLPixelFormat::RGBA8Unorm),
-            wgpu::TextureFormat::R8Unorm => Ok(metal::MTLPixelFormat::R8Unorm),
-            wgpu::TextureFormat::Rg8Unorm => Ok(metal::MTLPixelFormat::RG8Unorm),
-            wgpu::TextureFormat::Bgra8UnormSrgb => Ok(metal::MTLPixelFormat::BGRA8Unorm_sRGB),
-            wgpu::TextureFormat::Rgba8UnormSrgb => Ok(metal::MTLPixelFormat::RGBA8Unorm_sRGB),
+            wgpu::TextureFormat::Bgra8Unorm => Ok(MTLPixelFormat::BGRA8Unorm),
+            wgpu::TextureFormat::Rgba8Unorm => Ok(MTLPixelFormat::RGBA8Unorm),
+            wgpu::TextureFormat::R8Unorm => Ok(MTLPixelFormat::R8Unorm),
+            wgpu::TextureFormat::Rg8Unorm => Ok(MTLPixelFormat::RG8Unorm),
+            wgpu::TextureFormat::Bgra8UnormSrgb => Ok(MTLPixelFormat::BGRA8Unorm_sRGB),
+            wgpu::TextureFormat::Rgba8UnormSrgb => Ok(MTLPixelFormat::RGBA8Unorm_sRGB),
             _ => {
                 warn!("Unsupported texture format {:?}; refusing import", format);
                 Err(ZeroCopyError::InvalidResource(format!(

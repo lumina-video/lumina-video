@@ -98,8 +98,8 @@ objc2-core-video = { workspace = true }
 objc2-video-toolbox = { workspace = true }
 block2 = { workspace = true }
 objc2-core-foundation = { version = "0.3", features = ["CFNumber", "CFDictionary", "CFString"] }
-# metal-rs for zero-copy IOSurface → Metal texture import
-metal = { workspace = true }
+objc2-io-surface = { version = "0.3" }
+objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLDevice", "MTLTexture", "MTLResource", "MTLPixelFormat", "MTLAllocation", "MTLLibrary", "MTLTypes", "objc2-io-surface"] }
 # wgpu with HAL access for zero-copy Metal IOSurface import
 wgpu = { version = "30" }
 # Profiling support
