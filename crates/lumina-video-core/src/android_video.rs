@@ -986,6 +986,32 @@ static HARDWARE_BUFFER_RECEIVER: OnceLock<crossbeam_channel::Receiver<AndroidVid
 //
 // Tracking: Consider creating a beads issue for this future work.
 
+type FrameWake = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+static FRAME_WAKERS: OnceLock<parking_lot::RwLock<HashMap<u64, FrameWake>>> = OnceLock::new();
+
+pub fn set_frame_waker(player_id: u64, waker: FrameWake) {
+    FRAME_WAKERS
+        .get_or_init(|| parking_lot::RwLock::new(HashMap::new()))
+        .write()
+        .insert(player_id, waker);
+}
+
+pub fn clear_frame_waker(player_id: u64) {
+    if let Some(wakers) = FRAME_WAKERS.get() {
+        wakers.write().remove(&player_id);
+    }
+}
+
+fn wake_frame_consumer(player_id: u64) {
+    let waker = FRAME_WAKERS
+        .get()
+        .and_then(|wakers| wakers.read().get(&player_id).cloned());
+    if let Some(waker) = waker {
+        waker();
+    }
+}
+
 /// Initializes the per-player queues map.
 fn init_player_queues() {
     let _ = PLAYER_QUEUES.get_or_init(|| parking_lot::RwLock::new(HashMap::new()));
@@ -1287,6 +1313,7 @@ pub fn release_player_queue(player_id: u64) {
         return; // Legacy mode uses shared queue, don't clear
     }
     if let Some(queues) = PLAYER_QUEUES.get() {
+        clear_frame_waker(player_id);
         let mut queues_guard = queues.write();
         if let Some(removed_state) = queues_guard.remove(&player_id) {
             let frame_count = removed_state.queue.len();
@@ -1561,5 +1588,6 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwa
             }
             state.queue.push_back(frame);
         }
+        wake_frame_consumer(player_id_u64);
     }
 }
