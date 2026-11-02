@@ -45,6 +45,9 @@
 
 pub mod media;
 
+#[cfg(target_os = "android")]
+pub mod android_wgpu;
+
 // Vendored runtime support for Linux (bundles GStreamer libraries)
 #[cfg(all(target_os = "linux", feature = "vendored-runtime"))]
 pub use lumina_video_core::vendored_runtime;

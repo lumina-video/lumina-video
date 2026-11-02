@@ -194,11 +194,10 @@ pub extern "C" fn android_main(app: AndroidApp) {
         viewport: egui::ViewportBuilder::default().with_title("lumina-video Demo"),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: egui_wgpu::WgpuConfiguration {
-            wgpu_setup: {
-                let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
-                setup.instance_descriptor.backends = wgpu::Backends::VULKAN;
-                egui_wgpu::WgpuSetup::CreateNew(setup)
-            },
+            wgpu_setup: egui_wgpu::WgpuSetup::Existing(
+                lumina_video::android_wgpu::android_wgpu_setup()
+                    .expect("android vulkan setup"),
+            ),
             ..Default::default()
         },
         ..Default::default()
