@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::num::NonZeroU64;
 #[cfg(any(
     target_os = "macos",
+    target_os = "ios",
     target_os = "linux",
     target_os = "android",
     all(target_os = "windows", feature = "windows-native-video")
@@ -14,6 +15,7 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(
     target_os = "macos",
+    target_os = "ios",
     target_os = "linux",
     target_os = "android",
     all(target_os = "windows", feature = "windows-native-video")
@@ -41,7 +43,7 @@ use super::zero_copy as zero_copy_android;
 // libc for fence sync on Android (poll/close)
 #[cfg(target_os = "android")]
 extern crate libc;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use super::zero_copy;
 #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
 use super::zero_copy as zero_copy_windows;
@@ -113,6 +115,7 @@ pub struct VideoRenderResources {
     /// Cached 1x1 dummy texture for unused UV planes in RGB zero-copy path
     #[cfg(any(
         target_os = "macos",
+        target_os = "ios",
         target_os = "linux",
         target_os = "android",
         all(target_os = "windows", feature = "windows-native-video")
@@ -283,6 +286,7 @@ impl VideoRenderResources {
         // Create cached 1x1 dummy texture for zero-copy RGB path (avoids per-frame allocation)
         #[cfg(any(
             target_os = "macos",
+            target_os = "ios",
             target_os = "linux",
             target_os = "android",
             all(target_os = "windows", feature = "windows-native-video")
@@ -311,6 +315,7 @@ impl VideoRenderResources {
             sampler,
             #[cfg(any(
                 target_os = "macos",
+                target_os = "ios",
                 target_os = "linux",
                 target_os = "android",
                 all(target_os = "windows", feature = "windows-native-video")
@@ -534,6 +539,7 @@ impl VideoTexture {
     /// The imported texture is used as the Y texture with the RGB pipeline.
     #[cfg(any(
         target_os = "macos",
+        target_os = "ios",
         target_os = "linux",
         target_os = "android",
         all(target_os = "windows", feature = "windows-native-video")
@@ -1016,6 +1022,7 @@ mod native_render_callback {
         /// Rate-limit "no CPU fallback" warning (log once per player instance, persists across frames)
         #[cfg(any(
             target_os = "macos",
+            target_os = "ios",
             target_os = "linux",
             target_os = "android",
             all(target_os = "windows", feature = "windows-native-video")
@@ -1056,7 +1063,7 @@ mod native_render_callback {
                 // applications (VR/AR) may need the async import optimization.
 
                 // Zero-copy path: import macOS IOSurface directly as wgpu texture
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 if let Some(ref surface) = pending.macos_surface {
                     let mut texture_guard = self.texture.lock();
                     let mut imported_ok = false;
@@ -1790,12 +1797,13 @@ mod native_render_callback {
                     // This can happen when zero-copy import fails and decoder didn't provide CPU frame
                     #[cfg(any(
                         target_os = "macos",
+                        target_os = "ios",
                         target_os = "linux",
                         target_os = "android",
                         all(target_os = "windows", feature = "windows-native-video")
                     ))]
                     {
-                        #[cfg(target_os = "macos")]
+                        #[cfg(any(target_os = "macos", target_os = "ios"))]
                         let has_gpu_surface = pending.macos_surface.is_some();
                         #[cfg(target_os = "windows")]
                         let has_gpu_surface = pending.windows_surface.is_some();
@@ -1805,6 +1813,7 @@ mod native_render_callback {
                         let has_gpu_surface = pending.linux_surface.is_some();
                         #[cfg(not(any(
                             target_os = "macos",
+                            target_os = "ios",
                             target_os = "windows",
                             target_os = "android",
                             target_os = "linux"
