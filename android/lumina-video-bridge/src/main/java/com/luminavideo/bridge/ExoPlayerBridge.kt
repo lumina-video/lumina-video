@@ -55,7 +55,9 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
         private const val TAG = "ExoPlayerBridge"
 
         /** Maximum number of images to hold in the ImageReader buffer */
-        private const val MAX_IMAGES = 3
+        private const val MAX_IMAGES = 6
+
+        private const val HELD_IMAGES = 3
 
         /** Timeout for ExoPlayer creation on the HandlerThread */
         private const val INIT_TIMEOUT_SECONDS = 5L
@@ -94,6 +96,9 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
     // State tracking
     private val isReleased = AtomicBoolean(false)
     private val frameCount = AtomicInteger(0)
+    private val heldImages = ArrayDeque<android.media.Image>()
+    private var lastImageTimestampNs = Long.MIN_VALUE
+    private var imageTimestampRegressions = 0
 
     // Player listener for cleanup on release
     private var playerListener: Player.Listener? = null
@@ -385,6 +390,7 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
         // onImageAvailable and setupImageReader
         handler?.post {
             ndkMode = true
+            releaseHeldImages()
             imageReader?.close()
             imageReader = null
             this.surface?.release()
@@ -405,6 +411,7 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
             return
         }
 
+        releaseHeldImages()
         imageReader?.close()
         imageReader = null
         surface?.release()
@@ -454,8 +461,14 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
         } ?: return
 
         var hardwareBuffer: HardwareBuffer? = null
+        var submitted = false
         try {
             hardwareBuffer = image.hardwareBuffer
+            if (image.timestamp <= lastImageTimestampNs) {
+                imageTimestampRegressions++
+                Log.w(TAG, "image timestamp regression ${image.timestamp} after $lastImageTimestampNs, total $imageTimestampRegressions")
+            }
+            lastImageTimestampNs = image.timestamp
             if (hardwareBuffer != null) {
                 val fenceFd = -1
 
@@ -469,12 +482,30 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
                 )
 
                 frameCount.incrementAndGet()
+                submitted = true
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error processing frame: ${e.message}")
         } finally {
             hardwareBuffer?.close()
-            image.close()
+            if (submitted) {
+                holdImage(image)
+            } else {
+                image.close()
+            }
+        }
+    }
+
+    private fun holdImage(image: android.media.Image) {
+        heldImages.addLast(image)
+        while (heldImages.size > HELD_IMAGES) {
+            heldImages.removeFirst().close()
+        }
+    }
+
+    private fun releaseHeldImages() {
+        while (heldImages.isNotEmpty()) {
+            heldImages.removeFirst().close()
         }
     }
 
@@ -509,6 +540,7 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
             surface?.release()
             surface = null
 
+            releaseHeldImages()
             imageReader?.close()
             imageReader = null
         }

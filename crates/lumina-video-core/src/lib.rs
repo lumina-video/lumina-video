@@ -28,6 +28,7 @@ pub mod audio_ring_buffer;
 
 // === Native-only modules (not available on wasm32) ===
 
+pub mod frame_order;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod frame_queue;
 #[cfg(not(target_arch = "wasm32"))]
