@@ -49,6 +49,7 @@ profiling = { version = "1.0", optional = true }
 jni = { workspace = true }
 android-activity = { version = "0.6", features = ["game-activity"] }
 ndk-context = "0.1"
+pollster = "0.4"
 ndk-sys = { version = "0.6" }
 # ndk crate for safe AImageReader bindings (acquire_latest_image_async with fence FD)
 ndk = { version = "0.9", features = ["api-level-26", "media"] }
