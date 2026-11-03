@@ -510,11 +510,11 @@ impl ZeroCopyGStreamerDecoder {
         // For HTTP streams, keep buffering enabled but we rely on the improved seek handling
         // to avoid the post-seek stall issue.
         let is_local_file = url.starts_with("file://");
-        let source = gst::ElementFactory::make("uridecodebin")
+        let source = gst::ElementFactory::make("uridecodebin3")
             .property("uri", url)
             .property("use-buffering", !is_local_file)
             .build()
-            .map_err(|e| VideoError::DecoderInit(format!("Failed to create uridecodebin: {e}")))?;
+            .map_err(|e| VideoError::DecoderInit(format!("Failed to create uridecodebin3: {e}")))?;
 
         tracing::info!(
             "uridecodebin: use-buffering={} (is_local_file={})",
@@ -649,11 +649,11 @@ impl ZeroCopyGStreamerDecoder {
         let pipeline = gst::Pipeline::new();
 
         let is_local_file = url.starts_with("file://");
-        let source = gst::ElementFactory::make("uridecodebin")
+        let source = gst::ElementFactory::make("uridecodebin3")
             .property("uri", url)
             .property("use-buffering", !is_local_file)
             .build()
-            .map_err(|e| VideoError::DecoderInit(format!("Failed to create uridecodebin: {e}")))?;
+            .map_err(|e| VideoError::DecoderInit(format!("Failed to create uridecodebin3: {e}")))?;
 
         // Add queue2 between uridecodebin and videoconvert to prevent buffer starvation
         let video_queue = gst::ElementFactory::make("queue2")
@@ -812,11 +812,11 @@ impl ZeroCopyGStreamerDecoder {
         let pipeline = gst::Pipeline::new();
 
         let is_local_file = url.starts_with("file://");
-        let source = gst::ElementFactory::make("uridecodebin")
+        let source = gst::ElementFactory::make("uridecodebin3")
             .property("uri", url)
             .property("use-buffering", !is_local_file)
             .build()
-            .map_err(|e| VideoError::DecoderInit(format!("Failed to create uridecodebin: {e}")))?;
+            .map_err(|e| VideoError::DecoderInit(format!("Failed to create uridecodebin3: {e}")))?;
 
         // Request DMABuf directly from decoder - no vapostproc
         let dmabuf_caps = gst::Caps::from_str("video/x-raw(memory:DMABuf)")
