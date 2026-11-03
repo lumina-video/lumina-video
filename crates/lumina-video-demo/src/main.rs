@@ -446,7 +446,8 @@ impl DemoApp {
 }
 
 impl eframe::App for DemoApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn ui(&mut self, root: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = &root.ctx().clone();
         // Poll for Nostr discovery events
         #[cfg(feature = "moq")]
         self.poll_nostr_discovery();
@@ -475,7 +476,7 @@ impl eframe::App for DemoApp {
         }
 
         // Top panel with controls
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+        egui::Panel::top("top_panel").show(root, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(format!(
                     "lumina-video Demo  [{}]",
@@ -685,9 +686,9 @@ impl eframe::App for DemoApp {
 
         // Right panel with metadata (optional)
         if self.show_metadata {
-            egui::SidePanel::right("metadata_panel")
-                .min_width(200.0)
-                .show(ctx, |ui| {
+            egui::Panel::right("metadata_panel")
+                .min_size(200.0)
+                .show(root, |ui| {
                     ui.heading("Video Info");
                     ui.separator();
 
@@ -1230,7 +1231,7 @@ impl eframe::App for DemoApp {
         }
 
         // Central panel with video
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(root, |ui| {
             if let Some(ref mut player) = self.player {
                 let available_size = ui.available_size();
 

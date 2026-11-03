@@ -29,8 +29,8 @@ windows-native-video = ["lumina-video/windows-native-video"]
 # NOTE: objc2 0.5.x (winit) and 0.6.x (AVFoundation) coexist because they use different ObjC classes.
 # The Objective-C runtime handles dispatch correctly for both versions.
 lumina-video = { path = "../lumina-video", features = ["moq"] }
-eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "wgpu"] }
-egui = "0.31.1"
+eframe = { version = "0.36.2", default-features = false, features = ["default_fonts", "wgpu"] }
+egui = "0.36.2"
 ehttp = "0.5"
 parking_lot = { workspace = true }
 tracing = { workspace = true }

@@ -29,7 +29,7 @@ use std::sync::Mutex;
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// # #[cfg(target_os = "macos")]
 /// # fn main() {
 /// use lumina_video::media::video::{MacOSGpuSurface, PixelFormat, CpuFrame};

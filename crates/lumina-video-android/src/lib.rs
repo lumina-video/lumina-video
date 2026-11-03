@@ -58,102 +58,77 @@ fn test_hal_viability(render_state: &egui_wgpu::RenderState) -> HalViabilityResu
     // 4. The FFI calls (enumerate_device_extension_properties) use the ash crate's
     //    safe wrapper over the Vulkan C API
     let hal_result = unsafe {
-        device.as_hal::<Vulkan, _, _>(|hal_device| {
-            match hal_device {
-                Some(d) => {
-                    let raw_device = d.raw_device();
-                    info!("Got raw VkDevice handle: {:?}", raw_device.handle());
-
-                    let instance = d.shared_instance();
-                    let raw_instance = instance.raw_instance();
-                    info!("Got raw VkInstance handle: {:?}", raw_instance.handle());
-
-                    let physical_device = d.raw_physical_device();
-                    info!("Got VkPhysicalDevice: {:?}", physical_device);
-
-                    // Query device extensions using ash
-                    match raw_instance.enumerate_device_extension_properties(physical_device) {
-                        Ok(extension_props) => {
-                            let has_ext = |name: &str| -> bool {
-                                extension_props.iter().any(|ext| {
-                                    ext.extension_name_as_c_str()
-                                        .map(|s| s.to_string_lossy())
-                                        .unwrap_or_default()
-                                        == name
-                                })
-                            };
-
-                            let ext_memory_ahb =
-                                has_ext("VK_ANDROID_external_memory_android_hardware_buffer");
-                            let ext_memory = has_ext("VK_KHR_external_memory");
-                            let ext_semaphore = has_ext("VK_KHR_external_semaphore_fd");
-                            let ycbcr_conv = has_ext("VK_KHR_sampler_ycbcr_conversion");
-
-                            for (name, present) in [
-                                (
-                                    "VK_ANDROID_external_memory_android_hardware_buffer",
-                                    ext_memory_ahb,
-                                ),
-                                ("VK_KHR_external_memory", ext_memory),
-                                ("VK_KHR_external_semaphore_fd", ext_semaphore),
-                                ("VK_KHR_sampler_ycbcr_conversion", ycbcr_conv),
-                            ] {
-                                if present {
-                                    info!("Extension present: {}", name);
-                                } else {
-                                    warn!("Extension MISSING: {}", name);
-                                }
-                            }
-
-                            let all = ext_memory_ahb && ext_memory && ext_semaphore && ycbcr_conv;
-
-                            if all {
-                                info!("=== HAL VIABILITY: SUCCESS ===");
-                            } else {
-                                warn!("=== HAL VIABILITY: PARTIAL ===");
-                            }
-
-                            (
-                                true,
-                                ext_memory_ahb,
-                                ext_memory,
-                                ext_semaphore,
-                                ycbcr_conv,
-                                all,
-                                None,
-                            )
-                        }
-                        Err(e) => {
-                            error!("Failed to enumerate Vulkan device extensions: {:?}", e);
-                            (
-                                true, // HAL access worked, query didn't
-                                false,
-                                false,
-                                false,
-                                false,
-                                false,
-                                Some(format!(
-                                    "Failed to enumerate Vulkan device extensions: {:?}",
-                                    e
-                                )),
-                            )
-                        }
+        match device.as_hal::<Vulkan>() {
+            Some(d) => {
+                let instance = d.shared_instance();
+                let raw_instance = instance.raw_instance();
+                let physical_device = d.raw_physical_device();
+                info!("Got VkPhysicalDevice: {:?}", physical_device);
+                match raw_instance.enumerate_device_extension_properties(physical_device) {
+                    Ok(extension_props) => {
+                        let has_ext = |name: &str| -> bool {
+                            extension_props.iter().any(|ext| {
+                                ext.extension_name_as_c_str()
+                                    .map(|s| s.to_string_lossy())
+                                    .unwrap_or_default()
+                                    == name
+                            })
+                        };
+                        let ext_memory_ahb =
+                            has_ext("VK_ANDROID_external_memory_android_hardware_buffer");
+                        let ext_memory = has_ext("VK_KHR_external_memory");
+                        let ext_semaphore = has_ext("VK_KHR_external_semaphore_fd");
+                        let ycbcr_conv = has_ext("VK_KHR_sampler_ycbcr_conversion");
+                        let enabled = d.enabled_device_extensions();
+                        let enabled_ahb = enabled.iter().any(|e| {
+                            e.to_str() == Ok("VK_ANDROID_external_memory_android_hardware_buffer")
+                        });
+                        info!(
+                            "AHardwareBuffer extension enabled on device: {}",
+                            enabled_ahb
+                        );
+                        let all = ext_memory_ahb
+                            && ext_memory
+                            && ext_semaphore
+                            && ycbcr_conv
+                            && enabled_ahb;
+                        (
+                            true,
+                            ext_memory_ahb,
+                            ext_memory,
+                            ext_semaphore,
+                            ycbcr_conv,
+                            all,
+                            None,
+                        )
+                    }
+                    Err(e) => {
+                        error!("Failed to enumerate Vulkan device extensions: {:?}", e);
+                        (
+                            true,
+                            false,
+                            false,
+                            false,
+                            false,
+                            false,
+                            Some(format!("{:?}", e)),
+                        )
                     }
                 }
-                None => {
-                    error!("as_hal returned None - HAL access not available");
-                    (
-                        false,
-                        false,
-                        false,
-                        false,
-                        false,
-                        false,
-                        Some("as_hal returned None".to_string()),
-                    )
-                }
             }
-        })
+            None => {
+                error!("as_hal returned None - HAL access not available");
+                (
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    Some("as_hal returned None".to_string()),
+                )
+            }
+        }
     };
 
     HalViabilityResult {
@@ -219,14 +194,11 @@ pub extern "C" fn android_main(app: AndroidApp) {
         viewport: egui::ViewportBuilder::default().with_title("lumina-video Demo"),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: egui_wgpu::WgpuConfiguration {
-            // Use Vulkan for AHardwareBuffer import support
-            wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(egui_wgpu::WgpuSetupCreateNew {
-                instance_descriptor: wgpu::InstanceDescriptor {
-                    backends: wgpu::Backends::VULKAN,
-                    ..Default::default()
-                },
-                ..Default::default()
-            }),
+            wgpu_setup: {
+                let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+                setup.instance_descriptor.backends = wgpu::Backends::VULKAN;
+                egui_wgpu::WgpuSetup::CreateNew(setup)
+            },
             ..Default::default()
         },
         ..Default::default()
@@ -341,9 +313,10 @@ impl DemoApp {
 }
 
 impl eframe::App for DemoApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &root.ctx().clone();
         // Top bar with debug toggle
-        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+        egui::Panel::top("top_bar").show(root, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("lumina-video");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -361,9 +334,9 @@ impl eframe::App for DemoApp {
 
         // Debug side panel
         if self.show_debug_panel {
-            egui::SidePanel::right("debug_panel")
-                .max_width(260.0)
-                .show(ctx, |ui| {
+            egui::Panel::right("debug_panel")
+                .default_size(260.0)
+                .show(root, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         self.render_debug_panel(ui);
                     });
@@ -371,7 +344,7 @@ impl eframe::App for DemoApp {
         }
 
         // Main video area
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(root, |ui| {
             if let Some(ref mut player) = self.player {
                 let available_size = ui.available_size();
 
