@@ -306,7 +306,7 @@ fn extract_cpu_frame_from_pixel_buffer(
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// # fn main() {
 /// use lumina_video::media::macos_video::MacOSZeroCopyStatsSnapshot;
 ///

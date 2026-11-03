@@ -60,14 +60,22 @@ fn make_surface() -> *mut c_void {
 #[test]
 fn iosurface_imported_into_wgpu_metal_texture_has_same_pixels() {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-        .expect("adapter");
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-        .expect("device");
+    let adapter =
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+            .expect("adapter");
+    let (device, queue) =
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+            .expect("device");
 
     let surface = make_surface();
     let texture = unsafe {
-        import_iosurface(&device, surface, WIDTH, HEIGHT, wgpu::TextureFormat::Bgra8Unorm)
+        import_iosurface(
+            &device,
+            surface,
+            WIDTH,
+            HEIGHT,
+            wgpu::TextureFormat::Bgra8Unorm,
+        )
     }
     .expect("import");
 

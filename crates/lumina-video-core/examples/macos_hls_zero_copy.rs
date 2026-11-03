@@ -6,19 +6,23 @@ fn main() {
     use lumina_video_core::video::{DecodedFrame, VideoDecoderBackend};
     use lumina_video_core::zero_copy::macos::import_iosurface;
 
-    let url = std::env::args().nth(1).expect("usage: macos_hls_zero_copy <url> [seconds]");
-    let seconds: u64 = std::env::args().nth(2).map(|s| s.parse().unwrap()).unwrap_or(15);
+    let url = std::env::args()
+        .nth(1)
+        .expect("usage: macos_hls_zero_copy <url> [seconds]");
+    let seconds: u64 = std::env::args()
+        .nth(2)
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(15);
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter =
         pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
             .expect("adapter");
-    let (device, _queue) =
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            required_limits: adapter.limits(),
-            ..Default::default()
-        }))
-            .expect("device");
+    let (device, _queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_limits: adapter.limits(),
+        ..Default::default()
+    }))
+    .expect("device");
 
     let mut decoder = MacOSVideoDecoder::new(&url).expect("decoder");
     decoder.resume().expect("resume");

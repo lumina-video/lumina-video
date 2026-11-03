@@ -386,6 +386,7 @@ pub mod macos {
             #[cfg(target_os = "ios")]
             descriptor.setStorageMode(MTLStorageMode::Shared);
 
+            // SAFETY: io_surface was checked non-null above and the caller keeps the IOSurface alive for this call.
             let surface = &*(io_surface as *const objc2_io_surface::IOSurfaceRef);
             let Some(metal_texture) =
                 metal_device.newTextureWithDescriptor_iosurface_plane(&descriptor, surface, 0)
