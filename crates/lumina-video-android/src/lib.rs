@@ -194,10 +194,15 @@ pub extern "C" fn android_main(app: AndroidApp) {
         viewport: egui::ViewportBuilder::default().with_title("lumina-video Demo"),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: egui_wgpu::WgpuConfiguration {
-            wgpu_setup: egui_wgpu::WgpuSetup::Existing(
-                lumina_video::android_wgpu::android_wgpu_setup()
-                    .expect("android vulkan setup"),
-            ),
+            wgpu_setup: match lumina_video::android_wgpu::android_wgpu_setup() {
+                Ok(existing) => egui_wgpu::WgpuSetup::Existing(existing),
+                Err(e) => {
+                    error!("android vulkan setup failed, using default device: {}", e);
+                    let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+                    setup.instance_descriptor.backends = wgpu::Backends::VULKAN;
+                    egui_wgpu::WgpuSetup::CreateNew(setup)
+                }
+            },
             ..Default::default()
         },
         ..Default::default()

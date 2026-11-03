@@ -45,7 +45,7 @@
 
 pub mod media;
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 pub mod android_wgpu;
 
 // Vendored runtime support for Linux (bundles GStreamer libraries)
