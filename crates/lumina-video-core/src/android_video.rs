@@ -589,6 +589,8 @@ impl VideoDecoderBackend for AndroidVideoDecoder {
         env.call_method(&self.bridge, "seek", "(J)V", &[JValue::Long(position_ms)])
             .map_err(|e| VideoError::SeekFailed(format!("Seek failed: {}", e)))?;
 
+        reset_player_frame_order(self.player_id);
+
         Ok(())
     }
 
@@ -1207,6 +1209,14 @@ fn init_hardware_buffer_queue() {
     let (sender, receiver) = crossbeam_channel::bounded(8);
     let _ = HARDWARE_BUFFER_QUEUE.set(sender);
     let _ = HARDWARE_BUFFER_RECEIVER.set(receiver);
+}
+
+fn reset_player_frame_order(player_id: u64) {
+    if let Some(queues) = PLAYER_QUEUES.get() {
+        if let Some(state) = queues.write().get_mut(&player_id) {
+            state.order.reset();
+        }
+    }
 }
 
 /// Gets the next available HardwareBuffer frame for a specific player, if any.

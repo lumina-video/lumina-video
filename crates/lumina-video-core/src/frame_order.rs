@@ -20,6 +20,10 @@ impl FrameOrder {
         }
         latest
     }
+
+    pub fn reset(&mut self) {
+        self.last_ts = None;
+    }
 }
 
 #[cfg(test)]
@@ -55,5 +59,17 @@ mod tests {
         assert_eq!(order.pop_latest(&mut q, |t| *t), Some(3));
         assert!(q.is_empty());
         assert_eq!(order.out_of_order, 0);
+    }
+
+    #[test]
+    fn frames_after_backward_seek_are_presented_once_reset() {
+        let mut order = FrameOrder::default();
+        let mut q: VecDeque<i64> = [5_000].into();
+        assert_eq!(order.pop_latest(&mut q, |t| *t), Some(5_000));
+        q.extend([1_000]);
+        assert_eq!(order.pop_latest(&mut q, |t| *t), None);
+        order.reset();
+        q.extend([1_000, 1_033]);
+        assert_eq!(order.pop_latest(&mut q, |t| *t), Some(1_033));
     }
 }
