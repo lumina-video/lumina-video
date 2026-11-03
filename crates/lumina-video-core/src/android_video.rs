@@ -589,6 +589,8 @@ impl VideoDecoderBackend for AndroidVideoDecoder {
         env.call_method(&self.bridge, "seek", "(J)V", &[JValue::Long(position_ms)])
             .map_err(|e| VideoError::SeekFailed(format!("Seek failed: {}", e)))?;
 
+        reset_player_frame_order(self.player_id);
+
         Ok(())
     }
 
@@ -789,6 +791,7 @@ fn with_player_stats(player_id: u64, f: impl FnOnce(&PerPlayerStats)) {
     let state = guard.entry(player_id).or_insert_with(|| PlayerState {
         queue: VecDeque::new(),
         stats: PerPlayerStats::new(),
+        order: Default::default(),
     });
     f(&state.stats);
 }
@@ -952,6 +955,7 @@ const MAX_QUEUE_SIZE_PER_PLAYER: usize = 8;
 struct PlayerState {
     queue: VecDeque<AndroidVideoFrame>,
     stats: PerPlayerStats,
+    order: crate::frame_order::FrameOrder,
 }
 
 /// Per-player queues for multi-player isolation.
@@ -1207,6 +1211,14 @@ fn init_hardware_buffer_queue() {
     let _ = HARDWARE_BUFFER_RECEIVER.set(receiver);
 }
 
+fn reset_player_frame_order(player_id: u64) {
+    if let Some(queues) = PLAYER_QUEUES.get() {
+        if let Some(state) = queues.write().get_mut(&player_id) {
+            state.order.reset();
+        }
+    }
+}
+
 /// Gets the next available HardwareBuffer frame for a specific player, if any.
 /// Called by the rendering thread to get zero-copy frames.
 ///
@@ -1222,7 +1234,17 @@ pub fn try_receive_hardware_buffer_for_player(player_id: u64) -> Option<AndroidV
     // Per-player mode: pop from this player's dedicated queue
     let queues = PLAYER_QUEUES.get()?;
     let mut queues_guard = queues.write();
-    queues_guard.get_mut(&player_id)?.queue.pop_front()
+    let state = queues_guard.get_mut(&player_id)?;
+    let before = state.order.out_of_order;
+    let frame = state.order.pop_latest(&mut state.queue, |f| f.timestamp_ns);
+    if state.order.out_of_order != before {
+        tracing::warn!(
+            "player {} dropped out of order frame, total {}",
+            player_id,
+            state.order.out_of_order
+        );
+    }
+    frame
 }
 
 /// Gets the next available HardwareBuffer frame, if any (legacy single-player mode).
@@ -1522,6 +1544,7 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwa
                 .or_insert_with(|| PlayerState {
                     queue: VecDeque::new(),
                     stats: PerPlayerStats::new(),
+                    order: Default::default(),
                 });
 
             // Enforce max queue size per player
