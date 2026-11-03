@@ -1096,7 +1096,7 @@ impl VideoPlayer {
         // Draw error icon (X)
         let center = rect.center();
         let icon_size = 40.0;
-        let stroke = egui::Stroke::new(4.0, Color32::from_rgb(255, 100, 100));
+        let stroke = egui::Stroke::new(4.0_f32, Color32::from_rgb(255, 100, 100));
 
         ui.painter().line_segment(
             [
@@ -1178,7 +1178,7 @@ impl VideoPlayer {
 
         // Progress ring parameters
         let ring_radius = 30.0;
-        let ring_thickness = 4.0;
+        let ring_thickness = 4.0_f32;
 
         // Draw background ring (dark gray)
         ui.painter().circle_stroke(

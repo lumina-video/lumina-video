@@ -131,14 +131,16 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Select preinstalled Android NDK
+        run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> $GITHUB_ENV
       - name: Add Android target
         run: rustup target add aarch64-linux-android
       - name: Install cargo-ndk
         run: cargo install cargo-ndk
       - name: Check Android build
         # Exclude web-demo (wasm-only) and demo (requires native deps)
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
         run: cargo ndk -t arm64-v8a check --package lumina-video --package lumina-video-android
 
   # Summary job for branch protection

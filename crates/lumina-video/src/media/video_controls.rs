@@ -421,7 +421,7 @@ impl<'a> VideoControls<'a> {
 
         let center = video_rect.center();
         let radius = 24.0;
-        let stroke_width = 4.0;
+        let stroke_width = 4.0_f32;
 
         // Draw background ring (gray track)
         let bg_stroke = Stroke::new(
@@ -540,7 +540,7 @@ impl<'a> VideoControls<'a> {
 
         if self.muted {
             // Draw X through the speaker when muted
-            let stroke = Stroke::new(2.0, Color32::from_rgb(255, 100, 100));
+            let stroke = Stroke::new(2.0_f32, Color32::from_rgb(255, 100, 100));
             let x_offset = icon_size * 0.1;
             ui.painter().line_segment(
                 [
@@ -570,7 +570,7 @@ impl<'a> VideoControls<'a> {
             );
         } else {
             // Draw sound waves when not muted
-            let wave_stroke = Stroke::new(1.5, self.config.icon_color);
+            let wave_stroke = Stroke::new(1.5_f32, self.config.icon_color);
             let wave_offset = icon_size * 0.45;
             for i in 0..2 {
                 let wave_x = center.x + wave_offset + (i as f32) * icon_size * 0.2;
@@ -615,7 +615,7 @@ impl<'a> VideoControls<'a> {
         let center = rect.center();
         let icon_size = rect.width() * 0.35;
         let corner_len = icon_size * 0.4;
-        let stroke = Stroke::new(2.0, self.config.icon_color);
+        let stroke = Stroke::new(2.0_f32, self.config.icon_color);
 
         // Top-left corner
         let tl = Pos2::new(center.x - icon_size, center.y - icon_size);
