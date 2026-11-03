@@ -81,10 +81,12 @@ fn test_hal_viability(render_state: &egui_wgpu::RenderState) -> HalViabilityResu
                         let ycbcr_conv = has_ext("VK_KHR_sampler_ycbcr_conversion");
                         let enabled = d.enabled_device_extensions();
                         let enabled_ahb = enabled.iter().any(|e| {
-                            e.to_str()
-                                == Ok("VK_ANDROID_external_memory_android_hardware_buffer")
+                            e.to_str() == Ok("VK_ANDROID_external_memory_android_hardware_buffer")
                         });
-                        info!("AHardwareBuffer extension enabled on device: {}", enabled_ahb);
+                        info!(
+                            "AHardwareBuffer extension enabled on device: {}",
+                            enabled_ahb
+                        );
                         let all = ext_memory_ahb
                             && ext_memory
                             && ext_semaphore
@@ -102,13 +104,29 @@ fn test_hal_viability(render_state: &egui_wgpu::RenderState) -> HalViabilityResu
                     }
                     Err(e) => {
                         error!("Failed to enumerate Vulkan device extensions: {:?}", e);
-                        (true, false, false, false, false, false, Some(format!("{:?}", e)))
+                        (
+                            true,
+                            false,
+                            false,
+                            false,
+                            false,
+                            false,
+                            Some(format!("{:?}", e)),
+                        )
                     }
                 }
             }
             None => {
                 error!("as_hal returned None - HAL access not available");
-                (false, false, false, false, false, false, Some("as_hal returned None".to_string()))
+                (
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    Some("as_hal returned None".to_string()),
+                )
             }
         }
     };
