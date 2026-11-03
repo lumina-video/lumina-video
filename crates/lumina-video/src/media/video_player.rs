@@ -162,6 +162,8 @@ pub struct VideoPlayer {
     show_subtitles: bool,
     /// Subtitle rendering style configuration
     subtitle_style: SubtitleStyle,
+    #[cfg(target_os = "android")]
+    frame_waker_id: u64,
 }
 
 impl VideoPlayer {
@@ -200,6 +202,8 @@ impl VideoPlayer {
             subtitle_track: None,
             show_subtitles: true,
             subtitle_style: SubtitleStyle::default(),
+            #[cfg(target_os = "android")]
+            frame_waker_id: 0,
         }
     }
 
@@ -296,6 +300,8 @@ impl VideoPlayer {
             subtitle_track: None,
             show_subtitles: true,
             subtitle_style: SubtitleStyle::default(),
+            #[cfg(target_os = "android")]
+            frame_waker_id: 0,
         }
     }
 
@@ -834,6 +840,11 @@ impl VideoPlayer {
             state_changed = true;
         }
 
+        #[cfg(target_os = "android")]
+        let frame_wake_registered = self.register_frame_waker(ui.ctx());
+        #[cfg(not(target_os = "android"))]
+        let frame_wake_registered = false;
+
         // Request repaint if playing/buffering, loading, initializing, or have pending frame
         #[cfg(feature = "moq")]
         let is_initializing = self.core.is_init_pending() || self.moq_init_promise.is_some();
@@ -850,7 +861,15 @@ impl VideoPlayer {
                 VideoState::Loading | VideoState::Buffering { .. }
             )
         {
-            ui.ctx().request_repaint();
+            if is_initializing || (has_pending_frame && !frame_wake_registered) {
+                ui.ctx().request_repaint();
+            } else if frame_wake_registered {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(250));
+            } else {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(16));
+            }
         }
 
         VideoPlayerResponse {
@@ -859,6 +878,23 @@ impl VideoPlayer {
             state_changed,
             toggle_fullscreen: controls_response.toggle_fullscreen,
         }
+    }
+
+    #[cfg(target_os = "android")]
+    fn register_frame_waker(&mut self, ctx: &egui::Context) -> bool {
+        let id = self.core.android_player_id();
+        if id == 0 {
+            return false;
+        }
+        if self.frame_waker_id != id {
+            let ctx = ctx.clone();
+            crate::media::android_video::set_frame_waker(
+                id,
+                std::sync::Arc::new(move || ctx.request_repaint()),
+            );
+            self.frame_waker_id = id;
+        }
+        true
     }
 
     /// Updates the current frame from the decode queue.
