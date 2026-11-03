@@ -1196,7 +1196,7 @@ impl ZeroCopyGStreamerDecoder {
         let mut width = 0u32;
         let mut height = 0u32;
         let mut duration = None;
-        let mut init_buffering_percent = 0i32;
+        let mut init_buffering_percent = 100i32;
 
         // Wait for async state change
         for msg in bus.iter_timed(gst::ClockTime::from_seconds(10)) {
@@ -2496,6 +2496,9 @@ impl VideoDecoderBackend for ZeroCopyGStreamerDecoder {
     }
 
     fn buffering_percent(&self) -> i32 {
+        if self.metadata.duration.is_none() && self.position > Duration::ZERO {
+            return 100;
+        }
         self.buffering_percent
     }
 

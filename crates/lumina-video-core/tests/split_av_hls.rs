@@ -74,4 +74,5 @@ fn split_rendition_fmp4_hls_with_large_decode_time_keeps_playing() {
         }
     }
     assert!(frames >= 45, "only {frames} of 60 frames decoded");
+    assert_eq!(decoder.buffering_percent(), 100);
 }
