@@ -1171,6 +1171,12 @@ pub struct FrameScheduler {
     /// Last time get_next_frame() was called (for rendering gap detection).
     /// A gap > RENDERING_GAP_THRESHOLD indicates the app was backgrounded.
     last_get_next_frame_time: Option<std::time::Instant>,
+    /// Last observed audio position from sync_position() — for stale detection.
+    last_observed_audio_pos: Duration,
+    /// Wall-clock time when `last_observed_audio_pos` last changed.
+    last_audio_pos_change: Option<std::time::Instant>,
+    /// True when audio has been detected as stale (not advancing).
+    audio_sync_stale: bool,
 }
 
 impl FrameScheduler {
@@ -1219,6 +1225,9 @@ impl FrameScheduler {
             initial_pts_bias_applied: false,
             deferred_epoch_pts: None,
             last_get_next_frame_time: None,
+            last_observed_audio_pos: Duration::ZERO,
+            last_audio_pos_change: None,
+            audio_sync_stale: false,
         }
     }
 
@@ -1247,6 +1256,30 @@ impl FrameScheduler {
         self.use_audio_as_sync_master = false;
     }
 
+    /// Rebases the wall-clock origin to the current audio position.
+    ///
+    /// Call when promoting from metrics-only to audio-as-sync-master to
+    /// eliminate the position discontinuity between where wall-clock had
+    /// advanced and where audio actually is.
+    pub fn resync_clock_to_audio(&mut self) {
+        let audio_pos = self.audio_position();
+        if audio_pos > Duration::ZERO {
+            let now = std::time::Instant::now();
+            self.playback_start_position = audio_pos;
+            self.playback_start_time = Some(now);
+            self.current_position = audio_pos;
+            self.last_observed_audio_pos = audio_pos;
+            self.last_audio_pos_change = Some(now);
+            self.audio_sync_stale = false;
+            self.reset_drift_correction();
+            self.sync_metrics.set_grace_period(10);
+            tracing::info!(
+                "FrameScheduler: resynced clock to audio position {:?}",
+                audio_pos,
+            );
+        }
+    }
+
     /// Clears the audio handle, falling back to wall-clock for frame pacing.
     pub fn clear_audio_handle(&mut self) {
         self.audio_handle = None;
@@ -1260,6 +1293,9 @@ impl FrameScheduler {
         self.audio_stall_start = None;
         self.ignore_audio_stall_until_recovered = false;
         self.last_get_next_frame_time = None;
+        self.last_observed_audio_pos = Duration::ZERO;
+        self.last_audio_pos_change = None;
+        self.audio_sync_stale = false;
         self.reset_drift_correction();
     }
 
@@ -1381,7 +1417,7 @@ impl FrameScheduler {
     /// - No audio handle is set
     /// - Audio is not available
     /// - Audio hasn't started yet (position == 0)
-    fn sync_position(&self) -> Duration {
+    fn sync_position(&mut self) -> Duration {
         // Get wall-clock position as baseline
         let wall_clock_pos = self.position();
 
@@ -1397,10 +1433,45 @@ impl FrameScheduler {
                 let audio_pos = audio.position_for_sync();
                 // Only use audio position if audio has actually started
                 if audio_pos > Duration::ZERO {
-                    // Once audio has started, always use it as master clock.
-                    // Don't fall back to wall-clock even if audio is behind -
-                    // video should slow down to match audio, not race ahead.
-                    return audio_pos;
+                    // Detect stale audio: if position hasn't changed in >2s,
+                    // fall back to wall-clock to prevent video freeze.
+                    const AUDIO_STALE_THRESHOLD: Duration = Duration::from_secs(2);
+                    let now = std::time::Instant::now();
+                    if audio_pos != self.last_observed_audio_pos {
+                        self.last_observed_audio_pos = audio_pos;
+                        self.last_audio_pos_change = Some(now);
+                        if self.audio_sync_stale {
+                            self.audio_sync_stale = false;
+                            // Re-anchor wall-clock to current audio position
+                            // so we don't jump when switching back to audio later
+                            self.playback_start_position = audio_pos;
+                            self.playback_start_time = Some(now);
+                            tracing::info!(
+                                "sync_position: audio recovered from stale, re-anchored to {:?}",
+                                audio_pos,
+                            );
+                        }
+                    } else if let Some(last_change) = self.last_audio_pos_change {
+                        if now.duration_since(last_change) > AUDIO_STALE_THRESHOLD
+                            && !self.audio_sync_stale
+                        {
+                            self.audio_sync_stale = true;
+                            // Re-anchor wall-clock to frozen audio position
+                            // so video continues smoothly from where audio stopped
+                            self.playback_start_position = audio_pos;
+                            self.playback_start_time = Some(now);
+                            tracing::warn!(
+                                "sync_position: audio stale for {:?}, falling back to wall-clock (audio_pos={:?})",
+                                now.duration_since(last_change),
+                                audio_pos,
+                            );
+                        }
+                    }
+
+                    if !self.audio_sync_stale {
+                        return audio_pos;
+                    }
+                    // Fall through to wall-clock when stale
                 } else {
                     // Audio available but not started yet (position == 0).
                     // Return playback_start_position to hold video at first frame
@@ -1738,7 +1809,7 @@ impl FrameScheduler {
         // EMA-smooth the raw drift signal (alpha=0.3, ~1s window at 200ms intervals)
         let raw_drift = self.sync_metrics.current_drift_us() as f64;
 
-        // Step detection: large drift (>200ms) indicates sudden desync from app
+        // Step detection: large drift (>100ms) indicates sudden desync from app
         // backgrounding or similar disruption. The proportional controller's 10ms/s
         // max slew would take ~100s to correct a 1s step. Instead, resync the wall
         // clock to the audio position immediately.
@@ -1761,7 +1832,8 @@ impl FrameScheduler {
         }
 
         const EMA_ALPHA: f64 = 0.3;
-        self.smoothed_drift_us = self.smoothed_drift_us * (1.0 - EMA_ALPHA) + raw_drift * EMA_ALPHA;
+        self.smoothed_drift_us =
+            self.smoothed_drift_us * (1.0 - EMA_ALPHA) + raw_drift * EMA_ALPHA;
         let drift_us = self.smoothed_drift_us as i64;
 
         // Hysteresis deadband: enter at |drift| > 40ms, exit at < 20ms
@@ -2365,6 +2437,17 @@ impl FrameScheduler {
                             threshold
                         );
                     }
+                    // Rebase wall-clock to the deferred threshold (= audio_base_pts).
+                    // During burst consumption, wall-clock advanced while audio was
+                    // gated (epoch not started). Without this rebase, the accumulated
+                    // wall-clock offset persists as permanent A/V drift.
+                    // Audio position starts at base_pts + 0 (samples_played was just
+                    // reset). Using threshold (not frame.pts) ensures wall-clock and
+                    // audio start from the exact same content position — zero offset.
+                    // frame.pts may overshoot threshold by up to one GOP interval;
+                    // using it would create a constant video-leads-audio offset.
+                    self.playback_start_position = threshold;
+                    self.playback_start_time = Some(std::time::Instant::now());
                     self.deferred_epoch_pts = None;
                 }
             }

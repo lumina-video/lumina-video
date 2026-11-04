@@ -115,6 +115,15 @@ public final class LuminaVideoPlayer: ObservableObject {
     ///   - audioSessionConfig: Audio session configuration. Defaults to `.default`.
     /// - Throws: `LuminaVideoError` if the URL is invalid or creation fails.
     public init(url: String, audioSessionConfig: AudioSessionConfig = .default) throws {
+        // Initialize Rust tracing subscriber (stderr → Xcode console).
+        // Guarded by Once internally — safe to call multiple times.
+        lumina_init_tracing()
+
+        // Configure audio session BEFORE player creation.
+        // MoQ spawns a background thread immediately — if the relay connects fast,
+        // cpal could try to open the audio device before the session is active.
+        configureAudioSession(audioSessionConfig)
+
         var ptr: OpaquePointer?
         let err = url.withCString { cStr in
             lumina_player_create(cStr, &ptr)
@@ -123,9 +132,6 @@ public final class LuminaVideoPlayer: ObservableObject {
             throw LuminaVideoError(rawValue: err) ?? .internal
         }
         self.playerPtr = validPtr
-
-        // Configure audio session
-        configureAudioSession(audioSessionConfig)
 
         // Sync initial mute state to Rust player
         lumina_player_set_muted(validPtr, is_muted)
@@ -166,6 +172,12 @@ public final class LuminaVideoPlayer: ObservableObject {
     public func seek(to position: TimeInterval) {
         guard let ptr = playerPtr else { return }
         lumina_player_seek(ptr, position)
+    }
+
+    /// MoQ audio pipeline status (0=N/A, 1=unavail, 2=starting, 3=running, 4=error, 5=bound).
+    public var moq_audio_status: Int32 {
+        guard let ptr = playerPtr else { return 0 }
+        return lumina_player_moq_audio_status(ptr)
     }
 
     // MARK: - Audio session

@@ -15,7 +15,7 @@ struct ContentView: View {
             }
         }
         .onAppear {
-            viewModel.load(url: "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8")
+            viewModel.load(url: "moq://192.168.8.219:4443/anon/bbb")
         }
         .statusBarHidden(isFullscreen)
     }
@@ -191,6 +191,10 @@ struct DiagnosticsPanel: View {
                     value: String(format: "%.1f", viewModel.measuredFPS))
             DiagRow(label: "A/V sync",
                     value: viewModel.isLive ? viewModel.clockDriftLabel : "AVPlayer (native)")
+            if viewModel.isLive {
+                DiagRow(label: "MoQ audio",
+                        value: viewModel.moqAudioStatus)
+            }
         }
         .padding(10)
         .background(Color(.secondarySystemBackground))
@@ -235,6 +239,7 @@ final class VideoViewModel: ObservableObject {
     @Published var nominalFPS: Float?
     @Published var measuredFPS: Double = 0
     @Published var clockDriftLabel: String = "—"
+    @Published var moqAudioStatus: String = "—"
 
     /// True for live streams (MoQ), false for VOD (HLS/MP4). Clock drift only shown for live.
     var isLive: Bool { duration == nil }
@@ -357,6 +362,22 @@ final class VideoViewModel: ObservableObject {
         let posElapsed = currentTime - startPos
         let drift = (posElapsed - wallElapsed) * 1000.0 // ms
         clockDriftLabel = String(format: "%+.0f ms", drift)
+    }
+
+    // MARK: - MoQ audio status
+
+    private func updateMoqAudioStatus() {
+        guard let player else { return }
+        let status = player.moq_audio_status
+        switch status {
+        case 0: moqAudioStatus = "N/A"
+        case 1: moqAudioStatus = "Unavailable"
+        case 2: moqAudioStatus = "Starting"
+        case 3: moqAudioStatus = "Running"
+        case 4: moqAudioStatus = "Error"
+        case 5: moqAudioStatus = "Bound"
+        default: moqAudioStatus = "Unknown (\(status))"
+        }
     }
 
     // MARK: - Media info probing
@@ -503,14 +524,21 @@ extension VideoViewModel: LuminaVideoPlayerDelegate {
             // Render path: zero-copy if IOSurface present
             self.renderPath = frame.ioSurface != nil ? "Zero-copy (IOSurface)" : "CPU fallback"
 
-            // FPS + A/V sync
+            // FPS + A/V sync (only after second frame to avoid PTS jump artifact)
             self.recordFrameArrival()
-            if self.isPlaying {
+            if self.isPlaying && !isFirst {
                 self.updateAVSync()
             }
 
+            // MoQ audio status
+            self.updateMoqAudioStatus()
+
             if isFirst {
                 self.videoSize = player.video_size
+                // Reset A/V sync so calibration starts from the first frame's position,
+                // avoiding a false +Nms jump from publisher-absolute PTS.
+                self.playbackStartWall = nil
+                self.playbackStartPosition = nil
             }
         }
     }

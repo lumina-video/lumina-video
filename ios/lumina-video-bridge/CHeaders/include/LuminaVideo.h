@@ -269,6 +269,36 @@ typedef struct LuminaDiagnostics {
  */
 LuminaError lumina_diagnostics_snapshot(LuminaDiagnostics *out);
 
+/* ========================================================================= */
+/* MoQ audio diagnostics                                                      */
+/* ========================================================================= */
+
+/**
+ * Returns MoQ audio pipeline status.
+ *
+ * - 0: Not a MoQ stream or MoQ feature not enabled
+ * - 1: Unavailable (audio not in catalog or not yet started)
+ * - 2: Starting (audio thread spawning)
+ * - 3: Running (cpal stream active)
+ * - 4: Error (audio thread failed)
+ * - 5: Handle bound (audio handle late-bound to player)
+ *
+ * @param player    Valid player handle. Returns 0 if NULL.
+ */
+int32_t lumina_player_moq_audio_status(const LuminaPlayer *player);
+
+/* ========================================================================= */
+/* Tracing / logging                                                          */
+/* ========================================================================= */
+
+/**
+ * Initializes the Rust tracing subscriber (logs to stderr).
+ *
+ * Call once at app startup, before any player creation. Safe to call
+ * multiple times (subsequent calls are no-ops).
+ */
+void lumina_init_tracing(void);
+
 #ifdef __cplusplus
 }
 #endif

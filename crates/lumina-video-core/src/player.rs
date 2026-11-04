@@ -409,6 +409,7 @@ impl CorePlayer {
             thread.set_muted(self.audio_handle.is_muted());
             thread.play();
             self.scheduler.start();
+            self.audio_handle.set_paused(false);
             self.state = VideoState::Playing {
                 position: self.scheduler.position(),
             };
@@ -431,6 +432,7 @@ impl CorePlayer {
             thread.set_muted(muted);
             thread.play();
             self.scheduler.start();
+            self.audio_handle.set_paused(false);
             self.state = VideoState::Playing {
                 position: self.scheduler.position(),
             };
@@ -446,6 +448,7 @@ impl CorePlayer {
         if let Some(ref thread) = self.decode_thread {
             thread.pause();
             self.scheduler.pause();
+            self.audio_handle.set_paused(true);
             self.state = VideoState::Paused {
                 position: self.scheduler.position(),
             };

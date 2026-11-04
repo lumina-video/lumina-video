@@ -93,6 +93,9 @@ struct AudioHandleInner {
     /// True when cpal callback detects sustained ring buffer underrun.
     /// Set by cpal callback (audio thread), read by FrameScheduler (UI thread).
     audio_stalled: AtomicBool,
+    /// True when playback is paused. Set by CorePlayer, read by cpal callback.
+    /// This is the cross-thread pause signal that works for both FFmpeg and MoQ audio paths.
+    paused: AtomicBool,
 }
 
 impl AudioHandle {
@@ -112,6 +115,7 @@ impl AudioHandle {
                 video_start_time_us_plus1: AtomicU64::new(0),
                 native_position_us: AtomicU64::new(0),
                 audio_stalled: AtomicBool::new(false),
+                paused: AtomicBool::new(false),
             }),
         }
     }
@@ -140,6 +144,16 @@ impl AudioHandle {
     pub fn toggle_mute(&self) {
         // Use fetch_xor for atomic toggle to avoid TOCTOU race condition
         self.inner.muted.fetch_xor(true, Ordering::Relaxed);
+    }
+
+    /// Returns whether playback is paused.
+    pub fn is_paused(&self) -> bool {
+        self.inner.paused.load(Ordering::Acquire)
+    }
+
+    /// Sets the paused state.
+    pub fn set_paused(&self, paused: bool) {
+        self.inner.paused.store(paused, Ordering::Release);
     }
 
     /// Returns the effective volume (0.0-1.0) accounting for mute.
@@ -783,7 +797,7 @@ mod cpal_impl {
             .build_output_stream(
                 config,
                 move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-                    if !playing.load(Ordering::Acquire) {
+                    if !playing.load(Ordering::Acquire) || handle.is_paused() {
                         let zero = T::from_sample(0.0f32);
                         data.fill(zero);
                         return;
