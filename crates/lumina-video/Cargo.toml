@@ -113,6 +113,20 @@ opus = { workspace = true }
 symphonia-codec-aac = { workspace = true }
 symphonia-core = { workspace = true }
 
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-av-foundation = { workspace = true }
+objc2-core-media = { workspace = true }
+objc2-core-video = { workspace = true }
+objc2-video-toolbox = { workspace = true }
+block2 = { workspace = true }
+objc2-core-foundation = { version = "0.3", features = ["CFNumber", "CFDictionary", "CFString"] }
+objc2-io-surface = { version = "0.3" }
+objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLDevice", "MTLTexture", "MTLResource", "MTLPixelFormat", "MTLAllocation", "MTLLibrary", "MTLTypes", "objc2-io-surface"] }
+wgpu = { version = "30" }
+profiling = { version = "1.0" }
+
 # Windows native Media Foundation decoder
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [

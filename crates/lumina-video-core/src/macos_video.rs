@@ -633,21 +633,30 @@ impl MacOSVideoDecoder {
                 #[allow(deprecated)]
                 let video_tracks = unsafe { asset.tracksWithMediaType(media_type) };
 
-                if video_tracks.is_empty() {
-                    return;
-                }
+                let (w, h, fps) = if video_tracks.is_empty() {
+                    let size = unsafe { self.player_item.presentationSize() };
+                    (size.width as u32, size.height as u32, 30.0)
+                } else {
+                    let video_track = video_tracks.objectAtIndex(0);
+                    let natural_size = unsafe { video_track.naturalSize() };
+                    let fps = unsafe { video_track.nominalFrameRate() };
+                    (
+                        natural_size.width as u32,
+                        natural_size.height as u32,
+                        if fps <= 0.0 { 30.0 } else { fps },
+                    )
+                };
 
-                let video_track = video_tracks.objectAtIndex(0);
-                let natural_size = unsafe { video_track.naturalSize() };
-                let w = natural_size.width as u32;
-                let h = natural_size.height as u32;
+                let (w, h) = if w == 0 || h == 0 {
+                    let size = unsafe { self.player_item.presentationSize() };
+                    (size.width as u32, size.height as u32)
+                } else {
+                    (w, h)
+                };
 
                 if w == 0 || h == 0 {
                     return;
                 }
-
-                let fps = unsafe { video_track.nominalFrameRate() };
-                let fps = if fps <= 0.0 { 30.0 } else { fps };
 
                 // Safety: Only called once, and metadata_ready acts as a barrier
                 // After this write completes and metadata_ready is set, no more writes occur
