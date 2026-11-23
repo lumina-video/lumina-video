@@ -3314,7 +3314,7 @@ mod macos_vt {
 pub mod android {
     use super::*;
     use crate::media::android_video::{
-        generate_player_id, try_receive_hardware_buffer_for_player, AndroidVideoFrame,
+        generate_player_id, try_receive_hardware_buffer_ordered_for_player, AndroidVideoFrame,
     };
     use crate::media::video::AndroidGpuSurface;
     use jni::objects::{GlobalRef, JClass, JObject, JValue};
@@ -3654,7 +3654,7 @@ pub mod android {
         /// MediaCodec outputs to ImageReader, which extracts HardwareBuffers
         /// and submits them via JNI to the per-player queue.
         fn poll_decoded_frames(&mut self) {
-            while let Some(frame) = try_receive_hardware_buffer_for_player(self.player_id) {
+            while let Some(frame) = try_receive_hardware_buffer_ordered_for_player(self.player_id) {
                 self.pending_frames.push_back(frame);
             }
         }
@@ -3879,7 +3879,7 @@ pub mod android {
     #[no_mangle]
     pub extern "C" fn Java_com_luminavideo_bridge_MoqMediaCodecBridge_nativeSubmitHardwareBuffer(
         env: JNIEnv,
-        class: JClass,
+        _class: JClass,
         buffer: JObject,
         timestamp_ns: jlong,
         width: jint,
@@ -3889,9 +3889,8 @@ pub mod android {
     ) {
         // Delegate to the existing ExoPlayerBridge implementation
         // This reuses all the HardwareBuffer acquisition and queue logic
-        crate::media::android_video::Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwareBuffer(
+        crate::media::android_video::submit_hardware_buffer_untracked(
             env,
-            class,
             buffer,
             timestamp_ns,
             width,

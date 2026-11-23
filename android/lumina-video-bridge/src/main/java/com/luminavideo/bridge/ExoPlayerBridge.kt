@@ -55,9 +55,7 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
         private const val TAG = "ExoPlayerBridge"
 
         /** Maximum number of images to hold in the ImageReader buffer */
-        private const val MAX_IMAGES = 6
-
-        private const val HELD_IMAGES = 3
+        private const val MAX_IMAGES = 12
 
         /** Timeout for ExoPlayer creation on the HandlerThread */
         private const val INIT_TIMEOUT_SECONDS = 5L
@@ -96,7 +94,8 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
     // State tracking
     private val isReleased = AtomicBoolean(false)
     private val frameCount = AtomicInteger(0)
-    private val heldImages = ArrayDeque<android.media.Image>()
+    private val heldImages = HashMap<Long, android.media.Image>()
+    private var nextImageId = 1L
     private var lastImageTimestampNs = Long.MIN_VALUE
     private var imageTimestampRegressions = 0
 
@@ -462,6 +461,8 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
 
         var hardwareBuffer: HardwareBuffer? = null
         var submitted = false
+        releaseDroppedImages()
+        val imageId = nextImageId++
         try {
             hardwareBuffer = image.hardwareBuffer
             if (image.timestamp <= lastImageTimestampNs) {
@@ -478,7 +479,8 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
                     image.width,
                     image.height,
                     playerId,
-                    fenceFd
+                    fenceFd,
+                    imageId
                 )
 
                 frameCount.incrementAndGet()
@@ -489,24 +491,26 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
         } finally {
             hardwareBuffer?.close()
             if (submitted) {
-                holdImage(image)
+                heldImages[imageId] = image
             } else {
                 image.close()
             }
         }
     }
 
-    private fun holdImage(image: android.media.Image) {
-        heldImages.addLast(image)
-        while (heldImages.size > HELD_IMAGES) {
-            heldImages.removeFirst().close()
+    private fun releaseDroppedImages() {
+        if (playerId == 0L) return
+        val ids = nativeTakeReleasedImageIds(playerId) ?: return
+        for (id in ids) {
+            heldImages.remove(id)?.close()
         }
     }
 
     private fun releaseHeldImages() {
-        while (heldImages.isNotEmpty()) {
-            heldImages.removeFirst().close()
+        for (image in heldImages.values) {
+            image.close()
         }
+        heldImages.clear()
     }
 
     /**
@@ -576,8 +580,11 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
         width: Int,
         height: Int,
         playerId: Long,
-        fenceFd: Int
+        fenceFd: Int,
+        imageId: Long
     )
+
+    private external fun nativeTakeReleasedImageIds(playerId: Long): LongArray?
 
     private external fun nativeOnVideoSizeChanged(nativeHandle: Long, width: Int, height: Int)
 
