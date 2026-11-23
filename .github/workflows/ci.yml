@@ -144,11 +144,66 @@ jobs:
           CMAKE_POLICY_VERSION_MINIMUM: '3.5'
         run: cargo ndk -t arm64-v8a check --package lumina-video --package lumina-video-android
 
+  moq-linux:
+    name: MoQ and core (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libspeechd-dev libxkbcommon-dev libssl-dev libunwind-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            libasound2-dev libavutil-dev libavformat-dev libavcodec-dev \
+            libavdevice-dev libavfilter-dev libswscale-dev libswresample-dev \
+            libclang-dev
+      - run: cargo clippy -p lumina-video --features moq --all-targets -- -D warnings
+      - run: cargo test -p lumina-video --features moq
+      - run: cargo test -p lumina-video-core
+
+  check-web:
+    name: Check (web demo, wasm32)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p lumina-video-web-demo --target wasm32-unknown-unknown
+
+  check-macos-extra:
+    name: Check (iOS and MoQ, macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios-sim
+      - name: Install FFmpeg and pkg-config
+        run: brew install ffmpeg pkg-config
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-extra
+      - name: Set FFmpeg library paths
+        run: |
+          FFMPEG_PREFIX=$(brew --prefix ffmpeg)
+          echo "PKG_CONFIG_PATH=${FFMPEG_PREFIX}/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
+          echo "LIBRARY_PATH=${FFMPEG_PREFIX}/lib:$LIBRARY_PATH" >> $GITHUB_ENV
+      - run: cargo check -p lumina-video-ios --target aarch64-apple-ios-sim
+      - run: cargo check -p lumina-video --features moq
+
   # Summary job for branch protection
   ci-success:
     name: CI Success
     # Note: test-windows is disabled (if: false) until other platforms are stable
-    needs: [fmt, clippy, test-linux, test-macos, check-android]
+    needs: [fmt, clippy, test-linux, test-macos, check-android, moq-linux, check-web, check-macos-extra]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -158,7 +213,10 @@ jobs:
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
              [[ "${{ needs.test-linux.result }}" != "success" ]] || \
              [[ "${{ needs.test-macos.result }}" != "success" ]] || \
-             [[ "${{ needs.check-android.result }}" != "success" ]]; then
+             [[ "${{ needs.check-android.result }}" != "success" ]] || \
+             [[ "${{ needs.moq-linux.result }}" != "success" ]] || \
+             [[ "${{ needs.check-web.result }}" != "success" ]] || \
+             [[ "${{ needs.check-macos-extra.result }}" != "success" ]]; then
             echo "Some jobs failed"
             exit 1
           fi

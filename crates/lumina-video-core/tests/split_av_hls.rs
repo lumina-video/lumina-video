@@ -56,6 +56,10 @@ fn serve_fixture(dir: PathBuf) -> u16 {
 
 #[test]
 fn split_rendition_fmp4_hls_with_large_decode_time_keeps_playing() {
+    if gstreamer::init().is_err() || gstreamer::ElementFactory::find("vapostproc").is_none() {
+        eprintln!("skipping: GStreamer vapostproc element (VA-API) is not available");
+        return;
+    }
     std::env::set_var("EGUI_VID_FAKE_AUDIO", "1");
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/split_av_hls");
     let port = serve_fixture(dir);
