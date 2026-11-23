@@ -1193,6 +1193,47 @@ pub struct AndroidVideoFrame {
     /// The consumer (Vulkan) must wait on this fence before reading the buffer.
     /// This is critical for correct synchronization with hardware video decoders.
     pub fence_fd: i32,
+    /// Id of the Java `Image` backing this frame (0 = none). The Image is closed
+    /// by the bridge once this frame is dropped.
+    pub image_id: u64,
+}
+
+static RELEASED_IMAGE_IDS: OnceLock<
+    parking_lot::Mutex<HashMap<u64, crate::frame_order::DeferredRelease>>,
+> = OnceLock::new();
+
+const FRAMES_IN_FLIGHT_BEFORE_IMAGE_CLOSE: usize = 3;
+
+fn released_image_ids(
+) -> &'static parking_lot::Mutex<HashMap<u64, crate::frame_order::DeferredRelease>> {
+    RELEASED_IMAGE_IDS.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+}
+
+fn register_image_release_player(player_id: u64) {
+    released_image_ids()
+        .lock()
+        .entry(player_id)
+        .or_insert_with(|| {
+            crate::frame_order::DeferredRelease::new(FRAMES_IN_FLIGHT_BEFORE_IMAGE_CLOSE)
+        });
+}
+
+fn unregister_image_release_player(player_id: u64) {
+    released_image_ids().lock().remove(&player_id);
+}
+
+fn mark_image_released(player_id: u64, image_id: u64) {
+    if let Some(release) = released_image_ids().lock().get_mut(&player_id) {
+        release.frame_dropped(image_id);
+    }
+}
+
+fn take_released_image_ids(player_id: u64) -> Vec<u64> {
+    released_image_ids()
+        .lock()
+        .get_mut(&player_id)
+        .map(|release| release.take_ready())
+        .unwrap_or_default()
 }
 
 // SAFETY: AndroidVideoFrame can be sent and shared between threads because:
@@ -1226,6 +1267,10 @@ impl Drop for AndroidVideoFrame {
                 close(self.fence_fd);
             }
         }
+
+        if self.image_id != 0 {
+            mark_image_released(self.player_id, self.image_id);
+        }
     }
 }
 
@@ -1251,6 +1296,16 @@ fn reset_player_frame_order(player_id: u64) {
 /// Each player has its own queue, so frames from one player never affect another.
 /// Use player_id=0 to accept any frame (legacy/single-player mode via shared queue).
 pub fn try_receive_hardware_buffer_for_player(player_id: u64) -> Option<AndroidVideoFrame> {
+    receive_hardware_buffer(player_id, false)
+}
+
+/// Like `try_receive_hardware_buffer_for_player` but returns the oldest pending frame
+/// instead of collapsing the backlog, for consumers that need every frame in order (MoQ).
+pub fn try_receive_hardware_buffer_ordered_for_player(player_id: u64) -> Option<AndroidVideoFrame> {
+    receive_hardware_buffer(player_id, true)
+}
+
+fn receive_hardware_buffer(player_id: u64, ordered: bool) -> Option<AndroidVideoFrame> {
     // Legacy mode (player_id=0): use the shared queue for backward compatibility
     if player_id == 0 {
         let receiver = HARDWARE_BUFFER_RECEIVER.get()?;
@@ -1262,7 +1317,13 @@ pub fn try_receive_hardware_buffer_for_player(player_id: u64) -> Option<AndroidV
     let mut queues_guard = queues.write();
     let state = queues_guard.get_mut(&player_id)?;
     let before = state.order.out_of_order;
-    let frame = state.order.pop_latest(&mut state.queue, |f| f.timestamp_ns);
+    let frame = if ordered {
+        state
+            .order
+            .pop_front_ordered(&mut state.queue, |f| f.timestamp_ns)
+    } else {
+        state.order.pop_latest(&mut state.queue, |f| f.timestamp_ns)
+    };
     if state.order.out_of_order != before {
         tracing::warn!(
             "player {} dropped out of order frame, total {}",
@@ -1357,9 +1418,31 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeReleasePlaye
     player_id: jlong,
 ) {
     release_player_queue(player_id as u64);
+    unregister_image_release_player(player_id as u64);
 
     // NOTE: NDK ImageReader cleanup was removed - using Java ImageReader path
     // which handles its own lifecycle in Kotlin.
+}
+
+/// Returns the ids of submitted frames whose native frame has been dropped, so the
+/// bridge can close the matching Java `Image`s.
+#[no_mangle]
+pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeTakeReleasedImageIds<'l>(
+    env: JNIEnv<'l>,
+    _this: JObject,
+    player_id: jlong,
+) -> jni::sys::jlongArray {
+    let ids: Vec<jlong> = take_released_image_ids(player_id as u64)
+        .into_iter()
+        .map(|id| id as jlong)
+        .collect();
+    let Ok(array) = env.new_long_array(ids.len() as jint) else {
+        return std::ptr::null_mut();
+    };
+    if env.set_long_array_region(&array, 0, &ids).is_err() {
+        return std::ptr::null_mut();
+    }
+    array.into_raw()
 }
 
 /// JNI entry point for video size change notification.
@@ -1486,6 +1569,52 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwa
     height: jint,
     player_id: jlong,
     fence_fd: jint,
+    image_id: jlong,
+) {
+    submit_hardware_buffer(
+        env,
+        buffer,
+        timestamp_ns,
+        width,
+        height,
+        player_id,
+        fence_fd,
+        image_id as u64,
+    );
+}
+
+/// Submits a HardwareBuffer without an Image to release later (MoQ bridge).
+pub fn submit_hardware_buffer_untracked(
+    env: JNIEnv,
+    buffer: JObject,
+    timestamp_ns: jlong,
+    width: jint,
+    height: jint,
+    player_id: jlong,
+    fence_fd: jint,
+) {
+    submit_hardware_buffer(
+        env,
+        buffer,
+        timestamp_ns,
+        width,
+        height,
+        player_id,
+        fence_fd,
+        0,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_hardware_buffer(
+    env: JNIEnv,
+    buffer: JObject,
+    timestamp_ns: jlong,
+    width: jint,
+    height: jint,
+    player_id: jlong,
+    fence_fd: jint,
+    image_id: u64,
 ) {
     // Ensure queues are initialized
     if HARDWARE_BUFFER_QUEUE.get().is_none() {
@@ -1552,7 +1681,12 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwa
         format,
         player_id: player_id_u64,
         fence_fd,
+        image_id,
     };
+
+    if image_id != 0 {
+        register_image_release_player(player_id_u64);
+    }
 
     // Route to the appropriate queue based on player_id
     if player_id_u64 == 0 {

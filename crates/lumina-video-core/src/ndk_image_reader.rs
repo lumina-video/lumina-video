@@ -227,6 +227,7 @@ impl NdkImageReaderBridge {
             format,
             player_id,
             fence_fd, // Now we have the actual fence from the producer!
+            image_id: 0,
         };
 
         // Send to render thread
