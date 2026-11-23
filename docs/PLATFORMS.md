@@ -64,6 +64,23 @@ By default, lumina-video uses **alsasink** for audio output on Linux. This bypas
 | `LUMINA_VIDEO_FAKE_AUDIO=1` | fakesink | No audio output |
 | `LUMINA_VIDEO_NO_AUDIO=1` | *(disabled)* | Video only |
 
+### Linux MoQ live streaming (local relay run)
+
+Run on Linux with a local `moq-relay` (kixelated/moq at the rev pinned in `crates/lumina-video/Cargo.toml`, built with `cargo install --locked`), ffmpeg publishing fMP4 through `moq publish ... fmp4` (H.264 640x360 30fps plus 48 kHz mono audio), and `crates/lumina-video-demo/examples/play_url.rs` in a headless sway with a private PipeWire null sink. Pause and resume are driven by `PLAY_URL_PAUSE_AT` and `PLAY_URL_RESUME_AT` (seconds).
+
+| Check | AAC | Opus |
+|-------|-----|------|
+| Connect over QUIC, catalog parse | Pass | Pass |
+| Video (640x360, ~60 fps UI, 0 decode errors) | Pass | Pass |
+| Audio decode and cpal output (ALSA to PipeWire) | Pass (symphonia) | Pass (libopus) |
+| Pause and resume | Pass, position held, playback resumes | Pass |
+| `audio_stalled` | stays false | stays false |
+| A/V sync | **Fails over time**: video leads audio by 0.5 s at start, 6 to 12 s after about 40 s | **Fails over time**: same pattern |
+
+The A/V drift is the open issue for Linux MoQ: the audio thread logs repeated "inserted Nms silence for PTS gap" lines when the publisher bursts audio and the audio clock falls behind video. Linux MoQ stays **experimental** until that is fixed. A local relay needs the matching `moq-relay`; a newer relay (v0.17) did not accept the pinned client.
+
+Without a sound server, cpal fails with `snd_pcm_open ... Host is down` and the player runs video only (wall clock pacing).
+
 ## Android
 
 - **OS**: Android 5.0 (API 21) or later

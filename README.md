@@ -382,7 +382,7 @@ cargo run --package lumina-video-demo --features windows-native-video
 |------|-------------|--------|
 | Windows | Zero-copy diagnostics + A/V sync bridge | Needs porting to lumina-video |
 | MoQ | Frame pixelation on late join (IDR resync) | Investigating HTTP group fetch |
-| MoQ | Linux / Android / Windows testing | Audio pipeline ready, needs platform validation |
+| MoQ | Linux / Android / Windows testing | Linux: video and audio play from a local relay (AAC, Opus) but A/V drift grows over time, see docs/PLATFORMS.md. Android / Windows pending |
 | MoQ | zap.stream connectivity | Upstream PR submitted |
 
 > **Testers wanted!** Windows zero-copy needs validation on real hardware.
