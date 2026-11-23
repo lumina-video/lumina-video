@@ -3446,6 +3446,7 @@ pub mod android {
             let worker_shared = shared.clone();
             let worker_url = moq_url.clone();
             let worker_config = config.clone();
+            let initial_volume = config.initial_volume;
 
             runtime.spawn(async move {
                 if let Err(e) =
@@ -3464,7 +3465,7 @@ pub mod android {
                 _owned_runtime: owned_runtime,
                 _runtime: runtime,
                 audio_muted: false,
-                audio_volume: config.initial_volume,
+                audio_volume: initial_volume,
                 bridge: None,
                 player_id,
                 pending_frames: VecDeque::new(),
@@ -3847,7 +3848,7 @@ pub mod android {
                 .load(Ordering::Relaxed)
         }
 
-        fn audio_handle(&self) -> Option<super::audio::AudioHandle> {
+        fn audio_handle(&self) -> Option<crate::media::audio::AudioHandle> {
             self.shared.audio.moq_audio_handle.lock().clone()
         }
 
