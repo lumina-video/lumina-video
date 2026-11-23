@@ -10,6 +10,8 @@ struct PlayUrl {
     ui_times: Vec<f32>,
     last_frame: Instant,
     exit_after: Option<Duration>,
+    pause_at: Option<Duration>,
+    resume_at: Option<Duration>,
 }
 
 impl eframe::App for PlayUrl {
@@ -28,6 +30,17 @@ impl eframe::App for PlayUrl {
         if now.duration_since(self.last_report) >= Duration::from_secs(5) {
             self.report();
             self.last_report = now;
+        }
+        let elapsed = now.duration_since(self.started);
+        if self.pause_at.is_some_and(|t| elapsed >= t) {
+            self.pause_at = None;
+            self.player.pause();
+            println!("pause state={:?}", self.player.state());
+        }
+        if self.resume_at.is_some_and(|t| elapsed >= t) {
+            self.resume_at = None;
+            self.player.play();
+            println!("resume state={:?}", self.player.state());
         }
         if let Some(limit) = self.exit_after {
             if now.duration_since(self.started) >= limit {
@@ -67,7 +80,8 @@ impl PlayUrl {
         #[cfg(not(target_os = "linux"))]
         let zc = String::new();
         println!(
-            "frames={} mean={:.2}ms p50={:.2}ms p95={:.2}ms p99={:.2}ms max={:.2}ms ui_mean={:.3}ms ui_p95={:.3}ms state={:?} dims={:?} {:?}{}",
+            "audio_stalled={} frames={} mean={:.2}ms p50={:.2}ms p95={:.2}ms p99={:.2}ms max={:.2}ms ui_mean={:.3}ms ui_p95={:.3}ms state={:?} dims={:?} {:?}{}",
+            self.player.audio_handle().is_audio_stalled(),
             t.len(),
             mean,
             p(0.5),
@@ -82,6 +96,13 @@ impl PlayUrl {
             zc
         );
     }
+}
+
+fn env_secs(name: &str) -> Option<Duration> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_secs)
 }
 
 fn main() -> eframe::Result<()> {
@@ -114,6 +135,8 @@ fn main() -> eframe::Result<()> {
                 ui_times: Vec::new(),
                 last_frame: now,
                 exit_after,
+                pause_at: env_secs("PLAY_URL_PAUSE_AT"),
+                resume_at: env_secs("PLAY_URL_RESUME_AT"),
             }))
         }),
     )
