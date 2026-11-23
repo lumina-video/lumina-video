@@ -120,33 +120,33 @@ jobs:
 
           # Create Info.plist
           cat > "${APP_DIR}/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleName</key>
-  <string>${APP_NAME}</string>
-  <key>CFBundleDisplayName</key>
-  <string>${APP_NAME}</string>
-  <key>CFBundleIdentifier</key>
-  <string>com.luminavideo.demo</string>
-  <key>CFBundleVersion</key>
-  <string>${VERSION}</string>
-  <key>CFBundleShortVersionString</key>
-  <string>${VERSION}</string>
-  <key>CFBundleExecutable</key>
-  <string>lumina-video-demo</string>
-  <key>CFBundlePackageType</key>
-  <string>APPL</string>
-  <key>CFBundleIconFile</key>
-  <string>AppIcon</string>
-  <key>LSMinimumSystemVersion</key>
-  <string>10.13</string>
-  <key>NSHighResolutionCapable</key>
-  <true/>
-</dict>
-</plist>
-PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>${APP_NAME}</string>
+            <key>CFBundleDisplayName</key>
+            <string>${APP_NAME}</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.luminavideo.demo</string>
+            <key>CFBundleVersion</key>
+            <string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${VERSION}</string>
+            <key>CFBundleExecutable</key>
+            <string>lumina-video-demo</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleIconFile</key>
+            <string>AppIcon</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>10.13</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
 
           # Convert PNG icon to .icns for Finder/Dock
           ICON_SRC="crates/lumina-video-demo/assets/lumina-video-icon-ferris-hybrid.png"
