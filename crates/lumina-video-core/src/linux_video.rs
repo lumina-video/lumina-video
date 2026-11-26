@@ -346,6 +346,24 @@ pub enum PipelineMode {
 // Zero-Copy GStreamer Decoder
 // =============================================================================
 
+fn zero_copy_unavailable_reason() -> Option<String> {
+    zero_copy_unavailable_reason_with(|name| gst::ElementFactory::find(name).is_some())
+}
+
+fn zero_copy_unavailable_reason_with(has_element: impl Fn(&str) -> bool) -> Option<String> {
+    if has_element("vapostproc") {
+        return None;
+    }
+    let hint = if has_element("nvh264dec") {
+        "NVIDIA NVDEC decoders are present but they output CUDA memory, not DMABuf; using NVDEC with CPU download"
+    } else {
+        "no VA-API post-processor; using software or CPU download"
+    };
+    Some(format!(
+        "vapostproc is not available (the VA driver may be hidden from GStreamer): {hint}"
+    ))
+}
+
 /// Buffering threshold for resuming playback after buffering stall.
 const BUFFER_HIGH_THRESHOLD: i32 = 100;
 
@@ -503,6 +521,9 @@ impl ZeroCopyGStreamerDecoder {
     /// On GStreamer 1.24+, vapostproc outputs format=DMA_DRM with drm-format field
     /// containing the actual format and DRM modifier (e.g., NV12:0x0100000000000002).
     fn try_zero_copy_pipeline(url: &str) -> Result<Self, VideoError> {
+        if let Some(reason) = zero_copy_unavailable_reason() {
+            return Err(VideoError::DecoderInit(reason));
+        }
         let pipeline = gst::Pipeline::new();
 
         // Use uridecodebin which auto-detects container and codec
@@ -2510,5 +2531,28 @@ impl VideoDecoderBackend for ZeroCopyGStreamerDecoder {
     fn hw_accel_type(&self) -> HwAccelType {
         // Return VA-API since we're using VA-API for decoding
         HwAccelType::Vaapi
+    }
+}
+
+#[cfg(test)]
+mod zero_copy_probe_tests {
+    use super::zero_copy_unavailable_reason_with;
+
+    #[test]
+    fn reports_missing_vapostproc_on_nvidia() {
+        let reason = zero_copy_unavailable_reason_with(|n| n == "nvh264dec").unwrap();
+        assert!(reason.contains("vapostproc"));
+        assert!(reason.contains("NVDEC"));
+    }
+
+    #[test]
+    fn reports_missing_vapostproc_without_nvidia() {
+        let reason = zero_copy_unavailable_reason_with(|_| false).unwrap();
+        assert!(reason.contains("no VA-API"));
+    }
+
+    #[test]
+    fn allows_zero_copy_with_vapostproc() {
+        assert!(zero_copy_unavailable_reason_with(|n| n == "vapostproc").is_none());
     }
 }
